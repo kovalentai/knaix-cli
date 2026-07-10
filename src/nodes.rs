@@ -503,8 +503,7 @@ pub async fn chat(
                     if let Ok(chunk) = chunk_result {
                         let text = String::from_utf8_lossy(&chunk);
                         for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let json_str = &line[6..];
+                            if let Some(json_str) = line.strip_prefix("data: ") {
                                 if let Ok(data) =
                                     serde_json::from_str::<serde_json::Value>(json_str)
                                 {
@@ -525,15 +524,15 @@ pub async fn chat(
                     println!();
                 }
 
-                return Ok(Some(assistant_text));
+                Ok(Some(assistant_text))
             } else {
                 pb.finish_and_clear();
-                return Err(anyhow!("Chat failed on node: HTTP {}", resp.status()));
+                Err(anyhow!("Chat failed on node: HTTP {}", resp.status()))
             }
         }
         Err(e) => {
             pb.finish_and_clear();
-            return Err(e).context("Networking error during chat request");
+            Err(e).context("Networking error during chat request")
         }
     }
 }
@@ -619,8 +618,7 @@ pub async fn chat_silent(
                     if let Ok(chunk) = chunk_result {
                         let text = String::from_utf8_lossy(&chunk);
                         for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let json_str = &line[6..];
+                            if let Some(json_str) = line.strip_prefix("data: ") {
                                 if let Ok(data) =
                                     serde_json::from_str::<serde_json::Value>(json_str)
                                 {
@@ -1166,7 +1164,7 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         } else {
             files.sort();
             for f in files {
-                println!("  {} {}", "📄", f.cyan());
+                println!("  📄 {}", f.cyan());
             }
         }
         println!();
