@@ -17,6 +17,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 home = "0.5"
 futures-util = "0.3"
 url = "2.3"
+getrandom = "0.2"
 indicatif = "0.18.4"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 rustyline = "12.0"

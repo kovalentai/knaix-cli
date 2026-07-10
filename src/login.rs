@@ -7,24 +7,65 @@ use axum::{
 };
 use colored::*;
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
     token: String,
     username: String,
+    #[serde(default)]
+    knaix_state: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     completed: Arc<Mutex<bool>>,
+    expected_state: String,
+}
+
+/// Page shown when a callback arrives with a missing or mismatched state
+/// nonce. The token is never stored in that case.
+const REJECTED_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Knaix</title></head><body style=\"font-family:sans-serif;text-align:center;padding:64px;color:#0f172a\"><h1>Authentication rejected</h1><p>This login callback did not match the request started by your terminal. You can close this window and run <code>knaix login</code> again.</p></body></html>";
+
+/// Generates a 256-bit random state token, hex-encoded, from the OS CSPRNG.
+fn new_state_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("failed to read OS randomness");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Constant-time string comparison, so a mismatched state nonce cannot be
+/// recovered byte-by-byte from response timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn handle_callback(
     Query(params): Query<CallbackParams>,
     Extension(state): Extension<AppState>,
 ) -> Html<&'static str> {
+    // CSRF protection: only accept a callback that echoes back the exact state
+    // nonce this login attempt generated. Without it, any local page could hit
+    // our loopback callback and inject an attacker-controlled token.
+    if params.knaix_state.is_empty()
+        || !constant_time_eq(&params.knaix_state, &state.expected_state)
+    {
+        eprintln!(
+            "\n{} Ignored a login callback with an invalid state token.",
+            "Error:".red()
+        );
+        return Html(REJECTED_HTML);
+    }
+
     let mut config = load_config();
     config.token = Some(params.token.clone());
     config.username = Some(params.username.clone());
@@ -335,21 +376,66 @@ async fn handle_callback(
 }
 
 pub async fn login() {
+    // Bind the callback server to an OS-assigned loopback port. A random port
+    // (rather than a fixed 4242) means other local processes cannot predict the
+    // callback URL to race or forge it.
+    let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "{} Could not start the local callback server: {}",
+                "Error:".red(),
+                e
+            );
+            return;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            eprintln!(
+                "{} Could not resolve the callback port: {}",
+                "Error:".red(),
+                e
+            );
+            return;
+        }
+    };
+
+    // Single-use nonce the browser redirect must echo back (CSRF protection).
+    let expected_state = new_state_token();
+
     let state = AppState {
         completed: Arc::new(Mutex::new(false)),
+        expected_state: expected_state.clone(),
     };
 
     let app = Router::new()
         .route("/callback", get(handle_callback))
         .layer(Extension(state.clone()));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 4242));
-    let auth_url = "https://app.kovalentai.com/cli-auth?callback=http://localhost:4242/callback";
+    let callback_url = format!(
+        "http://127.0.0.1:{}/callback?knaix_state={}",
+        port, expected_state
+    );
+
+    // Build the auth URL with the callback properly percent-encoded, so the
+    // callback's own query string survives being nested as a parameter.
+    let auth_url = match url::Url::parse("https://app.kovalentai.com/cli-auth") {
+        Ok(mut u) => {
+            u.query_pairs_mut().append_pair("callback", &callback_url);
+            u.to_string()
+        }
+        Err(e) => {
+            eprintln!("{} Invalid authentication URL: {}", "Error:".red(), e);
+            return;
+        }
+    };
 
     println!("{} Starting Knaix SSO Login...", "Info:".blue());
     println!("  Opening browser: {}\n", auth_url.dimmed());
 
-    if let Err(e) = open::that(auth_url) {
+    if let Err(e) = open::that(&auth_url) {
         eprintln!("{} {}", "Failed to open browser:".red(), e);
     }
 
@@ -365,7 +451,12 @@ pub async fn login() {
         }
     });
 
-    let _server = axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await;
+    let server = match axum::Server::from_tcp(listener) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{} Failed to start callback server: {}", "Error:".red(), e);
+            return;
+        }
+    };
+    let _ = server.serve(app.into_make_service()).await;
 }
