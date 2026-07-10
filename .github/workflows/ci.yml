@@ -27,10 +27,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        # Not yet gating on warnings: the imported baseline has known clippy
-        # lints that are cleaned up during the hardening pass. Flip this to
-        # `cargo clippy --all-targets -- -D warnings` once they are resolved.
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --release --locked

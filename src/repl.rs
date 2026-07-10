@@ -75,31 +75,23 @@ pub async fn run(ctx: &KnaixContext, node_id: &str) -> Result<()> {
                         "/exit" | "/quit" => break,
                         "/help" => {
                             println!("\n{}", "Available REPL Commands:".bold().underline());
+                            println!("  {:<14} End the current session", "/exit, /quit".cyan());
+                            println!("  {:<14} Show this help message", "/help".cyan());
                             println!(
-                                "  {:<14} {}",
-                                "/exit, /quit".cyan(),
-                                "End the current session"
-                            );
-                            println!("  {:<14} {}", "/help".cyan(), "Show this help message");
-                            println!(
-                                "  {:<14} {}",
-                                "/explain <...>\t".cyan(),
-                                "Ask the AI to explain a concept in detail"
+                                "  {:<14} Ask the AI to explain a concept in detail",
+                                "/explain <...>\t".cyan()
                             );
                             println!(
-                                "  {:<14} {}",
-                                "/summarize <...>\t".cyan(),
-                                "Ask the AI to summarize a topic or findings"
+                                "  {:<14} Ask the AI to summarize a topic or findings",
+                                "/summarize <...>\t".cyan()
                             );
                             println!(
-                                "  {:<14} {}",
-                                "/remember <...>\t".cyan(),
-                                "Explicitly save a fact to your durable memory"
+                                "  {:<14} Explicitly save a fact to your durable memory",
+                                "/remember <...>\t".cyan()
                             );
                             println!(
-                                "  {:<14} {}",
-                                "/memory\t\t".cyan(),
-                                "Ask the AI what it remembers about you\n"
+                                "  {:<14} Ask the AI what it remembers about you\n",
+                                "/memory\t\t".cyan()
                             );
                             continue;
                         }

@@ -400,7 +400,7 @@ pub async fn chat(
 
     // Resolve API key and connection metadata
     let instances_url = format!("{}/api/instances", ctx.config.api_url);
-    let mut api_key = "knaix-private-key".to_string();
+    let mut api_key: Option<String> = None;
     let mut is_byot = false;
     let mut node_ip = String::new();
 
@@ -423,7 +423,7 @@ pub async fn chat(
             if let Some(node) = target_node {
                 if let Some(creds) = &node.credentials {
                     if let Some(key) = &creds.api_key {
-                        api_key = key.clone();
+                        api_key = Some(key.clone());
                     }
                 }
                 if let Some(cfg) = &node.config {
@@ -446,6 +446,13 @@ pub async fn chat(
             pb.finish_and_clear();
             return Err(anyhow!("BYOT node ID not found. Cannot resolve MagicDNS."));
         }
+        let Some(node_key) = api_key.as_deref() else {
+            pb.finish_and_clear();
+            return Err(anyhow!(
+                "Could not resolve credentials for BYOT node {}; cannot establish a direct sovereign link.",
+                node_id
+            ));
+        };
         url = format!(
             "http://{}:8080/api/v1/workspace/default/stream-chat",
             node_ip
@@ -453,7 +460,7 @@ pub async fn chat(
         req_builder = ctx
             .client
             .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", api_key));
+            .header(AUTHORIZATION, format!("Bearer {}", node_key));
         pb.suspend(|| {
             println!(
                 "{} {}",
@@ -466,11 +473,15 @@ pub async fn chat(
             "{}/api/nodes/{}/proxy/api/v1/workspace/default/stream-chat",
             ctx.config.api_url, node_id
         );
-        req_builder = ctx
+        let mut builder = ctx
             .client
             .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .header("X-Target-Authorization", format!("Bearer {}", api_key));
+            .header(AUTHORIZATION, format!("Bearer {}", token));
+        // Only forward a node credential when the control plane returned one.
+        if let Some(node_key) = api_key.as_deref() {
+            builder = builder.header("X-Target-Authorization", format!("Bearer {}", node_key));
+        }
+        req_builder = builder;
     }
 
     let payload = serde_json::json!({ "message": message, "mode": "chat" });
@@ -492,8 +503,7 @@ pub async fn chat(
                     if let Ok(chunk) = chunk_result {
                         let text = String::from_utf8_lossy(&chunk);
                         for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let json_str = &line[6..];
+                            if let Some(json_str) = line.strip_prefix("data: ") {
                                 if let Ok(data) =
                                     serde_json::from_str::<serde_json::Value>(json_str)
                                 {
@@ -514,15 +524,15 @@ pub async fn chat(
                     println!();
                 }
 
-                return Ok(Some(assistant_text));
+                Ok(Some(assistant_text))
             } else {
                 pb.finish_and_clear();
-                return Err(anyhow!("Chat failed on node: HTTP {}", resp.status()));
+                Err(anyhow!("Chat failed on node: HTTP {}", resp.status()))
             }
         }
         Err(e) => {
             pb.finish_and_clear();
-            return Err(e).context("Networking error during chat request");
+            Err(e).context("Networking error during chat request")
         }
     }
 }
@@ -535,7 +545,7 @@ pub async fn chat_silent(
     let token = config.token.context("Not logged in")?;
     let client = reqwest::Client::new();
     let instances_url = format!("{}/api/instances", config.api_url);
-    let mut api_key = "knaix-private-key".to_string();
+    let mut api_key: Option<String> = None;
     let mut is_byot = false;
     let mut node_ip = String::new();
 
@@ -555,7 +565,7 @@ pub async fn chat_silent(
             {
                 if let Some(creds) = &node.credentials {
                     if let Some(key) = &creds.api_key {
-                        api_key = key.clone();
+                        api_key = Some(key.clone());
                     }
                 }
                 if let Some(cfg) = &node.config {
@@ -574,22 +584,28 @@ pub async fn chat_silent(
         if node_ip.is_empty() {
             return Err(anyhow!("BYOT node ID not found"));
         }
+        let node_key = api_key
+            .as_deref()
+            .context("Could not resolve credentials for BYOT node")?;
         url = format!(
             "http://{}:8080/api/v1/workspace/default/stream-chat",
             node_ip
         );
         req_builder = client
             .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", api_key));
+            .header(AUTHORIZATION, format!("Bearer {}", node_key));
     } else {
         url = format!(
             "{}/api/nodes/{}/proxy/api/v1/workspace/default/stream-chat",
             config.api_url, node_id
         );
-        req_builder = client
+        let mut builder = client
             .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .header("X-Target-Authorization", format!("Bearer {}", api_key));
+            .header(AUTHORIZATION, format!("Bearer {}", token));
+        if let Some(node_key) = api_key.as_deref() {
+            builder = builder.header("X-Target-Authorization", format!("Bearer {}", node_key));
+        }
+        req_builder = builder;
     }
 
     let payload = serde_json::json!({ "message": message, "mode": "chat" });
@@ -602,8 +618,7 @@ pub async fn chat_silent(
                     if let Ok(chunk) = chunk_result {
                         let text = String::from_utf8_lossy(&chunk);
                         for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let json_str = &line[6..];
+                            if let Some(json_str) = line.strip_prefix("data: ") {
                                 if let Ok(data) =
                                     serde_json::from_str::<serde_json::Value>(json_str)
                                 {
@@ -1149,7 +1164,7 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         } else {
             files.sort();
             for f in files {
-                println!("  {} {}", "📄", f.cyan());
+                println!("  📄 {}", f.cyan());
             }
         }
         println!();
