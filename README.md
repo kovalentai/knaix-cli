@@ -85,5 +85,5 @@ Knaix supports the following environment overrides for automated scripting:
 ---
 
 <div align="center">
-  <small>&copy; 2026 Kovalent AI & Knaix. All rights reserved.</small>
+  <small>&copy; 2026 Kovalent AI &amp; Knaix. Licensed under the Apache License, Version 2.0.</small>
 </div>
