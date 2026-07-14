@@ -2,6 +2,14 @@
 name = "knaix"
 version = "0.3.3"
 edition = "2021"
+description = "The command-line client for Kovalent AI: provision nodes, ingest documents, and chat over a zero-trust mesh."
+authors = ["Kovalent AI"]
+license = "Apache-2.0"
+readme = "README.md"
+homepage = "https://knaix.com"
+repository = "https://github.com/kovalentai/knaix-cli"
+keywords = ["kovalent", "ai", "cli", "rag", "sovereign"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "3.2", features = ["derive"] }
