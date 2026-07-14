@@ -1,0 +1,143 @@
+name: Release
+
+# Cut a release by pushing a semver tag that matches Cargo.toml, e.g.:
+#   git tag v0.3.4 && git push origin v0.3.4
+# Builds static Linux (musl) and native macOS binaries for x86_64 and
+# arm64, then publishes a GitHub Release with the tarballs and SHA256SUMS.
+# workflow_dispatch can re-build an existing tag.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. v0.3.4'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ship stripped release binaries without a Cargo.toml profile change.
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+
+jobs:
+  # Resolve the tag once and refuse to release if it disagrees with the
+  # version in Cargo.toml, so a mistagged release cannot ship.
+  meta:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+      - id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "v${CARGO_VER}" ]; then
+            echo "::error::Tag ${TAG} does not match Cargo.toml version v${CARGO_VER}."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          # ring (via rustls) compiles C; route it through musl-gcc on Linux.
+          CC: ${{ contains(matrix.target, 'linux-musl') && 'musl-gcc' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/knaix-${{ needs.meta.outputs.tag }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" knaix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: knaix-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: knaix-*
+          merge-multiple: true
+
+      - name: Checksums and installer
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum knaix-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
