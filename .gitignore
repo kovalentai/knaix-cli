@@ -5,3 +5,23 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Secrets and credentials (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials
+credentials.json
+secrets.*
+
+# Local Knaix runtime state written on the user's machine
+.knaix/
+config.json
+_knaix_durable_memory.md
+_knaix_ephemeral_log.md
+
+# Logs
+*.log
