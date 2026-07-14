@@ -1,0 +1,23 @@
+# Gitleaks configuration for the Knaix CLI.
+# Extends the upstream default rule set and adds project-specific rules.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "knaix-bearer-token"
+description = "Knaix/Kovalent API bearer token"
+regex = '''(?i)(knaix|kovalent)[_-]?token['"]?\s*[:=]\s*['"]?[a-z0-9\-_\.]{16,}'''
+tags = ["token", "knaix"]
+
+[[rules]]
+id = "tailscale-auth-key"
+description = "Tailscale auth key"
+regex = '''tskey-(auth|api)-[a-zA-Z0-9\-]{10,}'''
+tags = ["key", "tailscale"]
+
+[allowlist]
+description = "Paths that never contain real secrets"
+paths = [
+  '''Cargo\.lock''',
+  '''(^|/)target/''',
+]
