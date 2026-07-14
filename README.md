@@ -1,4 +1,4 @@
-# Knaix CLI (v0.3.0)
+# Knaix CLI (v0.3.3)
 
 The high-performance, single-tenant command-line daemon for Kovalent AI infrastructure. Engineered in Rust for memory safety, cryptographic isolation, and an uncompromising developer experience.
 
@@ -31,8 +31,8 @@ curl -sSL https://knaix.com/install.sh | bash
 
 ### Source Compilation (Requires Rust toolchain)
 ```bash
-git clone https://github.com/kovalent/kovalent.git
-cd apps/knaix-cli
+git clone https://github.com/kovalentai/knaix-cli.git
+cd knaix-cli
 cargo install --path .
 ```
 
