@@ -460,3 +460,75 @@ pub async fn login() {
     };
     let _ = server.serve(app.into_make_service()).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_token_is_256_bits_of_hex() {
+        let token = new_state_token();
+        assert_eq!(token.len(), 64, "expected 32 bytes as 64 hex chars");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn state_tokens_do_not_repeat() {
+        let a = new_state_token();
+        let b = new_state_token();
+        assert_ne!(a, b, "each login attempt must get a fresh nonce");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_strings() {
+        assert!(constant_time_eq("", ""));
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        // Different lengths must not match and must not panic.
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("abcd", "abc"));
+    }
+
+    fn state_with(expected: &str) -> AppState {
+        AppState {
+            completed: Arc::new(Mutex::new(false)),
+            expected_state: expected.to_string(),
+        }
+    }
+
+    // The success branch of handle_callback writes to the real ~/.knaix
+    // config, so these tests only exercise the rejection branch, which
+    // returns before touching any state or the filesystem.
+
+    #[tokio::test]
+    async fn callback_with_missing_state_is_rejected() {
+        let state = state_with("expected-nonce");
+        let params = CallbackParams {
+            token: "attacker-token".to_string(),
+            username: "victim".to_string(),
+            knaix_state: String::new(),
+        };
+        let resp = handle_callback(Query(params), Extension(state.clone())).await;
+        assert_eq!(resp.0, REJECTED_HTML);
+        assert!(
+            !*state.completed.lock().unwrap(),
+            "a callback without a state nonce must not complete login"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_with_mismatched_state_is_rejected() {
+        let state = state_with("expected-nonce");
+        let params = CallbackParams {
+            token: "attacker-token".to_string(),
+            username: "victim".to_string(),
+            knaix_state: "wrong-nonce".to_string(),
+        };
+        let resp = handle_callback(Query(params), Extension(state.clone())).await;
+        assert_eq!(resp.0, REJECTED_HTML);
+        assert!(
+            !*state.completed.lock().unwrap(),
+            "a callback with the wrong state nonce must not complete login"
+        );
+    }
+}
