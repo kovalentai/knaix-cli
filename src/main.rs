@@ -1,4 +1,5 @@
 mod config;
+mod local;
 mod login;
 mod nodes;
 mod repl;
@@ -100,6 +101,12 @@ enum Commands {
     /// Provision a new Sovereign Node instantly
     Up,
 
+    /// Run the whole stack on this machine, with no account and no network
+    Local {
+        #[clap(subcommand)]
+        action: LocalAction,
+    },
+
     /// Check that a node retrieves and cites correctly, using a bundled corpus
     Selftest {
         /// The ID of the node to test (falls back to default)
@@ -126,6 +133,41 @@ enum Commands {
         /// Optional: read a specific memory file instead of listing
         #[clap(short, long)]
         file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalAction {
+    /// Start the local node (pulls the image the first time)
+    Up {
+        /// Host port to publish the node on
+        #[clap(long)]
+        port: Option<u16>,
+
+        /// Use a local model served at this URL instead of the mock
+        #[clap(long)]
+        llama_url: Option<String>,
+
+        /// Re-pull the image even if it is already present
+        #[clap(long)]
+        pull: bool,
+    },
+
+    /// Stop the local node
+    Down {
+        /// Also delete its store, discarding everything ingested
+        #[clap(long)]
+        purge: bool,
+    },
+
+    /// Show whether the local node is running and healthy
+    Status,
+
+    /// Show the local node's container logs
+    Logs {
+        /// Number of lines to show
+        #[clap(short, long, default_value = "50")]
+        lines: usize,
     },
 }
 
@@ -168,13 +210,13 @@ async fn main() -> Result<()> {
             println!("{} Set default node to {}", "Info:".blue(), node_id.bold());
         }
         Commands::Chat { node_id, message } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                nodes::chat(&ctx, &id, &message, true).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                nodes::chat(&ctx, &target, &message, true).await?;
             }
         }
         Commands::Upload { node_id, file_path } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                nodes::upload(&ctx, &id, &file_path).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                nodes::upload(&ctx, &target, &file_path).await?;
             }
         }
         Commands::Status => {
@@ -260,10 +302,20 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Repl { node_id } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                repl::run(&ctx, &id).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                repl::run(&ctx, &target).await?;
             }
         }
+        Commands::Local { action } => match action {
+            LocalAction::Up {
+                port,
+                llama_url,
+                pull,
+            } => local::up(port, llama_url, pull).await?,
+            LocalAction::Down { purge } => local::down(purge)?,
+            LocalAction::Status => local::status(ctx.output_format == "json").await?,
+            LocalAction::Logs { lines } => local::logs(lines)?,
+        },
         Commands::Up => {
             nodes::up(&ctx).await?;
         }
@@ -273,8 +325,8 @@ async fn main() -> Result<()> {
             quick,
             sweep,
         } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                selftest::run(&ctx, &id, keep, quick, sweep).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                selftest::run(&ctx, &target, keep, quick, sweep).await?;
             }
         }
         Commands::Memory { node_id, file } => {

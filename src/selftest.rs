@@ -11,7 +11,7 @@
 //! uploads is deleted before it returns. A node under test finishes with the
 //! corpus it started with.
 
-use crate::nodes::{Citation, KnaixContext};
+use crate::nodes::{Citation, KnaixContext, Target};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -189,11 +189,12 @@ fn quick_subset(all: &[GoldenQuestion]) -> Vec<GoldenQuestion> {
 
 pub async fn run(
     ctx: &KnaixContext,
-    node_uuid: &str,
+    target: &Target,
     keep: bool,
     quick: bool,
     sweep: bool,
 ) -> Result<()> {
+    let node_uuid = &target.label();
     let all = questions()?;
     let questions = if quick { quick_subset(&all) } else { all };
     let human = ctx.output_format != "json";
@@ -201,10 +202,10 @@ pub async fn run(
     // A run interrupted before cleanup leaves its corpus behind, and the next
     // run would then measure against two copies of every document. Report that
     // rather than assuming ownership of documents this run did not create.
-    let leftovers = list_selftest_documents(ctx, node_uuid).await?;
+    let leftovers = list_selftest_documents(ctx, target).await?;
     if !leftovers.is_empty() {
         if sweep {
-            let swept = sweep_previous(ctx, node_uuid).await?;
+            let swept = sweep_previous(ctx, target).await?;
             if human {
                 println!(
                     "{} Removed {} self-test document(s) left by an earlier run.",
@@ -249,24 +250,24 @@ pub async fn run(
     // Track ids as we go: a failure part-way through still has to clean up what
     // it managed to create.
     let mut document_ids: Vec<String> = Vec::new();
-    let ingest = ingest_corpus(ctx, node_uuid, &run_id, &mut document_ids).await;
+    let ingest = ingest_corpus(ctx, target, &run_id, &mut document_ids).await;
     if let Err(e) = ingest {
         pb.finish_and_clear();
-        cleanup(ctx, node_uuid, &document_ids, keep, human).await;
+        cleanup(ctx, target, &document_ids, keep, human).await;
         return Err(e);
     }
 
-    let (outcomes, model) = match run_questions(ctx, node_uuid, &questions, &pb, human).await {
+    let (outcomes, model) = match run_questions(ctx, target, &questions, &pb, human).await {
         Ok(o) => o,
         Err(e) => {
             pb.finish_and_clear();
-            cleanup(ctx, node_uuid, &document_ids, keep, human).await;
+            cleanup(ctx, target, &document_ids, keep, human).await;
             return Err(e);
         }
     };
     pb.finish_and_clear();
 
-    cleanup(ctx, node_uuid, &document_ids, keep, human).await;
+    cleanup(ctx, target, &document_ids, keep, human).await;
 
     let report = summarize(node_uuid, outcomes, model);
     if human {
@@ -319,10 +320,45 @@ fn document_name(run_id: &str, source_key: &str) -> String {
 
 async fn ingest_corpus(
     ctx: &KnaixContext,
-    node_uuid: &str,
+    target: &Target,
     run_id: &str,
     document_ids: &mut Vec<String>,
 ) -> Result<()> {
+    if let Target::Local { base, instance_id } = target {
+        // The node parses, chunks and embeds it itself; there is no control
+        // plane in the path and no credential to present.
+        for doc in corpus() {
+            let name = document_name(run_id, doc.source_key);
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/ingest", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "text": doc.body,
+                    "filename": name,
+                }))
+                .send()
+                .await
+                .context("Failed to reach the local node")?;
+
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "Self-test could not ingest {}: HTTP {} - {}",
+                    name,
+                    status,
+                    body["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+            if let Some(id) = body["documentId"].as_str() {
+                document_ids.push(id.to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    let node_uuid = target.label();
     let token = ctx.get_token()?;
     let url = format!(
         "{}/api/knowledge/{}/documents",
@@ -364,7 +400,7 @@ async fn ingest_corpus(
 
 async fn run_questions(
     ctx: &KnaixContext,
-    node_uuid: &str,
+    target: &Target,
     questions: &[GoldenQuestion],
     pb: &ProgressBar,
     human: bool,
@@ -378,7 +414,7 @@ async fn run_questions(
         }
 
         let started = Instant::now();
-        let answer = ask(ctx, node_uuid, &q.query).await?;
+        let answer = ask(ctx, target, &q.query).await?;
         let answer_ms = started.elapsed().as_millis();
         if model.is_none() {
             model = answer.model.clone();
@@ -439,8 +475,8 @@ async fn run_questions(
 /// A run costs one request per question plus a handful for setup, against an
 /// account-wide budget shared with everything else the user is doing. A raw
 /// "HTTP 429" mid-run reads as a broken node rather than a spent budget.
-async fn ask(ctx: &KnaixContext, node_uuid: &str, query: &str) -> Result<crate::nodes::ChatAnswer> {
-    match crate::nodes::chat(ctx, node_uuid, query, false).await {
+async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::nodes::ChatAnswer> {
+    match crate::nodes::chat(ctx, target, query, false).await {
         Ok(Some(answer)) => Ok(answer),
         Ok(None) => Err(anyhow!("Node returned no answer")),
         Err(e) if e.to_string().contains("429") => Err(anyhow!(
@@ -458,18 +494,25 @@ async fn ask(ctx: &KnaixContext, node_uuid: &str, query: &str) -> Result<crate::
 /// under it, and that run would then measure a node whose documents vanished
 /// mid-question -- a wrong answer reported confidently, which is worse than a
 /// stale document left lying around.
-async fn sweep_previous(ctx: &KnaixContext, node_uuid: &str) -> Result<usize> {
-    let stale = list_selftest_documents(ctx, node_uuid).await?;
+async fn sweep_previous(ctx: &KnaixContext, target: &Target) -> Result<usize> {
+    let stale = list_selftest_documents(ctx, target).await?;
     let mut removed = 0;
     for id in stale {
-        if delete_document(ctx, node_uuid, &id).await.is_ok() {
+        if delete_document(ctx, target, &id).await.is_ok() {
             removed += 1;
         }
     }
     Ok(removed)
 }
 
-async fn list_selftest_documents(ctx: &KnaixContext, node_uuid: &str) -> Result<Vec<String>> {
+async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<Vec<String>> {
+    // The node keeps chunks, not a document registry, so there is nothing to
+    // enumerate locally. A local run cleans up by the ids it collected instead,
+    // and has no way to find another run's leftovers.
+    if target.is_local() {
+        return Ok(Vec::new());
+    }
+    let node_uuid = target.label();
     let token = ctx.get_token()?;
     let url = format!(
         "{}/api/knowledge/{}/documents",
@@ -504,7 +547,26 @@ async fn list_selftest_documents(ctx: &KnaixContext, node_uuid: &str) -> Result<
         .collect())
 }
 
-async fn delete_document(ctx: &KnaixContext, node_uuid: &str, document_id: &str) -> Result<()> {
+async fn delete_document(ctx: &KnaixContext, target: &Target, document_id: &str) -> Result<()> {
+    if let Target::Local { base, instance_id } = target {
+        let resp = ctx
+            .client
+            .post(format!("{}/api/kb/delete", base))
+            .json(&serde_json::json!({
+                "instance_id": instance_id,
+                "document_id": document_id,
+            }))
+            .send()
+            .await
+            .context("Failed to reach the local node")?;
+        return if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("Delete failed: HTTP {}", resp.status()))
+        };
+    }
+
+    let node_uuid = target.label();
     let token = ctx.get_token()?;
     let url = format!(
         "{}/api/knowledge/{}/documents/{}",
@@ -531,7 +593,7 @@ async fn delete_document(ctx: &KnaixContext, node_uuid: &str, document_id: &str)
 /// user must never be left unaware that generated documents are still there.
 async fn cleanup(
     ctx: &KnaixContext,
-    node_uuid: &str,
+    target: &Target,
     document_ids: &[String],
     keep: bool,
     human: bool,
@@ -550,7 +612,7 @@ async fn cleanup(
 
     let mut failed = Vec::new();
     for id in document_ids {
-        if delete_document(ctx, node_uuid, id).await.is_err() {
+        if delete_document(ctx, target, id).await.is_err() {
             failed.push(id.clone());
         }
     }
