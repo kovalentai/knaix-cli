@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Pull requests from forks get a read-only token; state it explicitly rather
+# than relying on the repository default.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,3 +39,20 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails the build on any RustSec advisory affecting the locked
+      # dependency tree, including unmaintained crates.
+      - name: Audit
+        run: cargo audit --deny warnings
