@@ -32,6 +32,66 @@ fn stored_config(home: &Path) -> String {
 }
 
 #[test]
+fn a_fresh_install_saves_the_real_default_api_url() {
+    let home = scratch_home("freshdefault");
+
+    // The first command to write a config on a new machine must not poison
+    // api_url with an empty string; the field is present from then on, so
+    // serde's default would never repair it.
+    let status = knaix(&home)
+        .args(["use", "some-node"])
+        .status()
+        .expect("failed to run knaix");
+    assert!(status.success(), "knaix use should succeed");
+
+    let saved = stored_config(&home);
+    assert!(
+        saved.contains("https://api.kovalentai.com"),
+        "a fresh config should carry the real default API URL:\n{saved}"
+    );
+
+    // And it must still be there after a round trip through the file.
+    let out = knaix(&home)
+        .args(["-o", "json", "status"])
+        .output()
+        .expect("failed to run knaix");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("https://api.kovalentai.com"),
+        "the saved API URL should survive a reload:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn an_empty_api_url_on_disk_is_repaired() {
+    let home = scratch_home("repair");
+
+    // Simulate a config written by a version that saved the empty default.
+    let dir = home.join(".knaix");
+    fs::create_dir_all(&dir).expect("could not create config dir");
+    fs::write(
+        dir.join("config.json"),
+        r#"{"token":null,"username":null,"api_url":"","default_node_id":"n1"}"#,
+    )
+    .expect("could not seed config");
+
+    let out = knaix(&home)
+        .args(["-o", "json", "status"])
+        .output()
+        .expect("failed to run knaix");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("https://api.kovalentai.com"),
+        "an empty stored api_url should fall back to the default:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn env_token_is_not_written_to_the_config_file() {
     let home = scratch_home("token");
 

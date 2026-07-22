@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub token: Option<String>,
     pub username: Option<String>,
@@ -21,6 +21,24 @@ pub struct Config {
     pub last_update_check: Option<u64>,
     #[serde(default)]
     pub latest_known_version: Option<String>,
+}
+
+/// Written by hand rather than derived. A derived `Default` gives `api_url` an
+/// empty string, and the serde attribute above only fills the field in when it
+/// is missing from the JSON. Saving a defaulted config would write
+/// `"api_url": ""`, which is then present on every later read and so never
+/// repaired.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            token: None,
+            username: None,
+            api_url: default_api_url(),
+            default_node_id: None,
+            last_update_check: None,
+            latest_known_version: None,
+        }
+    }
 }
 
 fn default_api_url() -> String {
@@ -47,12 +65,21 @@ pub fn get_config_path() -> PathBuf {
 /// the current process to disk in plaintext.
 pub fn load_stored_config() -> Config {
     let path = get_config_path();
-    if path.exists() {
+    let mut config = if path.exists() {
         let content = fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
         serde_json::from_str(&content).unwrap_or_else(|_| Config::default())
     } else {
         Config::default()
+    };
+
+    // Repair configs already written with an empty api_url by earlier versions.
+    // Without this they stay broken, because the field is present and so serde
+    // never substitutes the default.
+    if config.api_url.trim().is_empty() {
+        config.api_url = default_api_url();
     }
+
+    config
 }
 
 /// Loads the effective config: what is on disk, with environment overrides
