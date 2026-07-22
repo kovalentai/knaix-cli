@@ -2,6 +2,23 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- **Environment credentials stay ephemeral**: `KNAIX_TOKEN` and `KNAIX_API_URL` are no longer written into `~/.knaix/config.json`. Previously any command that saved the config, including the daily update check, persisted them to disk in plaintext, so a CI token outlived the job it was issued for.
+- **Dependency advisories cleared**: Advanced `clap`, `reqwest`, and `axum`, resolving four RustSec vulnerabilities. The notable ones were certificate name-constraint bypasses and a CRL parsing panic in `rustls-webpki` 0.101, on the TLS path every command uses. CI now fails on any new advisory.
+
+### Added
+- **`KNAIX_NO_UPDATE_CHECK`**: Set to `1` to disable the daily version check, the only network request the CLI makes on its own behalf.
+
+### Fixed
+- **`knaix up` reports real state**: The command no longer pads its output with an invented five-second boot sequence. It returns when the API accepts the request and tells you how to watch for the node coming up.
+- **Update check no longer clobbers concurrent writes**: It re-reads the config before saving, instead of overwriting it with the copy loaded at startup.
+- **`knaix status`** pointed at a nonexistent `knaix select` command when no default node was set.
+
+### Documentation
+- Corrected the documented global JSON flag (`-o json`, not `--json`), the descriptions of `status`, `metrics`, `logs`, and `config`, where agent memory is written, and a reference to PKCE in a login flow that does not use it.
+
 ## [0.3.3] - 2026-03-03
 
 ### Sovereign Agentic Memory
@@ -59,5 +76,5 @@ All notable changes to the Knaix CLI will be documented in this file.
 
 ### Added
 - **Initial Beta**: First release of the Rust-based Knaix CLI.
-- **Auth Flow**: Integrated PKCE-based SSO login via the Kovalent Identity Center.
+- **Auth Flow**: Integrated browser-based SSO login via the Kovalent Identity Center.
 - **Core Commands**: Support for `chat`, `upload`, `metrics`, and node listing.

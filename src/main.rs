@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
                 config
                     .default_node_id
                     .as_deref()
-                    .unwrap_or("None set (use 'knaix select')")
+                    .unwrap_or("None set (use 'knaix use <node-id>')")
                     .blue()
                     .to_string(),
             ]);
