@@ -333,13 +333,13 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Metrics { node_id } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                nodes::get_metrics(&ctx, &id).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                nodes::get_metrics_for(&ctx, &target).await?;
             }
         }
         Commands::Logs { node_id, lines } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                nodes::get_logs(&ctx, &id, lines).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                nodes::get_logs_for(&ctx, &target, lines).await?;
             }
         }
         Commands::Repl { node_id } => {
@@ -381,8 +381,9 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Commands::Memory { node_id, file } => {
-            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
-                nodes::view_memory(&ctx, &id, file.as_deref()).await?;
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                let key = nodes::memory_key(&target);
+                nodes::view_memory(&ctx, &key, file.as_deref()).await?;
             }
         }
     }

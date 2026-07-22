@@ -1230,6 +1230,87 @@ fn report_summary(summary: &UploadSummary) {
     println!();
 }
 
+/// Health and latency for the local node, measured against it directly.
+///
+/// The control plane's metrics route reports what *it* can see of a hosted
+/// node. There is no control plane here, and the node is one hop away on
+/// loopback, so the honest number is the one measured from this machine.
+async fn get_local_metrics(ctx: &KnaixContext, base: &str) -> Result<()> {
+    let url = format!("{}/health", base);
+    let started = std::time::Instant::now();
+    let resp = ctx.client.get(&url).send().await.with_context(|| {
+        format!(
+            "Could not reach the local node at {}. Is it running? Try 'knaix local status'.",
+            base
+        )
+    })?;
+    let latency = started.elapsed().as_millis();
+
+    let healthy = resp.status().is_success();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+    if ctx.output_format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node": crate::local::LOCAL_NODE_ID,
+                "url": base,
+                "healthy": healthy,
+                "latencyMs": latency,
+                "ready": body["ready"],
+                "binding": body["binding"],
+                "tier": body["tier"],
+                "peers": body["peers"],
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("\n{}", "Local node health:".bold().underline());
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec![
+        "Status".dimmed().to_string(),
+        if healthy && body["ready"].as_bool().unwrap_or(false) {
+            "HEALTHY".green().to_string()
+        } else {
+            "NOT READY".yellow().to_string()
+        },
+    ]);
+    table.add_row(vec!["URL".dimmed().to_string(), base.cyan().to_string()]);
+    table.add_row(vec![
+        "Latency".dimmed().to_string(),
+        format!("{}ms", latency).blue().to_string(),
+    ]);
+    table.add_row(vec![
+        "Binding".dimmed().to_string(),
+        body["binding"].as_str().unwrap_or("unknown").to_string(),
+    ]);
+    table.add_row(vec![
+        "Tier".dimmed().to_string(),
+        body["tier"].as_str().unwrap_or("unknown").to_string(),
+    ]);
+    table.add_row(vec![
+        "Peers".dimmed().to_string(),
+        body["peers"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+            .to_string(),
+    ]);
+    println!("{table}\n");
+    Ok(())
+}
+
+pub async fn get_metrics_for(ctx: &KnaixContext, target: &Target) -> Result<()> {
+    match target {
+        Target::Local { base, .. } => get_local_metrics(ctx, base).await,
+        Target::Remote { uuid } => get_metrics(ctx, uuid).await,
+    }
+}
+
 pub async fn get_metrics(ctx: &KnaixContext, node_id: &str) -> Result<()> {
     let token = ctx.get_token()?;
 
@@ -1323,6 +1404,15 @@ pub async fn get_metrics(ctx: &KnaixContext, node_id: &str) -> Result<()> {
             pb.finish_and_clear();
             Err(e).context("Networking error during metrics request")
         }
+    }
+}
+
+pub async fn get_logs_for(ctx: &KnaixContext, target: &Target, lines: usize) -> Result<()> {
+    match target {
+        // The node is a container on this machine; its logs are docker's, and
+        // going through a control plane to reach them would be absurd.
+        Target::Local { .. } => crate::local::logs(lines),
+        Target::Remote { uuid } => get_logs(ctx, uuid, lines).await,
     }
 }
 
@@ -1580,6 +1670,14 @@ pub async fn upload_single_file_silent(
     }
 }
 
+/// Directory name a target's memory is filed under.
+///
+/// Memory has always been local files; the control plane was only ever asked
+/// for a name to put on the directory. The local node has a name already.
+pub fn memory_key(target: &Target) -> String {
+    target.label()
+}
+
 pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::path::Path::new(".").to_path_buf());
     let memory_dir = home_dir.join(".knaix").join("memory").join(node_id);
@@ -1709,5 +1807,43 @@ mod tests {
         let r = Target::Remote { uuid: "u-1".into() };
         assert!(!r.is_local());
         assert_eq!(r.label(), "u-1");
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn local() -> Target {
+        Target::Local {
+            base: "http://127.0.0.1:8080".into(),
+            instance_id: "11111111-2222-4333-8444-555555555555".into(),
+        }
+    }
+
+    #[test]
+    fn memory_is_filed_under_a_name_that_needs_no_control_plane() {
+        // Memory is local files. Resolving a UUID through the API just to name
+        // a directory is what made `knaix memory` fail with a DNS error on a
+        // machine that has no control plane.
+        assert_eq!(memory_key(&local()), crate::local::LOCAL_NODE_ID);
+        assert_eq!(
+            memory_key(&Target::Remote {
+                uuid: "abc-123".into()
+            }),
+            "abc-123"
+        );
+    }
+
+    #[test]
+    fn a_local_target_is_recognisable_without_a_network_call() {
+        assert!(local().is_local());
+        assert!(!Target::Remote { uuid: "x".into() }.is_local());
+    }
+
+    #[test]
+    fn the_local_label_is_the_reserved_name_users_type() {
+        // `knaix use local` writes this, and every command has to route on it.
+        assert_eq!(local().label(), "local");
     }
 }
