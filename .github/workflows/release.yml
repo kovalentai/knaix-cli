@@ -53,41 +53,42 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: meta
-    runs-on: ${{ matrix.os }}
+    # Every target — Linux musl AND macOS — cross-compiles from one x86_64
+    # Linux runner via cargo-zigbuild, which uses zig as the C/C++ linker.
+    # macOS runners bill at 10x Linux, so building the Apple targets natively
+    # was by far the most expensive part of a release; zig links Mach-O just
+    # as well and ships the macOS libSystem stubs, so no Apple SDK is needed.
+    # This also drops the musl-tools install and the native arm64 runner.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-13
-          - target: aarch64-apple-darwin
-            os: macos-14
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
-      - name: Install musl toolchain
-        if: contains(matrix.target, 'linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build
-        env:
-          # ring (via rustls) compiles C; route it through musl-gcc on Linux.
-          CC: ${{ contains(matrix.target, 'linux-musl') && 'musl-gcc' || '' }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
