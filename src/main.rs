@@ -172,6 +172,10 @@ enum LocalAction {
         #[clap(long)]
         llama_url: Option<String>,
 
+        /// Model to request from that server, e.g. an Ollama model name
+        #[clap(long)]
+        llama_model: Option<String>,
+
         /// Ignore any remembered model server and use the deterministic mock
         #[clap(long, conflicts_with = "llama_url")]
         mock: bool,
@@ -351,9 +355,10 @@ async fn main() -> Result<()> {
             LocalAction::Up {
                 port,
                 llama_url,
+                llama_model,
                 mock,
                 pull,
-            } => local::up(port, llama_url, mock, pull).await?,
+            } => local::up(port, llama_url, llama_model, mock, pull).await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
             LocalAction::Logs { lines } => local::logs(lines)?,

@@ -77,6 +77,10 @@ pub struct LocalNode {
     /// written before this was recorded, and when the mock is in use.
     #[serde(default)]
     pub llama_url: Option<String>,
+    /// Which model to ask that server for. Servings vary: llama-server ignores
+    /// it, Ollama and vLLM require a name they actually host.
+    #[serde(default)]
+    pub llama_model: Option<String>,
 }
 
 impl LocalNode {
@@ -162,6 +166,7 @@ fn image_present(tag: &str) -> bool {
 pub async fn up(
     port: Option<u16>,
     llama_url: Option<String>,
+    llama_model: Option<String>,
     mock: bool,
     pull: bool,
 ) -> Result<()> {
@@ -289,6 +294,15 @@ pub async fn up(
             args.push(format!("{}:host-gateway", HOST_GATEWAY));
             args.push("-e".into());
             args.push(format!("LLAMA_SERVER_URL={}", reachable));
+            // Servers differ on whether this matters: llama-server serves the
+            // one model it was started with and ignores the name, while Ollama
+            // and vLLM route on it and refuse a name they do not host. Sending
+            // the wrong one fails at the first question rather than at startup,
+            // which is the worst time to find out.
+            if let Some(model) = &llama_model {
+                args.push("-e".into());
+                args.push(format!("LLAMA_MODEL_ID={}", model));
+            }
         }
         // Nothing serves a model by default, and generation fails closed
         // without one. The deterministic mock answers from the chunks the node
@@ -308,6 +322,7 @@ pub async fn up(
         instance_id,
         image: tag,
         llama_url: llama_url.clone(),
+        llama_model: llama_model.clone(),
     };
     save(&node)?;
 
@@ -493,7 +508,10 @@ pub async fn status(json: bool) -> Result<()> {
         table.add_row(vec![
             "Answers".dimmed().to_string(),
             match &n.llama_url {
-                Some(url) => format!("model at {}", url).green().to_string(),
+                Some(url) => match &n.llama_model {
+                    Some(model) => format!("{} at {}", model, url).green().to_string(),
+                    None => format!("model at {}", url).green().to_string(),
+                },
                 None => "deterministic mock (retrieval is real)"
                     .yellow()
                     .to_string(),
@@ -584,8 +602,20 @@ mod tests {
             instance_id: "x".into(),
             image: "img".into(),
             llama_url: None,
+            llama_model: None,
         };
         assert_eq!(node.base_url(), "http://127.0.0.1:9123");
+    }
+
+    #[test]
+    fn the_model_name_is_remembered_with_its_server() {
+        // Ollama and vLLM route on the model name and refuse one they do not
+        // host, so losing it turns every question into a 404 after a startup
+        // that looked fine.
+        let json = r#"{"port":8080,"instance_id":"a","image":"i","llama_url":"http://h:11434","llama_model":"qwen3.5:latest"}"#;
+        let node: LocalNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.llama_model.as_deref(), Some("qwen3.5:latest"));
+        assert_eq!(node.llama_url.as_deref(), Some("http://h:11434"));
     }
 
     #[test]
@@ -596,6 +626,7 @@ mod tests {
         let node: LocalNode = serde_json::from_str(old).expect("old state must still parse");
         assert_eq!(node.port, 8080);
         assert_eq!(node.llama_url, None);
+        assert_eq!(node.llama_model, None);
     }
 
     #[test]
