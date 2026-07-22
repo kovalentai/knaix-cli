@@ -2,6 +2,7 @@ mod config;
 mod login;
 mod nodes;
 mod repl;
+mod selftest;
 mod update;
 
 use anyhow::Result;
@@ -98,6 +99,24 @@ enum Commands {
 
     /// Provision a new Sovereign Node instantly
     Up,
+
+    /// Check that a node retrieves and cites correctly, using a bundled corpus
+    Selftest {
+        /// The ID of the node to test (falls back to default)
+        node_id: Option<String>,
+
+        /// Leave the generated documents on the node instead of removing them
+        #[clap(long)]
+        keep: bool,
+
+        /// Ask a short, balanced subset instead of the full question set
+        #[clap(long)]
+        quick: bool,
+
+        /// Remove self-test documents left behind by an earlier interrupted run
+        #[clap(long)]
+        sweep: bool,
+    },
 
     /// View your Sovereign Agentic Memory for a node
     Memory {
@@ -247,6 +266,16 @@ async fn main() -> Result<()> {
         }
         Commands::Up => {
             nodes::up(&ctx).await?;
+        }
+        Commands::Selftest {
+            node_id,
+            keep,
+            quick,
+            sweep,
+        } => {
+            if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
+                selftest::run(&ctx, &id, keep, quick, sweep).await?;
+            }
         }
         Commands::Memory { node_id, file } => {
             if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {
