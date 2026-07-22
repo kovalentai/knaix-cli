@@ -53,6 +53,10 @@ pub struct Document {
 pub struct ChatAnswer {
     pub text: String,
     pub citations: Vec<Citation>,
+    /// The model that produced the answer. A node running the deterministic
+    /// mock reports it here, which is the difference between "this model chose
+    /// its citations" and "the pipeline cited whatever ranked first".
+    pub model: Option<String>,
 }
 
 /// One grounded passage the node returned alongside an answer.
@@ -488,13 +492,17 @@ pub async fn chat(
         return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail));
     }
 
-    let (text, citations) = read_chat_stream(resp, &pb, stream_to_stdout).await?;
+    let (text, citations, model) = read_chat_stream(resp, &pb, stream_to_stdout).await?;
 
     if stream_to_stdout {
         print_citations(&citations);
     }
 
-    Ok(Some(ChatAnswer { text, citations }))
+    Ok(Some(ChatAnswer {
+        text,
+        citations,
+        model,
+    }))
 }
 
 /// Consume the server-sent event stream, printing tokens as they land.
@@ -507,11 +515,12 @@ async fn read_chat_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
     stream_to_stdout: bool,
-) -> Result<(String, Vec<Citation>)> {
+) -> Result<(String, Vec<Citation>, Option<String>)> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
+    let mut model: Option<String> = None;
     // Which citations the answer actually referenced. It arrives at the end, in
     // the `done` frame, rather than on the citations themselves.
     let mut cited_indexes: Vec<u32> = Vec::new();
@@ -544,6 +553,7 @@ async fn read_chat_stream(
                 "meta" => {
                     citations =
                         serde_json::from_value(parsed["citations"].clone()).unwrap_or_default();
+                    model = parsed["model"].as_str().map(|s| s.to_string());
                 }
                 "error" => {
                     stream_error = Some(
@@ -607,7 +617,7 @@ async fn read_chat_stream(
         citation.cited = Some(referenced);
     }
 
-    Ok((answer, citations))
+    Ok((answer, citations, model))
 }
 
 /// Render the passages an answer was grounded in, so a claim can be checked

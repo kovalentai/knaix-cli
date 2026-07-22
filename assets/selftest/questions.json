@@ -1,0 +1,618 @@
+[
+  {
+    "id": "msa-term",
+    "domain": "legal",
+    "query": "How long does the contract run before it renews, and how much notice is needed to stop renewal?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "twenty-four",
+      "renewing automatically"
+    ]
+  },
+  {
+    "id": "msa-payment",
+    "domain": "legal",
+    "query": "When are invoices due and what late fee applies to overdue amounts?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "within thirty (30) days of the invoice date"
+    ]
+  },
+  {
+    "id": "msa-uptime",
+    "domain": "legal",
+    "query": "What uptime is guaranteed and what service credit do I get if it is missed?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "99.9%",
+      "service credit"
+    ]
+  },
+  {
+    "id": "msa-liability-cap",
+    "domain": "legal",
+    "query": "Is there a cap on how much either party can be held liable for?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "aggregate liability",
+      "twelve (12) months preceding"
+    ]
+  },
+  {
+    "id": "msa-ip",
+    "domain": "legal",
+    "query": "Who owns the customer data versus the platform itself?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "client retains",
+      "client data"
+    ]
+  },
+  {
+    "id": "msa-confidentiality-survival",
+    "domain": "legal",
+    "query": "After the contract ends, how long do confidentiality duties last?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "confidentiality obligations survive termination",
+      "five (5) years"
+    ]
+  },
+  {
+    "id": "msa-indemnity",
+    "domain": "legal",
+    "query": "Does the vendor protect us if the product is accused of infringing a patent?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "defend and indemnify",
+      "infringes"
+    ]
+  },
+  {
+    "id": "msa-termination-cure",
+    "domain": "legal",
+    "query": "How much time does a party get to fix a material breach before the deal can be cancelled?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "materially breaches",
+      "cure the breach"
+    ]
+  },
+  {
+    "id": "msa-governing-law",
+    "domain": "legal",
+    "query": "Which state law governs this agreement and where would disputes be heard?",
+    "goldSourceKeys": [
+      "legal-msa"
+    ],
+    "goldNeedles": [
+      "state of delaware"
+    ]
+  },
+  {
+    "id": "dpa-roles",
+    "domain": "legal",
+    "query": "Under data protection law, which side is the controller and which is the processor?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "client acts as the controller",
+      "processor"
+    ]
+  },
+  {
+    "id": "dpa-subprocessor-notice",
+    "domain": "legal",
+    "query": "How much warning do we get before a new subprocessor is added?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "subprocessor",
+      "thirty (30) days"
+    ]
+  },
+  {
+    "id": "dpa-breach-window",
+    "domain": "legal",
+    "query": "How quickly must the processor tell us about a personal data breach?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "seventy-two (72) hours"
+    ]
+  },
+  {
+    "id": "dpa-residency",
+    "domain": "legal",
+    "query": "Can our customer data be moved out of the region we picked without asking us?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "selected region",
+      "prior written consent"
+    ]
+  },
+  {
+    "id": "dpa-deletion",
+    "domain": "legal",
+    "query": "After we stop using the service, how long until our personal data is deleted or returned?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "delete or return",
+      "ninety (90) days"
+    ]
+  },
+  {
+    "id": "dpa-audit",
+    "domain": "legal",
+    "query": "How often are we allowed to audit the processor for compliance?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "audits",
+      "once per twelve (12) month"
+    ]
+  },
+  {
+    "id": "dpa-security-keys",
+    "domain": "legal",
+    "query": "How are encryption keys handled and how often are they rotated?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "key-management service",
+      "rotated at least annually"
+    ]
+  },
+  {
+    "id": "dpa-transfers",
+    "domain": "legal",
+    "query": "What legal mechanism covers sending data to a country without an adequacy decision?",
+    "goldSourceKeys": [
+      "legal-dpa"
+    ],
+    "goldNeedles": [
+      "standard contractual clauses"
+    ]
+  },
+  {
+    "id": "exp-approval-5k",
+    "domain": "finance",
+    "query": "Who has to sign off before I spend more than five thousand dollars on one item?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "above $5,000",
+      "vice president of finance"
+    ]
+  },
+  {
+    "id": "exp-receipt-threshold",
+    "domain": "finance",
+    "query": "At what dollar amount do I need to attach an itemized receipt?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "itemized receipts are required",
+      "$25"
+    ]
+  },
+  {
+    "id": "exp-per-diem",
+    "domain": "finance",
+    "query": "What is the daily meal allowance and can I claim wine with dinner?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "meal per diem is $75",
+      "alcohol is not reimbursable"
+    ]
+  },
+  {
+    "id": "exp-mileage",
+    "domain": "finance",
+    "query": "What rate do I get for driving my own car on business?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "67 cents per mile"
+    ]
+  },
+  {
+    "id": "exp-flight-class",
+    "domain": "finance",
+    "query": "On a long-haul flight over six hours, what cabin class am I allowed to book?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "premium economy is permitted",
+      "six hours or longer"
+    ]
+  },
+  {
+    "id": "exp-lodging",
+    "domain": "finance",
+    "query": "What is the nightly hotel limit in an expensive city?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "$400 per night",
+      "high-cost cities"
+    ]
+  },
+  {
+    "id": "exp-deadline",
+    "domain": "finance",
+    "query": "How soon after a trip do I have to file my expense report?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "within thirty (30) days",
+      "expense was incurred"
+    ]
+  },
+  {
+    "id": "exp-nonreimbursable",
+    "domain": "finance",
+    "query": "Will the company pay back a parking ticket I got while travelling?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "never reimbursable",
+      "fines"
+    ]
+  },
+  {
+    "id": "exp-fx",
+    "domain": "finance",
+    "query": "How is a purchase in euros converted to dollars for reimbursement?",
+    "goldSourceKeys": [
+      "finance-expense"
+    ],
+    "goldNeedles": [
+      "foreign currency",
+      "exchange rate on the transaction date"
+    ]
+  },
+  {
+    "id": "rev-subscription",
+    "domain": "finance",
+    "query": "When do we start recognizing revenue on an annual software subscription?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "recognized ratably",
+      "access to the software is made available"
+    ]
+  },
+  {
+    "id": "rev-implementation",
+    "domain": "finance",
+    "query": "How are one-time onboarding service fees recognized?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "implementation",
+      "proportion of labor hours"
+    ]
+  },
+  {
+    "id": "rev-deferred",
+    "domain": "finance",
+    "query": "What happens to money we invoice before we have delivered the service?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "deferred revenue",
+      "contract liability"
+    ]
+  },
+  {
+    "id": "rev-variable",
+    "domain": "finance",
+    "query": "How do we treat usage-based fees that are not yet certain?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "variable consideration",
+      "expected-value method"
+    ]
+  },
+  {
+    "id": "rev-ssp",
+    "domain": "finance",
+    "query": "When a deal bundles several deliverables, how is the price split across them?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "standalone selling price"
+    ]
+  },
+  {
+    "id": "rev-commissions",
+    "domain": "finance",
+    "query": "Do we expense sales commissions immediately or spread them out?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "sales commissions",
+      "thirty-six (36) months"
+    ]
+  },
+  {
+    "id": "rev-modification",
+    "domain": "finance",
+    "query": "If a customer adds new services at list price mid-contract, how is that accounted for?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "modification",
+      "separate contract"
+    ]
+  },
+  {
+    "id": "rev-credits",
+    "domain": "finance",
+    "query": "How do service credits for a missed SLA affect reported revenue?",
+    "goldSourceKeys": [
+      "finance-revrec"
+    ],
+    "goldNeedles": [
+      "service credits",
+      "reduce revenue"
+    ]
+  },
+  {
+    "id": "baa-breach-window",
+    "domain": "healthcare",
+    "query": "How many days does the business associate have to report a breach of health information?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "sixty (60) calendar days",
+      "discovery of the breach"
+    ]
+  },
+  {
+    "id": "baa-minimum-necessary",
+    "domain": "healthcare",
+    "query": "How much PHI is the vendor allowed to use for a given task?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "minimum necessary"
+    ]
+  },
+  {
+    "id": "baa-encryption",
+    "domain": "healthcare",
+    "query": "Does electronic health information have to be encrypted, and where?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "encrypted both in transit and at rest"
+    ]
+  },
+  {
+    "id": "baa-subcontractor",
+    "domain": "healthcare",
+    "query": "What must the vendor do before letting a subcontractor touch PHI?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "subcontractor",
+      "same restrictions and conditions"
+    ]
+  },
+  {
+    "id": "baa-access",
+    "domain": "healthcare",
+    "query": "How fast must the business associate hand over records so patients can access their PHI?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "thirty (30) days",
+      "designated record set"
+    ]
+  },
+  {
+    "id": "baa-accounting",
+    "domain": "healthcare",
+    "query": "How many years of PHI disclosures must be tracked for an accounting request?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "accounting of disclosures",
+      "six (6) years"
+    ]
+  },
+  {
+    "id": "baa-termination-cure",
+    "domain": "healthcare",
+    "query": "Can the covered entity end the agreement if the vendor breaks a material term?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "terminate",
+      "material term",
+      "thirty (30) days"
+    ]
+  },
+  {
+    "id": "baa-return-destruction",
+    "domain": "healthcare",
+    "query": "What happens to PHI when the agreement ends if it cannot feasibly be destroyed?",
+    "goldSourceKeys": [
+      "health-baa"
+    ],
+    "goldNeedles": [
+      "return or destruction is infeasible",
+      "extend the protections"
+    ]
+  },
+  {
+    "id": "proto-design",
+    "domain": "healthcare",
+    "query": "What kind of study is this and how are participants split between drug and placebo?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "double-blind",
+      "2:1 ratio"
+    ]
+  },
+  {
+    "id": "proto-primary-endpoint",
+    "domain": "healthcare",
+    "query": "What is the main efficacy measure and at which week is it assessed?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "pasi 75",
+      "week 12"
+    ]
+  },
+  {
+    "id": "proto-inclusion-age",
+    "domain": "healthcare",
+    "query": "What age range and baseline severity qualifies someone to enroll?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "18 to 75 years",
+      "pasi score of 12"
+    ]
+  },
+  {
+    "id": "proto-exclusion-biologic",
+    "domain": "healthcare",
+    "query": "Would recent biologic therapy disqualify a candidate from the trial?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "excluded",
+      "biologic therapy within the twelve weeks"
+    ]
+  },
+  {
+    "id": "proto-dosing",
+    "domain": "healthcare",
+    "query": "What is the dose of the study drug and how often is it injected?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "150 mg subcutaneous injection once every two weeks"
+    ]
+  },
+  {
+    "id": "proto-sae-reporting",
+    "domain": "healthcare",
+    "query": "How quickly must a serious adverse event be reported to the sponsor?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "serious adverse events",
+      "twenty-four (24) hours"
+    ]
+  },
+  {
+    "id": "proto-consent",
+    "domain": "healthcare",
+    "query": "What has to happen before any study procedure is done to a participant?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "informed consent",
+      "before any study-specific procedure"
+    ]
+  },
+  {
+    "id": "proto-unblinding",
+    "domain": "healthcare",
+    "query": "Under what circumstances can the treatment assignment be revealed?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "blind may be broken",
+      "medical emergency"
+    ]
+  },
+  {
+    "id": "proto-rescue-med",
+    "domain": "healthcare",
+    "query": "Are participants allowed any topical treatment during the study, and from when?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "topical corticosteroids",
+      "after week 4"
+    ]
+  },
+  {
+    "id": "proto-withdrawal",
+    "domain": "healthcare",
+    "query": "What conditions force a participant to be pulled from the trial?",
+    "goldSourceKeys": [
+      "health-protocol"
+    ],
+    "goldNeedles": [
+      "withdrawn",
+      "life-threatening adverse reaction"
+    ]
+  }
+]
