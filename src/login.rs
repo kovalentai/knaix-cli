@@ -28,6 +28,30 @@ struct AppState {
 /// nonce. The token is never stored in that case.
 const REJECTED_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Knaix</title></head><body style=\"font-family:sans-serif;text-align:center;padding:64px;color:#0f172a\"><h1>Authentication rejected</h1><p>This login callback did not match the request started by your terminal. You can close this window and run <code>knaix login</code> again.</p></body></html>";
 
+/// The hosted dashboard that serves the CLI sign-in page in production.
+const DEFAULT_AUTH_BASE: &str = "https://app.kovalentai.com/cli-auth";
+
+/// Where to send the browser to sign in, derived from the API the CLI is
+/// pointed at.
+///
+/// Login has to follow `api_url`, because the token the browser hands back is
+/// only valid against the control plane that issued it. Sending someone at a
+/// local stack to the production dashboard returns a token their API will
+/// reject, which reads as a broken login rather than a misconfiguration. Only
+/// the production API keeps the hosted dashboard; anything else serves its own
+/// page on its own origin.
+fn auth_base(api_url: &str) -> String {
+    match url::Url::parse(api_url) {
+        Ok(u) if u.host_str() == Some("api.kovalentai.com") => DEFAULT_AUTH_BASE.to_string(),
+        Ok(mut u) => {
+            u.set_path("/cli-auth");
+            u.set_query(None);
+            u.to_string()
+        }
+        Err(_) => DEFAULT_AUTH_BASE.to_string(),
+    }
+}
+
 /// Generates a 256-bit random state token, hex-encoded, from the OS CSPRNG.
 fn new_state_token() -> String {
     let mut bytes = [0u8; 32];
@@ -424,7 +448,7 @@ pub async fn login() {
 
     // Build the auth URL with the callback properly percent-encoded, so the
     // callback's own query string survives being nested as a parameter.
-    let auth_url = match url::Url::parse("https://app.kovalentai.com/cli-auth") {
+    let auth_url = match url::Url::parse(&auth_base(&load_config().api_url)) {
         Ok(mut u) => {
             u.query_pairs_mut().append_pair("callback", &callback_url);
             u.to_string()
@@ -472,6 +496,44 @@ pub async fn login() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_api_keeps_the_hosted_dashboard() {
+        assert_eq!(auth_base("https://api.kovalentai.com"), DEFAULT_AUTH_BASE);
+        assert_eq!(
+            auth_base("https://api.kovalentai.com/api"),
+            DEFAULT_AUTH_BASE
+        );
+    }
+
+    #[test]
+    fn other_control_planes_serve_their_own_sign_in_page() {
+        // The token a browser hands back is only valid against the control
+        // plane that issued it, so login has to follow api_url.
+        assert_eq!(
+            auth_base("http://127.0.0.1:3002"),
+            "http://127.0.0.1:3002/cli-auth"
+        );
+        assert_eq!(
+            auth_base("https://api-sandbox.kovalentai.com/api"),
+            "https://api-sandbox.kovalentai.com/cli-auth"
+        );
+    }
+
+    #[test]
+    fn a_query_string_on_the_api_url_is_not_carried_into_the_auth_url() {
+        // It would collide with the callback parameter appended afterwards.
+        assert_eq!(
+            auth_base("http://localhost:3002/api?trace=1"),
+            "http://localhost:3002/cli-auth"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_api_url_falls_back_to_production() {
+        assert_eq!(auth_base("not a url"), DEFAULT_AUTH_BASE);
+        assert_eq!(auth_base(""), DEFAULT_AUTH_BASE);
+    }
 
     #[test]
     fn state_token_is_256_bits_of_hex() {

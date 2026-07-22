@@ -150,9 +150,12 @@ pub async fn run(ctx: &KnaixContext, node_id: &str) -> Result<()> {
                 }
 
                 match crate::nodes::chat(ctx, node_id, &final_input, false).await {
-                    Ok(Some(response)) => {
+                    Ok(Some(answer)) => {
                         println!();
-                        skin.print_text(&response);
+                        skin.print_text(&answer.text);
+                        // Show sources here too: an ungrounded claim should be
+                        // as visible in a session as in a one-shot command.
+                        crate::nodes::print_citations(&answer.citations);
                         println!();
                     }
                     Ok(None) => {
