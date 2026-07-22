@@ -84,6 +84,25 @@ fn docker(args: &[&str]) -> Result<String> {
     }
 }
 
+/// Run a docker command with its output attached to the terminal.
+///
+/// Used for `pull` alone. Capturing that one would leave a first run silent for
+/// minutes behind a "Pulling..." line while several hundred megabytes download,
+/// which is indistinguishable from a hang -- and the first run is exactly when
+/// a user has least reason to assume it is working.
+fn docker_streaming(args: &[&str]) -> Result<()> {
+    let status = Command::new("docker")
+        .args(args)
+        .status()
+        .context("Could not run docker. Is Docker installed and running?")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("docker {} exited with {}", args[0], status))
+    }
+}
+
 fn docker_available() -> Result<()> {
     docker(&["info", "--format", "{{.ServerVersion}}"])
         .map(|_| ())
@@ -123,8 +142,12 @@ pub async fn up(port: Option<u16>, llama_url: Option<String>, pull: bool) -> Res
     // Pull only when asked or when the image is not already here, so a normal
     // start stays offline once the image has been fetched once.
     if pull || !image_present(&tag) {
-        println!("{} Pulling {}...", "Info:".blue(), tag.cyan());
-        if let Err(e) = docker(&["pull", &tag]) {
+        println!(
+            "{} Fetching {} (about 380 MB, once).",
+            "Info:".blue(),
+            tag.cyan()
+        );
+        if let Err(e) = docker_streaming(&["pull", &tag]) {
             if !image_present(&tag) {
                 return Err(anyhow!(
                     "Could not pull {}: {}\n       Set KNAIX_LOCAL_IMAGE to an image you already have if you are running a local build.",

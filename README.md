@@ -22,6 +22,32 @@ Knaix CLI inverts the traditional cloud AI paradigm. Instead of sending sensitiv
 *   **Atomic Saves**: Profile and configuration state mutations utilize the "Write-Sync-Rename" atomic pattern to guarantee token integrity against unexpected hardware halts.
 *   **Persistent Connection Pooling**: The HTTP client maintains active connection reuse and TLS warming, radically reducing P2P latency.
 
+## Try it locally, with no account
+
+One command stands up the whole stack on your machine: the Node Runtime, its
+own store, its own embedder, and its own reranker. There is no control plane,
+no login, and no token. The image carries the model artifacts, so once it is
+pulled nothing needs the network.
+
+```bash
+knaix local up
+```
+
+`knaix local up` fetches the image the first time it runs (about 380 MB) and
+reuses it afterwards. Then point any command at the reserved node `local`:
+
+```bash
+knaix upload -n local ./docs
+knaix chat -n local "what do these documents say about refunds?"
+knaix use local          # make it the default for every command
+knaix local status       # is it running and healthy
+knaix local down         # stop it; the store is kept
+```
+
+Answers come from a deterministic mock unless you serve a model yourself and
+pass `--llama-url`. Retrieval, reranking and citations are real either way, so
+the part worth evaluating is the part that works out of the box.
+
 ## Installation
 
 ### Primary Install (macOS & Linux)
@@ -67,6 +93,8 @@ cargo install --path .
 | `knaix chat`     | Dispatch a stateless, one-shot prompt.                |
 | `knaix upload`   | Recursively ingest directories into vector storage.   |
 | `knaix memory`   | Interrogate durable and ephemeral node memories.      |
+| `knaix local`    | Run the whole stack on this machine (`up`, `down`, `status`, `logs`). |
+| `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix status`   | Show the local configuration and whether a session exists. |
 | `knaix metrics`  | Fetch a node's current health and latency.            |
 | `knaix logs`     | Fetch the most recent log lines from the agent pod.   |
@@ -82,6 +110,7 @@ Knaix supports the following environment overrides for automated scripting:
 - `KNAIX_TOKEN`: Kovalent API Bearer Token.
 - `KNAIX_API_URL`: Override the control plane endpoint (default: `https://api.kovalentai.com`).
 - `KNAIX_NO_UPDATE_CHECK`: Set to `1` to disable the daily version check, the only network request Knaix makes on its own behalf.
+- `KNAIX_LOCAL_IMAGE`: Node Runtime image `knaix local` runs (default: `ghcr.io/kovalentai/node-runtime:latest`). Point it at a tag you built yourself to run that instead.
 
 Values supplied through the environment apply to the running command only. They are never written to `~/.knaix/config.json`, so an ephemeral CI token does not outlive the job it was issued for.
 
