@@ -33,6 +33,37 @@ fn image() -> String {
         .unwrap_or_else(|_| "ghcr.io/kovalentai/node-runtime:latest".to_string())
 }
 
+/// Hostname Docker Desktop resolves to the host, and which `--add-host` below
+/// maps on Linux, where it does not exist by default.
+const HOST_GATEWAY: &str = "host.docker.internal";
+
+/// Rewrite a loopback model URL so the node can actually reach it.
+///
+/// The node runs in a container, so `127.0.0.1` is the container itself, not
+/// the machine. Someone serving a model on their laptop writes the address they
+/// used to start it, which is exactly the address that cannot work from inside.
+/// There is no case where a caller means the container's own loopback -- nothing
+/// else is listening in there -- so the intent is unambiguous and worth honouring
+/// rather than failing on.
+///
+/// Returns the rewritten URL and whether it changed, so the caller can say so.
+fn reachable_from_container(raw: &str) -> (String, bool) {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return (raw.to_string(), false);
+    };
+    let is_loopback = matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+    );
+    if !is_loopback {
+        return (raw.to_string(), false);
+    }
+    if url.set_host(Some(HOST_GATEWAY)).is_err() {
+        return (raw.to_string(), false);
+    }
+    (url.to_string(), true)
+}
+
 /// What `local up` recorded, so later commands can find the node it started.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LocalNode {
@@ -213,8 +244,21 @@ pub async fn up(port: Option<u16>, llama_url: Option<String>, pull: bool) -> Res
     match &llama_url {
         // A real model, if one is being served on this machine.
         Some(url) => {
+            let (reachable, rewritten) = reachable_from_container(url);
+            if rewritten {
+                println!(
+                    "{} Model URL {} is loopback, which inside the container means the\n  container itself. Using {} so it reaches this machine.",
+                    "Info:".blue(),
+                    url.cyan(),
+                    reachable.cyan()
+                );
+            }
+            // Linux has no host.docker.internal; this maps it. Harmless where
+            // Docker Desktop already provides it.
+            args.push("--add-host".into());
+            args.push(format!("{}:host-gateway", HOST_GATEWAY));
             args.push("-e".into());
-            args.push(format!("LLAMA_SERVER_URL={}", url));
+            args.push(format!("LLAMA_SERVER_URL={}", reachable));
         }
         // Nothing serves a model by default, and generation fails closed
         // without one. The deterministic mock answers from the chunks the node
@@ -451,6 +495,43 @@ mod tests {
         assert_eq!(&id[14..15], "4", "version nibble");
         assert!("89ab".contains(&id[19..20]), "variant nibble");
         assert_ne!(id, new_instance_id(), "ids must not repeat");
+    }
+
+    #[test]
+    fn a_loopback_model_url_is_rewritten_to_reach_the_host() {
+        // The address someone starts a model server on is exactly the one that
+        // cannot work from inside the container.
+        for raw in [
+            "http://127.0.0.1:8081",
+            "http://localhost:8081",
+            "http://localhost:8081/v1",
+        ] {
+            let (out, rewritten) = reachable_from_container(raw);
+            assert!(rewritten, "{raw} should be rewritten");
+            assert!(out.contains(HOST_GATEWAY), "{raw} -> {out}");
+            // The port and path have to survive, or it reaches the host and
+            // then asks it for the wrong thing.
+            assert!(out.contains("8081"), "{raw} -> {out} lost its port");
+        }
+        let (path, _) = reachable_from_container("http://localhost:8081/v1");
+        assert!(path.ends_with("/v1"), "path must survive: {path}");
+    }
+
+    #[test]
+    fn a_routable_model_url_is_left_alone() {
+        for raw in ["http://192.168.1.50:8081", "https://models.example.com"] {
+            let (out, rewritten) = reachable_from_container(raw);
+            assert!(!rewritten, "{raw} should not be rewritten");
+            assert_eq!(out, raw);
+        }
+    }
+
+    #[test]
+    fn an_unparseable_model_url_is_passed_through_untouched() {
+        // Let the node report a bad URL rather than mangling it here.
+        let (out, rewritten) = reachable_from_container("not a url");
+        assert!(!rewritten);
+        assert_eq!(out, "not a url");
     }
 
     #[test]
