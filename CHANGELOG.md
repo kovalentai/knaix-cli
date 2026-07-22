@@ -2,22 +2,31 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
-## [Unreleased]
-
-### Security
-- **Environment credentials stay ephemeral**: `KNAIX_TOKEN` and `KNAIX_API_URL` are no longer written into `~/.knaix/config.json`. Previously any command that saved the config, including the daily update check, persisted them to disk in plaintext, so a CI token outlived the job it was issued for.
-- **Dependency advisories cleared**: Advanced `clap`, `reqwest`, and `axum`, resolving four RustSec vulnerabilities. The notable ones were certificate name-constraint bypasses and a CRL parsing panic in `rustls-webpki` 0.101, on the TLS path every command uses. CI now fails on any new advisory.
+## [0.4.0] - 2026-07-22
 
 ### Added
-- **`KNAIX_NO_UPDATE_CHECK`**: Set to `1` to disable the daily version check, the only network request the CLI makes on its own behalf.
+- **`knaix local`**: run the whole stack on your machine with no account, no token, and no control plane. One command starts the Node Runtime with its own store, embedder and reranker; the image carries the model artifacts, so once it is pulled nothing needs the network. `up`, `down`, `status` and `logs`. The image is fetched automatically on first run and reused afterwards.
+- **`knaix selftest`**: check that a node answers correctly rather than that it merely responds. Ingests a bundled synthetic corpus, asks questions whose supporting passages are known in advance, and reports hit rate, MRR and citation accuracy against floors. Everything it uploads is deleted before it returns.
+- **`KNAIX_NO_UPDATE_CHECK`**: set to `1` to disable the daily version check, the only network request the CLI makes on its own behalf.
+- **`KNAIX_LOCAL_IMAGE`**: override the Node Runtime image `knaix local` runs, for anyone running a build of their own.
+
+### Changed
+- **The CLI talks to the native stack.** `upload`, `chat`, `repl` and document listing now use the native knowledge and chat endpoints instead of the AnythingLLM proxy, which had stopped existing: `upload` returned HTTP 500 and `chat` returned 404 against a current node. Answers now arrive with the passages they were grounded in, and node identifiers resolve by name, instance id or UUID.
+- **`knaix login` follows your API URL.** The browser is sent to the host the configured control plane lives on, so a local or self-hosted deployment authenticates the same way as production.
 
 ### Fixed
-- **`knaix up` reports real state**: The command no longer pads its output with an invented five-second boot sequence. It returns when the API accepts the request and tells you how to watch for the node coming up.
-- **Update check no longer clobbers concurrent writes**: It re-reads the config before saving, instead of overwriting it with the copy loaded at startup.
+- **Environment credentials no longer persist.** `KNAIX_TOKEN` and `KNAIX_API_URL` were written into `~/.knaix/config.json` by any command that saved the config, so the documented CI pattern left a bearer token on disk in plaintext. Values from the environment now apply to the running command only.
+- **A fresh install keeps the default API URL.** The first config write recorded an empty URL, so a new install talked to nothing until the URL was set by hand.
+- **`knaix up` reports real state.** It padded its output with an invented five-second boot sequence after the API had already answered.
+- **The image pull is visible.** `knaix local up` captured docker's output, so a first run went silent for several hundred megabytes.
+- **The update check no longer clobbers concurrent writes.** It re-reads the config before saving, rather than overwriting it with the copy loaded at startup.
 - **`knaix status`** pointed at a nonexistent `knaix select` command when no default node was set.
 
+### Security
+- Cleared four RustSec advisories by advancing `clap`, `reqwest` and `axum`, including certificate name-constraint bypasses and a CRL parsing panic in `rustls-webpki` 0.101, on the TLS path every command uses. CI now fails on any new advisory.
+
 ### Documentation
-- Corrected the documented global JSON flag (`-o json`, not `--json`), the descriptions of `status`, `metrics`, `logs`, and `config`, where agent memory is written, and a reference to PKCE in a login flow that does not use it.
+- Corrected the documented global JSON flag (`-o json`, not `--json`), the descriptions of `status`, `metrics`, `logs` and `config`, where agent memory is written, and a reference to PKCE in a login flow that has never used it.
 
 ## [0.3.3] - 2026-03-03
 
