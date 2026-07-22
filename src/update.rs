@@ -6,8 +6,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const RELEASE_URL: &str = "https://releases.knaix.com/latest-version";
 const CHECK_INTERVAL_SECS: u64 = 86400; // 24 hours
 
+/// Whether the user has opted out of the daily version check.
+///
+/// The check is the only network request the CLI makes on its own behalf, so
+/// it needs a way to turn off for air-gapped installs, CI, and anyone who
+/// simply does not want it.
+fn update_check_disabled() -> bool {
+    matches!(
+        std::env::var("KNAIX_NO_UPDATE_CHECK").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 pub async fn check_for_update_async() {
-    let mut config = config::load_config();
+    if update_check_disabled() {
+        return;
+    }
+
+    let config = config::load_stored_config();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
@@ -20,8 +36,12 @@ pub async fn check_for_update_async() {
 
     if should_check {
         if let Some(latest) = fetch_latest_version().await {
+            // Re-read before writing. The command running alongside this check
+            // may have saved a token or a default node while the request was in
+            // flight, and writing the copy loaded above would undo it.
+            let mut config = config::load_stored_config();
             config.last_update_check = Some(now);
-            config.latest_known_version = Some(latest.clone());
+            config.latest_known_version = Some(latest);
             let _ = config::save_config(&config);
         }
     }
@@ -47,7 +67,11 @@ async fn fetch_latest_version() -> Option<String> {
 }
 
 pub fn print_update_banner() {
-    let config = config::load_config();
+    if update_check_disabled() {
+        return;
+    }
+
+    let config = config::load_stored_config();
     if let Some(latest) = config.latest_known_version {
         let current = env!("CARGO_PKG_VERSION");
 

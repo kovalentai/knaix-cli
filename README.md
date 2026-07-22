@@ -81,6 +81,9 @@ cargo install --path .
 Knaix supports the following environment overrides for automated scripting:
 - `KNAIX_TOKEN`: Kovalent API Bearer Token.
 - `KNAIX_API_URL`: Override the control plane endpoint (default: `https://api.kovalentai.com`).
+- `KNAIX_NO_UPDATE_CHECK`: Set to `1` to disable the daily version check, the only network request Knaix makes on its own behalf.
+
+Values supplied through the environment apply to the running command only. They are never written to `~/.knaix/config.json`, so an ephemeral CI token does not outlive the job it was issued for.
 
 ---
 

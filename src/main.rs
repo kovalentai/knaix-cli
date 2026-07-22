@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
             nodes::list_nodes(&ctx, node_id.as_deref()).await?;
         }
         Commands::Use { node_id } => {
-            let mut config = config::load_config();
+            let mut config = config::load_stored_config();
             config.default_node_id = Some(node_id.clone());
             config::save_config(&config)?;
             println!("{} Set default node to {}", "Info:".blue(), node_id.bold());
@@ -218,12 +218,14 @@ async fn main() -> Result<()> {
             println!("{table}\n");
         }
         Commands::Config { api_url } => {
-            let mut config = config::load_config();
             if let Some(url) = api_url {
-                config.api_url = url.clone();
-                config::save_config(&config)?;
+                let mut stored = config::load_stored_config();
+                stored.api_url = url.clone();
+                config::save_config(&stored)?;
                 println!("{} Updated API URL to {}", "Info:".blue(), url.bold());
             } else {
+                // Report the URL requests actually go to, overrides included.
+                let config = config::load_config();
                 println!("\n{}", "Current Configuration:".bold().underline());
                 println!("  API URL: {}", config.api_url.cyan());
             }

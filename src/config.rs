@@ -38,17 +38,28 @@ pub fn get_config_path() -> PathBuf {
     path
 }
 
-/// Loads the config from disk, prioritizing environment variable overrides.
-pub fn load_config() -> Config {
+/// Loads the config exactly as stored on disk, with no environment overrides
+/// applied.
+///
+/// Anything that mutates and then saves the config must start here. Starting
+/// from `load_config` would fold an ephemeral `KNAIX_TOKEN` or `KNAIX_API_URL`
+/// into the saved file, writing a credential the caller only meant to use for
+/// the current process to disk in plaintext.
+pub fn load_stored_config() -> Config {
     let path = get_config_path();
-    let mut config = if path.exists() {
+    if path.exists() {
         let content = fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
         serde_json::from_str(&content).unwrap_or_else(|_| Config::default())
     } else {
         Config::default()
-    };
+    }
+}
 
-    // --- Enterprise Polish: Environment Variable Overrides ---
+/// Loads the effective config: what is on disk, with environment overrides
+/// applied on top. Use this for reading; never save the result.
+pub fn load_config() -> Config {
+    let mut config = load_stored_config();
+
     if let Ok(env_url) = env::var("KNAIX_API_URL") {
         config.api_url = env_url;
     }
