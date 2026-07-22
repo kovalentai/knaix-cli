@@ -148,6 +148,10 @@ enum LocalAction {
         #[clap(long)]
         llama_url: Option<String>,
 
+        /// Ignore any remembered model server and use the deterministic mock
+        #[clap(long, conflicts_with = "llama_url")]
+        mock: bool,
+
         /// Re-pull the image even if it is already present
         #[clap(long)]
         pull: bool,
@@ -310,8 +314,9 @@ async fn main() -> Result<()> {
             LocalAction::Up {
                 port,
                 llama_url,
+                mock,
                 pull,
-            } => local::up(port, llama_url, pull).await?,
+            } => local::up(port, llama_url, mock, pull).await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
             LocalAction::Logs { lines } => local::logs(lines)?,

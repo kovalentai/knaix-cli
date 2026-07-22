@@ -72,6 +72,11 @@ pub struct LocalNode {
     /// restarting the node does not orphan everything already ingested.
     pub instance_id: String,
     pub image: String,
+    /// The model server the node was last started against, remembered so a
+    /// later `up` does not silently drop back to the mock. Absent on state
+    /// written before this was recorded, and when the mock is in use.
+    #[serde(default)]
+    pub llama_url: Option<String>,
 }
 
 impl LocalNode {
@@ -154,7 +159,12 @@ fn image_present(tag: &str) -> bool {
     docker(&["image", "inspect", tag]).is_ok()
 }
 
-pub async fn up(port: Option<u16>, llama_url: Option<String>, pull: bool) -> Result<()> {
+pub async fn up(
+    port: Option<u16>,
+    llama_url: Option<String>,
+    mock: bool,
+    pull: bool,
+) -> Result<()> {
     docker_available()?;
 
     if container_state().as_deref() == Some("running") {
@@ -197,6 +207,26 @@ pub async fn up(port: Option<u16>, llama_url: Option<String>, pull: bool) -> Res
     // A stopped container still holds the name and the port.
     if container_state().is_some() {
         let _ = docker(&["rm", "-f", CONTAINER]);
+    }
+
+    // Reuse the model server this node was last started against. Forgetting a
+    // flag should not quietly change what is answering: the difference between
+    // a real model and the mock is visible in the wording and nowhere else, so
+    // a silent downgrade is one a user would not notice until they trusted an
+    // answer. `--mock` is how you go back deliberately.
+    let saved_llama = load().and_then(|n| n.llama_url);
+    let llama_url = if mock {
+        None
+    } else {
+        llama_url.or(saved_llama.clone())
+    };
+    if !mock && llama_url.is_some() && llama_url == saved_llama {
+        println!(
+            "{} Using the model server from last time: {}. {} to go back to the mock.",
+            "Info:".blue(),
+            llama_url.as_deref().unwrap_or_default().cyan(),
+            "--mock".cyan()
+        );
     }
 
     let port = port.unwrap_or(DEFAULT_PORT);
@@ -277,6 +307,7 @@ pub async fn up(port: Option<u16>, llama_url: Option<String>, pull: bool) -> Res
         port,
         instance_id,
         image: tag,
+        llama_url: llama_url.clone(),
     };
     save(&node)?;
 
@@ -419,6 +450,7 @@ pub async fn status(json: bool) -> Result<()> {
                 "healthy": healthy,
                 "state": state,
                 "url": node.as_ref().map(|n| n.base_url()),
+                "llamaUrl": node.as_ref().and_then(|n| n.llama_url.clone()),
                 "instanceId": node.as_ref().map(|n| n.instance_id.clone()),
                 "image": node.as_ref().map(|n| n.image.clone()),
             }))?
@@ -455,6 +487,17 @@ pub async fn status(json: bool) -> Result<()> {
         table.add_row(vec![
             "Image".dimmed().to_string(),
             n.image.dimmed().to_string(),
+        ]);
+        // What is actually answering. The difference between a model and the
+        // mock shows up only in the wording, so it has to be stated somewhere.
+        table.add_row(vec![
+            "Answers".dimmed().to_string(),
+            match &n.llama_url {
+                Some(url) => format!("model at {}", url).green().to_string(),
+                None => "deterministic mock (retrieval is real)"
+                    .yellow()
+                    .to_string(),
+            },
         ]);
     }
     println!("{table}");
@@ -540,8 +583,19 @@ mod tests {
             port: 9123,
             instance_id: "x".into(),
             image: "img".into(),
+            llama_url: None,
         };
         assert_eq!(node.base_url(), "http://127.0.0.1:9123");
+    }
+
+    #[test]
+    fn state_written_before_the_model_url_existed_still_loads() {
+        // Someone upgrading has a local.json with no llama_url in it. Failing
+        // to parse would look like the node was never started.
+        let old = r#"{"port":8080,"instance_id":"abc","image":"img"}"#;
+        let node: LocalNode = serde_json::from_str(old).expect("old state must still parse");
+        assert_eq!(node.port, 8080);
+        assert_eq!(node.llama_url, None);
     }
 
     #[test]
