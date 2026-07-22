@@ -1,4 +1,5 @@
 use crate::config::load_config;
+use crate::upload_filter::{SkipReason, UploadFilter};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -10,6 +11,7 @@ use reqwest::header::AUTHORIZATION;
 use reqwest::multipart;
 use serde::Deserialize;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -873,7 +875,7 @@ pub async fn upload_single_file(
     target: &Target,
     path: &Path,
     file_name: &str,
-) -> Result<()> {
+) -> Result<u64> {
     if let Target::Local { base, instance_id } = target {
         return upload_local(ctx, base, instance_id, path, file_name).await;
     }
@@ -946,7 +948,7 @@ pub async fn upload_single_file(
                     chunks,
                     if chunks == 1 { "" } else { "s" }
                 );
-                Ok(())
+                Ok(chunks)
             } else {
                 let err = data["error"].as_str().unwrap_or("Unknown error");
                 Err(anyhow!("Upload failed: HTTP {} - {}", status, err))
@@ -971,7 +973,7 @@ async fn upload_local(
     instance_id: &str,
     path: &Path,
     file_name: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let bytes = tokio::fs::read(path)
         .await
         .context("Could not read the file")?;
@@ -1017,44 +1019,215 @@ async fn upload_local(
             .unwrap_or("the node")
             .dimmed()
     );
-    Ok(())
+    Ok(chunks)
 }
 
-pub async fn upload(ctx: &KnaixContext, target: &Target, file_path: &str) -> Result<()> {
+/// What a directory upload did, so the summary can be specific.
+#[derive(Default)]
+pub struct UploadSummary {
+    pub ingested: usize,
+    pub chunks: u64,
+    pub skipped: Vec<(String, SkipReason)>,
+    /// Directories never descended into. Their contents are never walked, so
+    /// there is no file count to give -- naming the directories is both cheaper
+    /// and more useful than a number.
+    pub pruned_dirs: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+pub struct UploadOptions {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub all: bool,
+    pub dry_run: bool,
+}
+
+pub async fn upload(
+    ctx: &KnaixContext,
+    target: &Target,
+    file_path: &str,
+    opts: &UploadOptions,
+) -> Result<()> {
     let base_path = Path::new(file_path);
     if !base_path.exists() {
         return Err(anyhow!("Path not found: {}", file_path));
     }
 
-    if base_path.is_dir() {
-        println!(
-            "{} Uploading directory: {}",
-            "Info:".blue(),
-            file_path.bold()
-        );
-        for entry in WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_file() {
-                let file_name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap_or("file")
-                    .to_string();
-                upload_single_file(ctx, target, path, &file_name).await?;
-            }
+    let filter = UploadFilter::new(&opts.include, &opts.exclude, opts.all)?;
+
+    if !base_path.is_dir() {
+        // A named file is uploaded because it was named. Filters describe how
+        // to search a directory, not permission to ignore an explicit request.
+        let file_name = file_name_of(base_path);
+        if opts.dry_run {
+            println!("  {} {}", "would ingest".dimmed(), file_name);
+            return Ok(());
         }
-    } else {
-        let file_name = base_path
-            .file_name()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("file")
-            .to_string();
-        upload_single_file(ctx, target, base_path, &file_name).await?;
+        return upload_single_file(ctx, target, base_path, &file_name)
+            .await
+            .map(|_| ());
     }
 
-    Ok(())
+    println!("{} Scanning {}", "Info:".blue(), file_path.bold());
+
+    // Collect first so the count is known before uploading, which is what
+    // makes "3 of 12" possible and lets --dry-run report without sending.
+    let mut queue: Vec<PathBuf> = Vec::new();
+    let mut summary = UploadSummary::default();
+
+    let pruned = std::cell::RefCell::new(Vec::new());
+    let walker = WalkDir::new(base_path).into_iter().filter_entry(|e| {
+        if !e.file_type().is_dir() || e.depth() == 0 {
+            return true;
+        }
+        let name = e.file_name().to_str().unwrap_or_default();
+        if filter.should_enter(name) {
+            true
+        } else {
+            pruned.borrow_mut().push(name.to_string());
+            false
+        }
+    });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let relative = path.strip_prefix(base_path).unwrap_or(path);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+        match filter.verdict(relative, size) {
+            Some(reason) => summary
+                .skipped
+                .push((relative.display().to_string(), reason)),
+            None => queue.push(path.to_path_buf()),
+        }
+    }
+
+    summary.pruned_dirs = pruned.into_inner();
+    summary.pruned_dirs.sort();
+    summary.pruned_dirs.dedup();
+
+    if opts.dry_run {
+        report_dry_run(&queue, &summary, base_path);
+        return Ok(());
+    }
+
+    if queue.is_empty() {
+        println!(
+            "{} Nothing to ingest. {} file(s) were skipped; pass {} to see why, or {} to send everything.",
+            "Info:".blue(),
+            summary.skipped.len(),
+            "--dry-run".cyan(),
+            "--all".cyan()
+        );
+        return Ok(());
+    }
+
+    let total = queue.len();
+    for (i, path) in queue.iter().enumerate() {
+        let file_name = file_name_of(path);
+        println!(
+            "  {} {} of {}",
+            "[".dimmed(),
+            i + 1,
+            format!("{}]", total).dimmed()
+        );
+        // One bad file must not abandon the rest: a partial ingest that stops
+        // wherever it happened to fail is worse than a complete one with a
+        // named failure, because nothing says how far it got.
+        match upload_single_file(ctx, target, path, &file_name).await {
+            Ok(chunks) => {
+                summary.ingested += 1;
+                summary.chunks += chunks;
+            }
+            Err(e) => {
+                println!("  {} {}: {}", "✗".red(), file_name, e);
+                summary.failed.push((file_name, e.to_string()));
+            }
+        }
+    }
+
+    report_summary(&summary);
+
+    if summary.failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} of {} file(s) failed to ingest",
+            summary.failed.len(),
+            total
+        ))
+    }
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn report_dry_run(queue: &[PathBuf], summary: &UploadSummary, base: &Path) {
+    println!(
+        "\n{}",
+        format!("Would ingest {} file(s):", queue.len()).bold()
+    );
+    for path in queue.iter().take(50) {
+        let rel = path.strip_prefix(base).unwrap_or(path);
+        println!("  {} {}", "+".green(), rel.display());
+    }
+    if queue.len() > 50 {
+        println!("  {} and {} more", "+".green(), queue.len() - 50);
+    }
+
+    if !summary.pruned_dirs.is_empty() {
+        println!(
+            "\n{} {}",
+            "Not descended into:".dimmed(),
+            summary.pruned_dirs.join(", ").dimmed()
+        );
+    }
+
+    if !summary.skipped.is_empty() {
+        // Grouped, because a hundred lines of "unsupported type" teaches less
+        // than one line saying a hundred were.
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for (_, reason) in &summary.skipped {
+            *counts.entry(reason.describe()).or_default() += 1;
+        }
+        println!(
+            "\n{}",
+            format!("Skipping {} file(s):", summary.skipped.len()).dimmed()
+        );
+        for (reason, count) in counts {
+            println!("  {} {} ({})", "-".dimmed(), reason.dimmed(), count);
+        }
+    }
+    println!();
+}
+
+fn report_summary(summary: &UploadSummary) {
+    println!(
+        "\n{} Ingested {} file(s), {} chunk(s).",
+        "✓".green(),
+        summary.ingested,
+        summary.chunks
+    );
+    if !summary.skipped.is_empty() {
+        println!(
+            "  {} {} skipped (run with {} to see which).",
+            "-".dimmed(),
+            summary.skipped.len(),
+            "--dry-run".cyan()
+        );
+    }
+    for (name, err) in &summary.failed {
+        println!("  {} {}: {}", "✗".red(), name, err);
+    }
+    println!();
 }
 
 pub async fn get_metrics(ctx: &KnaixContext, node_id: &str) -> Result<()> {

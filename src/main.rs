@@ -5,6 +5,7 @@ mod nodes;
 mod repl;
 mod selftest;
 mod update;
+mod upload_filter;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -62,8 +63,24 @@ enum Commands {
         #[clap(short = 'n', long = "node-id")]
         node_id: Option<String>,
 
-        /// Path to the file to upload
+        /// Path to the file or directory to ingest
         file_path: String,
+
+        /// Only ingest files matching these glob patterns (repeatable)
+        #[clap(long)]
+        include: Vec<String>,
+
+        /// Skip files matching these glob patterns (repeatable)
+        #[clap(long)]
+        exclude: Vec<String>,
+
+        /// Ingest everything, including build directories and unsupported types
+        #[clap(long)]
+        all: bool,
+
+        /// List what would be ingested without sending anything
+        #[clap(long)]
+        dry_run: bool,
     },
 
     /// Show CLI configuration and connection status
@@ -123,6 +140,13 @@ enum Commands {
         /// Remove self-test documents left behind by an earlier interrupted run
         #[clap(long)]
         sweep: bool,
+    },
+
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
+    Completions {
+        /// Shell to generate for
+        #[clap(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// View your Sovereign Agentic Memory for a node
@@ -218,9 +242,22 @@ async fn main() -> Result<()> {
                 nodes::chat(&ctx, &target, &message, true).await?;
             }
         }
-        Commands::Upload { node_id, file_path } => {
+        Commands::Upload {
+            node_id,
+            file_path,
+            include,
+            exclude,
+            all,
+            dry_run,
+        } => {
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                nodes::upload(&ctx, &target, &file_path).await?;
+                let opts = nodes::UploadOptions {
+                    include,
+                    exclude,
+                    all,
+                    dry_run,
+                };
+                nodes::upload(&ctx, &target, &file_path, &opts).await?;
             }
         }
         Commands::Status => {
@@ -333,6 +370,15 @@ async fn main() -> Result<()> {
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 selftest::run(&ctx, &target, keep, quick, sweep).await?;
             }
+        }
+        Commands::Completions { shell } => {
+            // Written to stdout so it can be sourced or redirected directly;
+            // anything else on stdout here would be sourced as shell code.
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
         }
         Commands::Memory { node_id, file } => {
             if let Some(id) = nodes::resolve_node_id(&ctx, node_id.clone()).await? {

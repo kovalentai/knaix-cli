@@ -95,6 +95,7 @@ cargo install --path .
 | `knaix memory`   | Interrogate durable and ephemeral node memories.      |
 | `knaix local`    | Run the whole stack on this machine (`up`, `down`, `status`, `logs`). |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
+| `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
 | `knaix status`   | Show the local configuration and whether a session exists. |
 | `knaix metrics`  | Fetch a node's current health and latency.            |
 | `knaix logs`     | Fetch the most recent log lines from the agent pod.   |
@@ -103,6 +104,36 @@ cargo install --path .
 **Global Flags:**
 - `-o json`, `--output json`: Emit structured JSON instead of formatted tables.
 - `--version`: Output the current installed binary version.
+
+## Ingesting a directory
+
+`knaix upload` takes a file or a directory. A directory is walked recursively,
+skipping what is never documentation -- `.git`, `node_modules`, `target`,
+`dist`, virtualenvs and the like -- and skipping files the node has no parser
+for, rather than sending them to be refused.
+
+```bash
+knaix upload ./docs                          # everything ingestible under ./docs
+knaix upload . --dry-run                     # show what would be sent, send nothing
+knaix upload . --include '*.md' --include '*.pdf'
+knaix upload . --exclude 'CHANGELOG.md'
+knaix upload . --all                         # override both defaults
+```
+
+`--include` replaces the type default, so asking for `*.rs` sends source files.
+`--exclude` always wins. A bare pattern like `*.md` matches at any depth; one
+containing a slash is matched literally against the path.
+
+One unreadable file no longer abandons the run: the rest still upload and the
+failures are named at the end, with a non-zero exit.
+
+## Shell completion
+
+```bash
+knaix completions zsh  > "${fpath[1]}/_knaix"      # zsh
+knaix completions bash > /etc/bash_completion.d/knaix
+knaix completions fish > ~/.config/fish/completions/knaix.fish
+```
 
 ## Headless Execution
 
