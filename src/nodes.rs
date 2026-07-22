@@ -18,30 +18,52 @@ use walkdir::WalkDir;
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Node {
+    /// The instance UUID. Every knowledge and chat route is keyed by this, so
+    /// it is what the CLI resolves to before touching a node's data; the
+    /// human-facing `instance_id` and `name` are only ever inputs.
+    pub id: Option<String>,
     pub name: String,
     pub state: String,
     pub instance_id: Option<String>,
     pub private_ip: Option<String>,
     pub model: Option<String>,
-    pub credentials: Option<Credentials>,
     pub config: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-pub struct Credentials {
-    pub api_key: Option<String>,
+pub struct DocumentSource {
+    pub r#type: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Document {
-    pub id: serde_json::Value,
-    pub name: String,
-    pub r#type: String,
-    pub location: Option<String>,
+    pub id: String,
+    pub source: Option<DocumentSource>,
+    pub chunk_count: Option<u64>,
+    pub created_at: Option<String>,
+}
+
+/// An answer and the passages it was grounded in. The two travel together so
+/// every surface can show its sources, not just the one-shot command.
+pub struct ChatAnswer {
+    pub text: String,
+    pub citations: Vec<Citation>,
+}
+
+/// One grounded passage the node returned alongside an answer.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct Citation {
+    pub index: Option<u32>,
+    pub content: Option<String>,
+    pub source: Option<DocumentSource>,
+    pub cited: Option<bool>,
 }
 
 /// Holds the HTTP client and configuration shared by every request a single
@@ -78,6 +100,38 @@ impl KnaixContext {
     }
 }
 
+/// True when a node is the one the user named, by UUID, instance id, or name.
+/// Users read the last two off `knaix list`; the routes only accept the first.
+fn node_matches(node: &Node, wanted: &str) -> bool {
+    node.id.as_deref() == Some(wanted)
+        || node.instance_id.as_deref() == Some(wanted)
+        || node.name == wanted
+}
+
+/// Fetch the caller's nodes once, for resolution and listing alike.
+async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
+    let token = ctx.get_token()?;
+    let url = format!("{}/api/instances", ctx.config.api_url);
+
+    let resp = ctx
+        .client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .context("Failed to connect to Kovalent API")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "Failed to fetch nodes: HTTP {}. Are you logged in?",
+            resp.status()
+        ));
+    }
+
+    let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok(serde_json::from_value(wrapper["data"].clone()).unwrap_or_default())
+}
+
 pub fn format_file_size(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
@@ -94,8 +148,10 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
     let token = ctx.get_token()?;
 
     if let Some(nid) = node_id {
-        // List Documents for a specific node
-        let url = format!("{}/api/nodes/{}/documents", ctx.config.api_url, nid);
+        // The knowledge base of one node. Resolve first: the route is keyed by
+        // the instance UUID, but users pass whatever `knaix list` showed them.
+        let uuid = resolve_node_uuid(ctx, nid).await?;
+        let url = format!("{}/api/knowledge/{}/documents", ctx.config.api_url, uuid);
         let resp = ctx
             .client
             .get(&url)
@@ -106,7 +162,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
 
         if resp.status().is_success() {
             let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
-            let docs_val = &wrapper["documents"];
+            let docs_val = &wrapper["data"];
 
             if ctx.output_format == "json" {
                 let json_data = serde_json::to_string_pretty(docs_val).unwrap_or_default();
@@ -128,13 +184,18 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 let mut table = comfy_table::Table::new();
                 table.load_preset(comfy_table::presets::UTF8_FULL);
                 table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
-                table.set_header(vec!["Name", "Type", "Location"]);
+                table.set_header(vec!["Name", "Type", "Chunks", "Ingested"]);
 
                 for doc in docs {
+                    let source = doc.source.unwrap_or(DocumentSource {
+                        r#type: None,
+                        name: None,
+                    });
                     table.add_row(vec![
-                        doc.name,
-                        doc.r#type,
-                        doc.location.unwrap_or_else(|| "N/A".to_string()),
+                        source.name.unwrap_or_else(|| "N/A".to_string()),
+                        source.r#type.unwrap_or_else(|| "N/A".to_string()),
+                        doc.chunk_count.unwrap_or(0).to_string(),
+                        doc.created_at.unwrap_or_else(|| "N/A".to_string()),
                     ]);
                 }
                 println!("{table}\n");
@@ -271,13 +332,15 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         return Ok(None);
     }
 
-    // Auto-select if only one node exists
+    // Auto-select if only one node exists. Report the friendly name but return
+    // the UUID, which is what every data route is keyed by.
     if nodes.len() == 1 {
-        let id = nodes[0].instance_id.clone().or(Some(nodes[0].name.clone()));
-        if let Some(ref nid) = id {
-            println!("{} Auto-selected node: {}", "Info:".blue(), nid.cyan());
-        }
-        return Ok(id);
+        println!(
+            "{} Auto-selected node: {}",
+            "Info:".blue(),
+            nodes[0].name.cyan()
+        );
+        return Ok(node_uuid(&nodes[0]).ok());
     }
 
     // Multiple nodes: show fuzzy selector with cursor hidden for a clean UI
@@ -307,71 +370,70 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
     let _ = execute!(std::io::stderr(), cursor::Show);
 
     if let Some(index) = selection {
-        return Ok(nodes[index]
-            .instance_id
-            .clone()
-            .or(Some(nodes[index].name.clone())));
+        return Ok(node_uuid(&nodes[index]).ok());
     }
 
     Ok(None)
 }
 
-/// Resolves the best node ID to use.
-/// 1. If `manual_id` is Some, it uses that (no failover).
-/// 2. If `manual_id` is None, it tries the default node from config.
-/// 3. If no default is set or the default node is not 'running', triggers selection.
+/// The UUID a node's data routes are keyed by, or an error naming the node.
+fn node_uuid(node: &Node) -> Result<String> {
+    node.id.clone().ok_or_else(|| {
+        anyhow!(
+            "Node {} has no instance UUID; the control plane is too old for this CLI.",
+            node.name
+        )
+    })
+}
+
+/// Turn anything the user can read off `knaix list` -- UUID, instance id, or
+/// name -- into the instance UUID the knowledge and chat routes require.
+pub async fn resolve_node_uuid(ctx: &KnaixContext, wanted: &str) -> Result<String> {
+    let nodes = fetch_nodes(ctx).await?;
+    match nodes.iter().find(|n| node_matches(n, wanted)) {
+        Some(node) => node_uuid(node),
+        None => Err(anyhow!(
+            "No node matches '{}'. Run 'knaix list' to see your nodes.",
+            wanted
+        )),
+    }
+}
+
+/// Resolves the node to act on, always as an instance UUID.
+/// 1. If `manual_id` is Some, resolve exactly that (no failover).
+/// 2. Otherwise try the default node from config.
+/// 3. If there is no default, or it is gone or not running, offer selection.
 pub async fn resolve_node_id(
     ctx: &KnaixContext,
     manual_id: Option<String>,
 ) -> Result<Option<String>> {
     if let Some(id) = manual_id {
-        return Ok(Some(id));
+        return resolve_node_uuid(ctx, &id).await.map(Some);
     }
 
-    // Get token or fail early
-    let token = match ctx.config.token {
-        Some(ref t) => t,
-        None => return select_node_interactively(ctx).await,
-    };
+    // No token means nothing to resolve against; go straight to selection,
+    // which reports the auth failure in one place.
+    if ctx.config.token.is_none() {
+        return select_node_interactively(ctx).await;
+    }
 
-    // Lazy Validation: If we have a default node, check its health before committing
     if let Some(ref def_id) = ctx.config.default_node_id {
-        let url = format!("{}/api/instances", ctx.config.api_url);
-
-        if let Ok(resp) = ctx
-            .client
-            .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
-                let nodes_val = &wrapper["data"];
-                if let Ok(nodes) = serde_json::from_value::<Vec<Node>>(nodes_val.clone()) {
-                    let found = nodes
-                        .iter()
-                        .find(|n| n.instance_id.as_deref() == Some(def_id) || n.name == *def_id);
-
-                    if let Some(node) = found {
-                        if node.state == "running" {
-                            return Ok(Some(def_id.clone()));
-                        } else {
-                            println!(
-                                "{} Default node [{}] is {}, falling back to selection...",
-                                "Info:".blue(),
-                                def_id.cyan(),
-                                node.state.yellow()
-                            );
-                        }
-                    } else {
-                        println!(
-                            "{} Default node [{}] no longer exists, falling back to selection...",
-                            "Info:".blue(),
-                            def_id.cyan()
-                        );
-                    }
-                }
+        // Validate the default before committing to it, so a stopped or
+        // deleted node prompts instead of failing mid-command.
+        if let Ok(nodes) = fetch_nodes(ctx).await {
+            match nodes.iter().find(|n| node_matches(n, def_id)) {
+                Some(node) if node.state == "running" => return node_uuid(node).map(Some),
+                Some(node) => println!(
+                    "{} Default node [{}] is {}, falling back to selection...",
+                    "Info:".blue(),
+                    def_id.cyan(),
+                    node.state.yellow()
+                ),
+                None => println!(
+                    "{} Default node [{}] no longer exists, falling back to selection...",
+                    "Info:".blue(),
+                    def_id.cyan()
+                ),
             }
         }
     }
@@ -380,263 +442,230 @@ pub async fn resolve_node_id(
     select_node_interactively(ctx).await
 }
 
+/// Send one message to a node and stream the grounded answer back.
+///
+/// Talks to the native chat route, where the whole RAG pipeline runs on the
+/// node itself: retrieval, rerank and synthesis happen behind the residency
+/// boundary and the response carries the passages the answer was grounded in.
 pub async fn chat(
     ctx: &KnaixContext,
-    node_id: &str,
+    node_uuid: &str,
     message: &str,
     stream_to_stdout: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<ChatAnswer>> {
     let token = ctx.get_token()?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .tick_chars(
+                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
+            )
             .template("{spinner:.cyan} {msg}")
             .unwrap(),
     );
-    pb.set_message("Locating node...");
+    pb.set_message("Thinking...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    // Resolve API key and connection metadata
-    let instances_url = format!("{}/api/instances", ctx.config.api_url);
-    let mut api_key: Option<String> = None;
-    let mut is_byot = false;
-    let mut node_ip = String::new();
+    let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
+    let payload = serde_json::json!({ "message": message, "stream": true });
 
-    if let Ok(resp) = ctx
+    let resp = ctx
         .client
-        .get(&instances_url)
+        .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
+        .json(&payload)
         .send()
         .await
-    {
-        if resp.status().is_success() {
-            let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
-            let nodes_val = &wrapper["data"];
-            let nodes: Vec<Node> = serde_json::from_value(nodes_val.clone()).unwrap_or_default();
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("Networking error during chat request")?;
 
-            let target_node = nodes
-                .iter()
-                .find(|n| n.instance_id.as_deref() == Some(node_id) || n.name == node_id);
-
-            if let Some(node) = target_node {
-                if let Some(creds) = &node.credentials {
-                    if let Some(key) = &creds.api_key {
-                        api_key = Some(key.clone());
-                    }
-                }
-                if let Some(cfg) = &node.config {
-                    is_byot = cfg.get("isByot").and_then(|v| v.as_bool()).unwrap_or(false);
-                }
-                if let Some(iid) = &node.instance_id {
-                    node_ip = iid.clone();
-                }
-            }
-        }
+    if !resp.status().is_success() {
+        pb.finish_and_clear();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let detail = body["error"].as_str().unwrap_or("no detail");
+        return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail));
     }
 
-    pb.set_message("Thinking...");
+    let (text, citations) = read_chat_stream(resp, &pb, stream_to_stdout).await?;
 
-    let url;
-    let req_builder;
-
-    if is_byot {
-        if node_ip.is_empty() {
-            pb.finish_and_clear();
-            return Err(anyhow!("BYOT node ID not found. Cannot resolve MagicDNS."));
-        }
-        let Some(node_key) = api_key.as_deref() else {
-            pb.finish_and_clear();
-            return Err(anyhow!(
-                "Could not resolve credentials for BYOT node {}; cannot establish a direct sovereign link.",
-                node_id
-            ));
-        };
-        url = format!(
-            "http://{}:8080/api/v1/workspace/default/stream-chat",
-            node_ip
-        );
-        req_builder = ctx
-            .client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", node_key));
-        pb.suspend(|| {
-            println!(
-                "{} {}",
-                "[Mesh]".magenta(),
-                format!("Direct Sovereign Link: http://{}:8080", node_ip).dimmed()
-            );
-        });
-    } else {
-        url = format!(
-            "{}/api/nodes/{}/proxy/api/v1/workspace/default/stream-chat",
-            ctx.config.api_url, node_id
-        );
-        let mut builder = ctx
-            .client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token));
-        // Only forward a node credential when the control plane returned one.
-        if let Some(node_key) = api_key.as_deref() {
-            builder = builder.header("X-Target-Authorization", format!("Bearer {}", node_key));
-        }
-        req_builder = builder;
+    if stream_to_stdout {
+        print_citations(&citations);
     }
 
-    let payload = serde_json::json!({ "message": message, "mode": "chat" });
-
-    match req_builder.json(&payload).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                pb.finish_and_clear();
-
-                if stream_to_stdout {
-                    print!("{} ", "AI:".cyan().bold());
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                }
-
-                let mut stream = resp.bytes_stream();
-                let mut assistant_text = String::new();
-
-                while let Some(chunk_result) = stream.next().await {
-                    if let Ok(chunk) = chunk_result {
-                        let text = String::from_utf8_lossy(&chunk);
-                        for line in text.lines() {
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if let Ok(data) =
-                                    serde_json::from_str::<serde_json::Value>(json_str)
-                                {
-                                    if let Some(resp_text) = data["textResponse"].as_str() {
-                                        if stream_to_stdout {
-                                            print!("{}", resp_text);
-                                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                                        }
-                                        assistant_text.push_str(resp_text);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if stream_to_stdout {
-                    println!();
-                }
-
-                Ok(Some(assistant_text))
-            } else {
-                pb.finish_and_clear();
-                Err(anyhow!("Chat failed on node: HTTP {}", resp.status()))
-            }
-        }
-        Err(e) => {
-            pb.finish_and_clear();
-            Err(e).context("Networking error during chat request")
-        }
-    }
+    Ok(Some(ChatAnswer { text, citations }))
 }
 
+/// Consume the server-sent event stream, printing tokens as they land.
+///
+/// The stream carries three kinds of frame: a `meta` event holding the
+/// citations, bare `data:` frames holding one token each, and a terminating
+/// `done` (or `error`) event. Tokens are printed as they arrive so a long
+/// answer feels responsive; the citations are held back and rendered after.
+async fn read_chat_stream(
+    resp: reqwest::Response,
+    pb: &ProgressBar,
+    stream_to_stdout: bool,
+) -> Result<(String, Vec<Citation>)> {
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut answer = String::new();
+    let mut citations: Vec<Citation> = Vec::new();
+    // Which citations the answer actually referenced. It arrives at the end, in
+    // the `done` frame, rather than on the citations themselves.
+    let mut cited_indexes: Vec<u32> = Vec::new();
+    let mut event = String::new();
+    let mut first_token = true;
+    let mut stream_error: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Chat stream ended unexpectedly")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Frames are newline-delimited; keep any partial tail for the next chunk.
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim_end_matches('\r').to_string();
+            buffer.drain(..=newline);
+
+            if let Some(name) = line.strip_prefix("event: ") {
+                event = name.trim().to_string();
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event.as_str() {
+                "meta" => {
+                    citations =
+                        serde_json::from_value(parsed["citations"].clone()).unwrap_or_default();
+                }
+                "error" => {
+                    stream_error = Some(
+                        parsed["error"]
+                            .as_str()
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    );
+                }
+                "done" => {
+                    cited_indexes = parsed["citedIndexes"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                _ => {
+                    if let Some(token) = parsed["token"].as_str() {
+                        if stream_to_stdout {
+                            // Clear the spinner only once the first token is in
+                            // hand, so the line it occupied is reused.
+                            if first_token {
+                                pb.finish_and_clear();
+                                print!("{} ", "AI:".cyan().bold());
+                            }
+                            print!("{}", token);
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        first_token = false;
+                        answer.push_str(token);
+                    }
+                }
+            }
+            // Every frame here carries its whole payload on one `data:` line, so
+            // the event ends with it. Leaving the name set would make the next
+            // token frame read as another `meta`.
+            event.clear();
+        }
+    }
+
+    pb.finish_and_clear();
+    if stream_to_stdout && !first_token {
+        println!();
+    }
+
+    if let Some(code) = stream_error {
+        return Err(anyhow!("Chat failed on node: {}", code));
+    }
+
+    // Retrieval returns candidates; only some end up referenced. Mark the ones
+    // the answer actually used, so the CLI shows sources rather than every
+    // passage the node happened to consider.
+    for citation in citations.iter_mut() {
+        let referenced = citation
+            .index
+            .map(|i| cited_indexes.contains(&i))
+            .unwrap_or(false);
+        citation.cited = Some(referenced);
+    }
+
+    Ok((answer, citations))
+}
+
+/// Render the passages an answer was grounded in, so a claim can be checked
+/// against the node's own corpus rather than taken on trust.
+pub fn print_citations(citations: &[Citation]) {
+    let cited: Vec<&Citation> = citations
+        .iter()
+        .filter(|c| c.cited.unwrap_or(false))
+        .collect();
+    if cited.is_empty() {
+        return;
+    }
+
+    println!("\n{}", "Grounded in:".dimmed());
+    for citation in cited {
+        let index = citation.index.unwrap_or(0);
+        let name = citation
+            .source
+            .as_ref()
+            .and_then(|s| s.name.clone())
+            .unwrap_or_else(|| "unknown source".to_string());
+        let snippet = citation.content.clone().unwrap_or_default();
+        let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = if snippet.chars().count() > 160 {
+            format!("{}...", snippet.chars().take(160).collect::<String>())
+        } else {
+            snippet
+        };
+        println!("  {} {}", format!("[{}]", index).cyan(), name.dimmed());
+        println!("      {}", snippet);
+    }
+    println!();
+}
+
+/// Chat without touching stdout, for the REPL's background summarizer.
 pub async fn chat_silent(
     config: crate::config::Config,
-    node_id: String,
+    node_uuid: String,
     message: String,
 ) -> Result<Option<String>> {
-    let token = config.token.context("Not logged in")?;
+    let token = config.token.clone().context("Not logged in")?;
     let client = reqwest::Client::new();
-    let instances_url = format!("{}/api/instances", config.api_url);
-    let mut api_key: Option<String> = None;
-    let mut is_byot = false;
-    let mut node_ip = String::new();
+    let url = format!("{}/api/nodes/{}/native-chat", config.api_url, node_uuid);
 
-    if let Ok(resp) = client
-        .get(&instances_url)
+    let resp = client
+        .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
+        .json(&serde_json::json!({ "message": message }))
         .send()
         .await
-    {
-        if resp.status().is_success() {
-            let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
-            let nodes_val = &wrapper["data"];
-            let nodes: Vec<Node> = serde_json::from_value(nodes_val.clone()).unwrap_or_default();
-            if let Some(node) = nodes
-                .iter()
-                .find(|n| n.instance_id.as_deref() == Some(&node_id) || n.name == node_id)
-            {
-                if let Some(creds) = &node.credentials {
-                    if let Some(key) = &creds.api_key {
-                        api_key = Some(key.clone());
-                    }
-                }
-                if let Some(cfg) = &node.config {
-                    is_byot = cfg.get("isByot").and_then(|v| v.as_bool()).unwrap_or(false);
-                }
-                if let Some(iid) = &node.instance_id {
-                    node_ip = iid.clone();
-                }
-            }
-        }
+        .context("Networking error during chat request")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("Chat failed on node: HTTP {}", resp.status()));
     }
 
-    let url;
-    let req_builder;
-    if is_byot {
-        if node_ip.is_empty() {
-            return Err(anyhow!("BYOT node ID not found"));
-        }
-        let node_key = api_key
-            .as_deref()
-            .context("Could not resolve credentials for BYOT node")?;
-        url = format!(
-            "http://{}:8080/api/v1/workspace/default/stream-chat",
-            node_ip
-        );
-        req_builder = client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", node_key));
-    } else {
-        url = format!(
-            "{}/api/nodes/{}/proxy/api/v1/workspace/default/stream-chat",
-            config.api_url, node_id
-        );
-        let mut builder = client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token));
-        if let Some(node_key) = api_key.as_deref() {
-            builder = builder.header("X-Target-Authorization", format!("Bearer {}", node_key));
-        }
-        req_builder = builder;
-    }
-
-    let payload = serde_json::json!({ "message": message, "mode": "chat" });
-    match req_builder.json(&payload).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                let mut stream = resp.bytes_stream();
-                let mut assistant_text = String::new();
-                while let Some(chunk_result) = stream.next().await {
-                    if let Ok(chunk) = chunk_result {
-                        let text = String::from_utf8_lossy(&chunk);
-                        for line in text.lines() {
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if let Ok(data) =
-                                    serde_json::from_str::<serde_json::Value>(json_str)
-                                {
-                                    if let Some(resp_text) = data["textResponse"].as_str() {
-                                        assistant_text.push_str(resp_text);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Some(assistant_text))
-            } else {
-                Err(anyhow!("Chat failed on node: HTTP {}", resp.status()))
-            }
-        }
-        Err(e) => Err(e).context("Networking error during chat request"),
-    }
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok(body["answer"].as_str().map(|s| s.to_string()))
 }
 
 pub async fn upload_single_file(
@@ -687,7 +716,9 @@ pub async fn upload_single_file(
         .unwrap();
 
     let form = multipart::Form::new().part("file", part);
-    let url = format!("{}/api/nodes/{}/documents", ctx.config.api_url, node_id);
+    // Native ingest: the control plane parses and chunks, and the chunks land
+    // in the node's own store rather than a workspace on the node's runtime.
+    let url = format!("{}/api/knowledge/{}/documents", ctx.config.api_url, node_id);
 
     match ctx
         .client
@@ -703,10 +734,13 @@ pub async fn upload_single_file(
             let data: serde_json::Value = resp.json().await.unwrap_or_default();
 
             if status.is_success() && data["success"].as_bool().unwrap_or(false) {
+                let chunks = data["data"]["chunkCount"].as_u64().unwrap_or(0);
                 println!(
-                    "  {} {} uploaded to knowledge base.",
+                    "  {} {} ingested ({} chunk{}).",
                     "✓".green(),
-                    file_name.white()
+                    file_name.white(),
+                    chunks,
+                    if chunks == 1 { "" } else { "s" }
                 );
                 Ok(())
             } else {
@@ -932,12 +966,20 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let url = format!("{}/api/instances", ctx.config.api_url);
-    let payload = serde_json::json!({ "tier": "Community" });
+    // Send no tier or deployment mode: the control plane derives both from the
+    // caller's subscription, and a hardcoded tier here would silently ask for
+    // the wrong placement on any account that is not Community.
+    let payload = serde_json::json!({});
 
     match ctx
         .client
         .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
+        // Provisioning pulls an image and boots a container, which routinely
+        // outlasts the client's default timeout. Timing out here abandons a
+        // request the control plane is still working on, so the node appears
+        // minutes later with no sign the command created it.
+        .timeout(Duration::from_secs(300))
         .json(&payload)
         .send()
         .await
@@ -946,23 +988,33 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
             if resp.status().is_success() {
                 let data: serde_json::Value = resp.json().await.unwrap_or_default();
 
-                // Get the instance ID from typical response or default to "Node"
+                // The provisioning response reports status, not an identifier,
+                // so name the node only when one actually came back rather than
+                // inventing a placeholder and telling the user to look it up.
                 let instance_id = data
                     .get("data")
                     .and_then(|d| d.get("instanceId"))
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("Node");
+                    .and_then(|i| i.as_str());
 
-                pb.finish_with_message(format!(
-                    "{} Node {} requested.",
-                    "✓".green(),
-                    instance_id.cyan()
-                ));
-                println!(
-                    "  Boot takes a few minutes. Check on it with {} or {}.",
-                    "knaix list".cyan(),
-                    format!("knaix metrics {}", instance_id).cyan()
-                );
+                match instance_id {
+                    Some(id) => pb.finish_with_message(format!(
+                        "{} Node {} requested.",
+                        "✓".green(),
+                        id.cyan()
+                    )),
+                    None => pb.finish_with_message(format!("{} Node requested.", "✓".green())),
+                }
+                match instance_id {
+                    Some(id) => println!(
+                        "  Boot takes a few minutes. Check on it with {} or {}.",
+                        "knaix list".cyan(),
+                        format!("knaix metrics {}", id).cyan()
+                    ),
+                    None => println!(
+                        "  Boot takes a few minutes. Run {} to see it come up.",
+                        "knaix list".cyan()
+                    ),
+                }
             } else {
                 let status = resp.status();
                 pb.finish_and_clear();
@@ -1065,7 +1117,7 @@ pub async fn upload_single_file_silent(
         .unwrap();
 
     let form = multipart::Form::new().part("file", part);
-    let url = format!("{}/api/nodes/{}/documents", config.api_url, node_id);
+    let url = format!("{}/api/knowledge/{}/documents", config.api_url, node_id);
     let client = reqwest::Client::new();
 
     let resp = client
