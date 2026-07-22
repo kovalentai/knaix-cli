@@ -1,4 +1,4 @@
-use crate::config::{load_config, save_config};
+use crate::config::{load_config, load_stored_config, save_config};
 use axum::{
     extract::{Extension, Query},
     response::Html,
@@ -66,10 +66,12 @@ async fn handle_callback(
         return Html(REJECTED_HTML);
     }
 
-    let mut config = load_config();
-    config.token = Some(params.token.clone());
-    config.username = Some(params.username.clone());
-    save_config(&config).ok();
+    // Persist only the disk state plus the new session, so a KNAIX_API_URL set
+    // for this shell does not become the user's saved API URL.
+    let mut stored = load_stored_config();
+    stored.token = Some(params.token.clone());
+    stored.username = Some(params.username.clone());
+    save_config(&stored).ok();
 
     println!("\n{} Successfully logged in!", "✓".green());
     println!("  Welcome, {}", params.username.cyan());
@@ -78,7 +80,8 @@ async fn handle_callback(
     println!("\n{} Synchronizing with private mesh...", "Info:".blue());
 
     let client = reqwest::Client::new();
-    let api_url = config.api_url.clone();
+    // The request itself honours KNAIX_API_URL, even though the saved file does not.
+    let api_url = load_config().api_url;
     let token = params.token.clone();
 
     // Trigger mesh join request in the background/async
