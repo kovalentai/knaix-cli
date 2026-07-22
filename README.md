@@ -8,9 +8,9 @@ Knaix CLI inverts the traditional cloud AI paradigm. Instead of sending sensitiv
 
 ## Magic Developer Experience (DX)
 
-*   **Agent Memory**: Intelligent, cross-session persistent state. Knaix intercepts explicit "Remember..." commands, committing facts atomically to `_knaix_durable_memory.md` on the isolated node, while older context is compressed into `_knaix_ephemeral_log.md`.
-*   **Terminal-Native Provisioning**: Execute `knaix up` to automatically broker compute requests and simulate the EC2/EKS boot sequence via immersive `indicatif` rendering. Infrastructure as Code abstracted directly to the CLI.
-*   **Enterprise Scriptability**: Native `--json` global flag compatibility across all telemetry and list commands, eliminating string-parsing friction in CI/CD pipelines. Standard stdout is dynamically structured utilizing the `comfy-table` engine.
+*   **Agent Memory**: Intelligent, cross-session persistent state. Knaix intercepts explicit "Remember..." commands, appending facts to `_knaix_durable_memory.md` under `~/.knaix/memory/<node-id>` and uploading them to the node's knowledge base, while older context is compressed into `_knaix_ephemeral_log.md`.
+*   **Terminal-Native Provisioning**: Execute `knaix up` to broker a compute request from the terminal. Infrastructure as Code abstracted directly to the CLI.
+*   **Enterprise Scriptability**: Native `-o json` global flag compatibility across all telemetry and list commands, eliminating string-parsing friction in CI/CD pipelines. Standard stdout is dynamically structured utilizing the `comfy-table` engine.
 *   **Recursive Ingestion**: The `knaix upload <path>` command leverages the highly optimized `walkdir` crate, seamlessly walking nested directories for massive bulk documentation embedding.
 *   **Smart Failover**: Automatic health checks detect unreachable nodes and dynamically prompt interactive recovery sequences.
 *   **REPL**: Persistent, markdown-rendered terminal sessions utilizing an intelligent local sliding window for context management.
@@ -26,7 +26,7 @@ Knaix CLI inverts the traditional cloud AI paradigm. Instead of sending sensitiv
 
 ### Primary Install (macOS & Linux)
 ```bash
-curl -sSL https://knaix.com/install.sh | bash
+curl -sSL https://knaix.com/install.sh | sh
 ```
 
 ### Source Compilation (Requires Rust toolchain)
@@ -67,13 +67,13 @@ cargo install --path .
 | `knaix chat`     | Dispatch a stateless, one-shot prompt.                |
 | `knaix upload`   | Recursively ingest directories into vector storage.   |
 | `knaix memory`   | Interrogate durable and ephemeral node memories.      |
-| `knaix status`   | Verify API health, mesh routing, and authentication.  |
-| `knaix metrics`  | Stream real-time node latency and allocation metrics. |
-| `knaix logs`     | Subscribe to live service stdout from the agent pod.  |
-| `knaix config`   | Manipulate local CLI overrides and preferences.       |
+| `knaix status`   | Show the local configuration and whether a session exists. |
+| `knaix metrics`  | Fetch a node's current health and latency.            |
+| `knaix logs`     | Fetch the most recent log lines from the agent pod.   |
+| `knaix config`   | Show or set the API URL used by the CLI.              |
 
 **Global Flags:**
-- `--json`: Emit structured JSON instead of formatted tables.
+- `-o json`, `--output json`: Emit structured JSON instead of formatted tables.
 - `--version`: Output the current installed binary version.
 
 ## Headless Execution

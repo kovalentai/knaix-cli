@@ -44,8 +44,8 @@ pub struct Document {
     pub location: Option<String>,
 }
 
-/// The KnaixContext holds its own wam-up HTTP client and configuration.
-/// This allows for connection pooling and TLS session reuse between commands.
+/// Holds the HTTP client and configuration shared by every request a single
+/// command makes, so repeated calls reuse one connection pool and TLS session.
 #[derive(Clone)]
 pub struct KnaixContext {
     pub config: crate::config::Config,
@@ -953,19 +953,16 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
                     .and_then(|i| i.as_str())
                     .unwrap_or("Node");
 
-                pb.set_message(format!("[DONE] Requesting compute: {}", instance_id));
-                // Simulate boot stages according to enterprise polish specification
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                pb.set_message(format!("[BUSY] Booting kernel for {}...", instance_id));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                pb.set_message("[BUSY] Establishing Tailscale route...");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
                 pb.finish_with_message(format!(
-                    "{} Node {} provisioned successfully.",
+                    "{} Node {} requested.",
                     "✓".green(),
                     instance_id.cyan()
                 ));
+                println!(
+                    "  Boot takes a few minutes. Check on it with {} or {}.",
+                    "knaix list".cyan(),
+                    format!("knaix metrics {}", instance_id).cyan()
+                );
             } else {
                 let status = resp.status();
                 pb.finish_and_clear();
