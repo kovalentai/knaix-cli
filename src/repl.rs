@@ -5,7 +5,8 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use termimad::MadSkin;
 
-pub async fn run(ctx: &KnaixContext, node_id: &str) -> Result<()> {
+pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()> {
+    let node_id = &target.label();
     let mut rl = DefaultEditor::new().context("Failed to initialize readline")?;
     let skin = MadSkin::default_dark();
 
@@ -149,7 +150,7 @@ pub async fn run(ctx: &KnaixContext, node_id: &str) -> Result<()> {
                     history_buffer.clear();
                 }
 
-                match crate::nodes::chat(ctx, node_id, &final_input, false).await {
+                match crate::nodes::chat(ctx, target, &final_input, false).await {
                     Ok(Some(answer)) => {
                         println!();
                         skin.print_text(&answer.text);

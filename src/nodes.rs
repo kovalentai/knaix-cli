@@ -1,5 +1,7 @@
 use crate::config::load_config;
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use colored::*;
 use crossterm::{cursor, execute};
 use futures_util::StreamExt;
@@ -102,6 +104,68 @@ impl KnaixContext {
             .as_ref()
             .context("Not logged in. Run 'knaix login' first.")
     }
+}
+
+/// Where a command should send its work.
+///
+/// The two differ in more than a base URL: the local node exposes the intent
+/// routes directly and needs no credential, while a hosted instance is reached
+/// through the control plane, which authorizes the caller and holds the node's
+/// key. Keeping them one type means every data command decides once, at the
+/// edge, instead of threading a flag through the middle.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// The node running on this machine. No account, no token.
+    Local { base: String, instance_id: String },
+    /// An instance the control plane provisioned and authorizes access to.
+    Remote { uuid: String },
+}
+
+impl Target {
+    /// Identifier to show a user; the local node has no meaningful UUID to them.
+    pub fn label(&self) -> String {
+        match self {
+            Target::Local { .. } => crate::local::LOCAL_NODE_ID.to_string(),
+            Target::Remote { uuid } => uuid.clone(),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Target::Local { .. })
+    }
+}
+
+/// Resolve the local node, failing with the command that would start it.
+fn local_target() -> Result<Target> {
+    let node = crate::local::load().ok_or_else(|| {
+        anyhow!(
+            "No local node has been started. Run '{}' first.",
+            "knaix local up"
+        )
+    })?;
+    Ok(Target::Local {
+        base: node.base_url(),
+        instance_id: node.instance_id,
+    })
+}
+
+/// Resolve what a command should act on, local or hosted.
+pub async fn resolve_target(
+    ctx: &KnaixContext,
+    manual_id: Option<String>,
+) -> Result<Option<Target>> {
+    // The reserved name wins wherever it appears, including as the saved
+    // default, so `knaix use local` makes every later command local.
+    let named = manual_id
+        .clone()
+        .or_else(|| ctx.config.default_node_id.clone());
+    if named.as_deref() == Some(crate::local::LOCAL_NODE_ID) {
+        return local_target().map(Some);
+    }
+
+    Ok(resolve_node_id(ctx, manual_id)
+        .await?
+        .map(|uuid| Target::Remote { uuid }))
 }
 
 /// True when a node is the one the user named, by UUID, instance id, or name.
@@ -453,10 +517,14 @@ pub async fn resolve_node_id(
 /// boundary and the response carries the passages the answer was grounded in.
 pub async fn chat(
     ctx: &KnaixContext,
-    node_uuid: &str,
+    target: &Target,
     message: &str,
     stream_to_stdout: bool,
 ) -> Result<Option<ChatAnswer>> {
+    if let Target::Local { base, instance_id } = target {
+        return chat_local(ctx, base, instance_id, message, stream_to_stdout).await;
+    }
+    let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
     let pb = ProgressBar::new_spinner();
@@ -503,6 +571,128 @@ pub async fn chat(
         citations,
         model,
     }))
+}
+
+/// Ask the local node directly.
+///
+/// It answers as one JSON body rather than a stream, so there is nothing to
+/// print progressively; the spinner covers the wait and the answer arrives
+/// whole. No token is sent because there is no one to authorize against -- the
+/// node is on loopback and belongs to whoever is running it.
+async fn chat_local(
+    ctx: &KnaixContext,
+    base: &str,
+    instance_id: &str,
+    message: &str,
+    print: bool,
+) -> Result<Option<ChatAnswer>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars(
+                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
+            )
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Thinking...");
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    let resp = ctx
+        .client
+        .post(format!("{}/api/query/answer", base))
+        .json(&serde_json::json!({ "instance_id": instance_id, "query": message }))
+        .send()
+        .await
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    pb.finish_and_clear();
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let detail = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("no detail");
+        return Err(anyhow!(
+            "Local node could not answer: HTTP {} - {}",
+            status,
+            detail
+        ));
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let text = body["answer"].as_str().unwrap_or_default().to_string();
+    let citations = node_citations(&body["citations"], &text);
+    let model = body["model"].as_str().map(|s| s.to_string());
+
+    if print {
+        println!("{} {}", "AI:".cyan().bold(), text);
+        print_citations(&citations);
+    }
+
+    Ok(Some(ChatAnswer {
+        text,
+        citations,
+        model,
+    }))
+}
+
+/// Map the node's citation shape onto the CLI's.
+///
+/// The node keeps provenance under `metadata`, where its store put it, and does
+/// not mark which passages the answer used -- the control plane derives that
+/// from its own stream. Answering directly, the only record of what was used is
+/// the answer text, so read the `[n]` markers back out of it. A passage the
+/// answer never referenced is context the model saw, not a source it cited, and
+/// showing the two alike would overstate what the answer rests on.
+fn node_citations(raw: &serde_json::Value, answer: &str) -> Vec<Citation> {
+    let referenced = referenced_indexes(answer);
+    raw.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|c| {
+                    let index = c["index"].as_u64().map(|n| n as u32);
+                    Citation {
+                        index,
+                        content: c["content"].as_str().map(|s| s.to_string()),
+                        source: serde_json::from_value(c["metadata"]["source"].clone()).ok(),
+                        cited: Some(index.map(|i| referenced.contains(&i)).unwrap_or(false)),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The citation markers an answer actually used, as in "... [1] ... [3]".
+fn referenced_indexes(answer: &str) -> Vec<u32> {
+    let mut found = Vec::new();
+    let bytes: Vec<char> = answer.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '[' {
+            let mut j = i + 1;
+            let mut digits = String::new();
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                digits.push(bytes[j]);
+                j += 1;
+            }
+            if !digits.is_empty() && j < bytes.len() && bytes[j] == ']' {
+                if let Ok(n) = digits.parse::<u32>() {
+                    if !found.contains(&n) {
+                        found.push(n);
+                    }
+                }
+                i = j;
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Consume the server-sent event stream, printing tokens as they land.
@@ -680,10 +870,14 @@ pub async fn chat_silent(
 
 pub async fn upload_single_file(
     ctx: &KnaixContext,
-    node_id: &str,
+    target: &Target,
     path: &Path,
     file_name: &str,
 ) -> Result<()> {
+    if let Target::Local { base, instance_id } = target {
+        return upload_local(ctx, base, instance_id, path, file_name).await;
+    }
+    let node_id = &target.label();
     let token = ctx.get_token()?;
     let file_size = tokio::fs::metadata(path)
         .await
@@ -765,7 +959,68 @@ pub async fn upload_single_file(
     }
 }
 
-pub async fn upload(ctx: &KnaixContext, node_id: &str, file_path: &str) -> Result<()> {
+/// Send one file to the local node, which parses, chunks and embeds it itself.
+///
+/// The bytes go as base64 in a JSON body rather than multipart: the node's
+/// ingest intent takes one shape for text, a file, or a URL, and a CLI that
+/// spoke a second wire format for the same operation would be a second thing to
+/// keep in step.
+async fn upload_local(
+    ctx: &KnaixContext,
+    base: &str,
+    instance_id: &str,
+    path: &Path,
+    file_name: &str,
+) -> Result<()> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .context("Could not read the file")?;
+    println!(
+        "\n  {} {} ({})",
+        "Ingesting".cyan(),
+        file_name.bold().white(),
+        format_file_size(bytes.len() as u64).dimmed()
+    );
+
+    let encoded = BASE64.encode(&bytes);
+    let resp = ctx
+        .client
+        .post(format!("{}/api/kb/ingest", base))
+        .json(&serde_json::json!({
+            "instance_id": instance_id,
+            "content_base64": encoded,
+            "filename": file_name,
+        }))
+        .send()
+        .await
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let detail = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow!("Ingest failed: HTTP {} - {}", status, detail));
+    }
+
+    let chunks = body["chunkCount"].as_u64().unwrap_or(0);
+    println!(
+        "  {} {} ingested ({} chunk{}), embedded by {}.",
+        "\u{2713}".green(),
+        file_name.white(),
+        chunks,
+        if chunks == 1 { "" } else { "s" },
+        body["embeddingProvider"]
+            .as_str()
+            .unwrap_or("the node")
+            .dimmed()
+    );
+    Ok(())
+}
+
+pub async fn upload(ctx: &KnaixContext, target: &Target, file_path: &str) -> Result<()> {
     let base_path = Path::new(file_path);
     if !base_path.exists() {
         return Err(anyhow!("Path not found: {}", file_path));
@@ -786,7 +1041,7 @@ pub async fn upload(ctx: &KnaixContext, node_id: &str, file_path: &str) -> Resul
                     .to_str()
                     .unwrap_or("file")
                     .to_string();
-                upload_single_file(ctx, node_id, path, &file_name).await?;
+                upload_single_file(ctx, target, path, &file_name).await?;
             }
         }
     } else {
@@ -796,7 +1051,7 @@ pub async fn upload(ctx: &KnaixContext, node_id: &str, file_path: &str) -> Resul
             .to_str()
             .unwrap_or("file")
             .to_string();
-        upload_single_file(ctx, node_id, base_path, &file_name).await?;
+        upload_single_file(ctx, target, base_path, &file_name).await?;
     }
 
     Ok(())
@@ -1230,4 +1485,56 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_markers_are_read_out_of_the_answer() {
+        // Answering the node directly, the text is the only record of which
+        // passages were actually used.
+        assert_eq!(referenced_indexes("Grounded in [1] and [3]."), vec![1, 3]);
+        assert_eq!(referenced_indexes("no markers here"), Vec::<u32>::new());
+        // Repeats collapse; a passage cited twice is still one source.
+        assert_eq!(referenced_indexes("[2] then [2] again"), vec![2]);
+        // Not a marker.
+        assert_eq!(referenced_indexes("[abc] [ 1 ] [1"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn node_citations_hoist_source_and_mark_only_what_was_used() {
+        let raw = serde_json::json!([
+            { "index": 1, "content": "used passage",
+              "metadata": { "source": { "name": "a.md", "type": "text" } } },
+            { "index": 2, "content": "unused passage",
+              "metadata": { "source": { "name": "b.md", "type": "text" } } }
+        ]);
+        let cites = node_citations(&raw, "Answer grounded in [1].");
+
+        assert_eq!(cites.len(), 2);
+        // Provenance lives under metadata on the node; the CLI reads it flat.
+        assert_eq!(
+            cites[0].source.as_ref().unwrap().name.as_deref(),
+            Some("a.md")
+        );
+        assert_eq!(cites[0].cited, Some(true));
+        // Retrieved but never referenced: context, not a source.
+        assert_eq!(cites[1].cited, Some(false));
+    }
+
+    #[test]
+    fn a_local_target_is_addressed_directly_and_labelled_local() {
+        let t = Target::Local {
+            base: "http://127.0.0.1:8080".into(),
+            instance_id: "abc".into(),
+        };
+        assert!(t.is_local());
+        assert_eq!(t.label(), "local");
+
+        let r = Target::Remote { uuid: "u-1".into() };
+        assert!(!r.is_local());
+        assert_eq!(r.label(), "u-1");
+    }
 }
