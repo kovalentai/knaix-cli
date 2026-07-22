@@ -451,14 +451,19 @@ pub async fn login() {
         }
     });
 
-    let server = match axum::Server::from_tcp(listener) {
-        Ok(s) => s,
+    // axum 0.8 serves from a tokio listener, which must be non-blocking.
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("{} Failed to start callback server: {}", "Error:".red(), e);
+        return;
+    }
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("{} Failed to start callback server: {}", "Error:".red(), e);
             return;
         }
     };
-    let _ = server.serve(app.into_make_service()).await;
+    let _ = axum::serve(listener, app).await;
 }
 
 #[cfg(test)]
