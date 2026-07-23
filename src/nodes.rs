@@ -720,24 +720,28 @@ async fn chat_local(
     pb.set_message("Thinking...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
+    let body = build_local_answer_body(instance_id, message, history, verbosity);
+
     let resp = ctx
         .client
         .post(format!("{}/api/query/answer/stream", base))
         // First question after a start can include a model server loading its
         // weights, which routinely outlasts the client's default timeout.
         .timeout(Duration::from_secs(300))
-        .json(&build_local_answer_body(
-            instance_id,
-            message,
-            history,
-            verbosity,
-        ))
+        .json(&body)
         .send()
         .await
         .inspect_err(|_| pb.finish_and_clear())
         .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
 
-    // A non-2xx never reaches the event stream: the error is a normal JSON body.
+    // A node image built before streaming has no such route. Rather than fail
+    // against an older local node, answer through the blocking endpoint it does
+    // have: the reserved `local` node upgrades on its own schedule, not the CLI's.
+    if matches!(resp.status().as_u16(), 404 | 405) {
+        return chat_local_blocking(ctx, base, &body, &pb, print).await;
+    }
+
+    // Any other non-2xx never reaches the event stream: it is a normal JSON body.
     if !resp.status().is_success() {
         pb.finish_and_clear();
         let status = resp.status();
@@ -754,6 +758,61 @@ async fn chat_local(
     }
 
     let (text, citations, model) = read_local_answer_stream(resp, &pb, print).await?;
+
+    Ok(Some(ChatAnswer {
+        text,
+        citations,
+        model,
+    }))
+}
+
+/// The pre-streaming path: one blocking request that returns the whole answer.
+///
+/// Kept for a local node whose image predates the streaming route, so a CLI
+/// ahead of the node still answers. The request body is identical; only the
+/// endpoint and the one-shot parse differ.
+async fn chat_local_blocking(
+    ctx: &KnaixContext,
+    base: &str,
+    body: &serde_json::Value,
+    pb: &ProgressBar,
+    print: bool,
+) -> Result<Option<ChatAnswer>> {
+    let resp = ctx
+        .client
+        .post(format!("{}/api/query/answer", base))
+        .timeout(Duration::from_secs(300))
+        .json(body)
+        .send()
+        .await
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    pb.finish_and_clear();
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let detail = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("no detail");
+        return Err(anyhow!(
+            "Local node could not answer: HTTP {} - {}",
+            status,
+            detail
+        ));
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let text = body["answer"].as_str().unwrap_or_default().to_string();
+    let citations = node_citations(&body["citations"], &text);
+    let model = body["model"].as_str().map(|s| s.to_string());
+
+    if print {
+        println!("{} {}", "AI:".cyan().bold(), text);
+        print_citations(&citations);
+    }
 
     Ok(Some(ChatAnswer {
         text,
