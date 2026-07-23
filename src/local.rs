@@ -231,11 +231,26 @@ pub async fn up(
         let node = load().ok_or_else(|| {
             anyhow!("A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.", CONTAINER)
         })?;
-        println!(
-            "{} Local node already running on {}.",
-            "Info:".blue(),
-            node.base_url().cyan()
-        );
+        // The container reads its model configuration once, at startup. Flags
+        // passed to a node that is already up are read here and dropped, so an
+        // explicit request to change what answers has to say it did not take
+        // rather than print the same "already running" line as a bare `up`.
+        if mock || model_url.is_some() || model.is_some() {
+            println!(
+                "{} Local node already running on {}. Model flags only apply at startup, so it keeps its current answer source.\n  Run {} then {} to apply this, or {} to change it and restart in place.",
+                "Warning:".yellow(),
+                node.base_url().cyan(),
+                "knaix local down".cyan(),
+                "knaix local up".cyan(),
+                "knaix local setup".cyan()
+            );
+        } else {
+            println!(
+                "{} Local node already running on {}.",
+                "Info:".blue(),
+                node.base_url().cyan()
+            );
+        }
         return Ok(());
     }
 
