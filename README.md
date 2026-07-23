@@ -1,4 +1,4 @@
-# Knaix CLI (v0.4.0)
+# Knaix CLI (v0.4.1)
 
 The high-performance, single-tenant command-line daemon for Kovalent AI infrastructure. Engineered in Rust for memory safety, cryptographic isolation, and an uncompromising developer experience.
 

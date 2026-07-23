@@ -2,6 +2,25 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.1] - 2026-07-22
+
+### Added
+- **`knaix local setup`**: an interactive picker that probes the ports Ollama, LM Studio, vLLM and llama-server listen on, lists the models each server hosts, and remembers the choice. It offers to restart a running node so the pick takes effect immediately.
+- **`knaix logout`**: removes the saved session from this machine, and points out a `KNAIX_TOKEN` still set in the shell.
+- **`knaix completions <shell>`**: prints a shell completion script for bash, zsh, fish, powershell or elvish, generated from the parser so it cannot drift from the real flags.
+- **`chat -o json`**: the answer, every retrieved passage with a `cited` flag, and the model that produced it, as structured output.
+- **Directory upload filtering**: `knaix upload <dir>` skips directories that are never documentation (`.git`, `node_modules`, `target`, `dist`, virtualenvs) and files the node has no parser for, instead of sending them to be refused. `--include` and `--exclude` take globs, `--dry-run` shows what would be sent, and `--all` turns both defaults off. One unreadable file no longer abandons the run: the rest upload, the failures are named at the end, and the exit code is non-zero.
+
+### Changed
+- **`knaix local up` takes `--model-url` and `-m`/`--model`** (the earlier `--llama-url`/`--llama-model` remain as aliases). A loopback model URL is rewritten so the node's container can reach a server on your machine, and a model named without a server now warns rather than failing later.
+- **Mock answers are labeled at every layer.** The answer is prefixed, a footer follows it, and JSON reports the model as `mock`. The "Grounded in" list shows only the passages an answer actually cited.
+- **`-n` selects the node on `metrics`, `logs`, `repl`, `selftest` and `memory`**, the same as `chat` and `upload` already accepted.
+- **`knaix login` times out after five minutes** instead of waiting indefinitely, and prints the sign-in URL when no browser opens.
+- **Help text rewritten** so each command's one-line summary states plainly what it does.
+
+### Fixed
+- `metrics`, `logs` and `memory` against a local node no longer reach for the control plane; they read from the node itself.
+
 ## [0.4.0] - 2026-07-22
 
 ### Added
