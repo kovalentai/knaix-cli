@@ -90,3 +90,29 @@ case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) echo "Note: ${INSTALL_DIR} is not on your PATH; add it to use '${BIN}' directly." ;;
 esac
+
+cat <<'EOF'
+
+========================================================
+   Kovalent (Knaix) CLI installed
+========================================================
+
+Quick start (no account needed, just Docker):
+
+  1. Stand up a private AI node and pick a model (or the mock):
+     $ knaix local setup
+
+  2. Give it some documents:
+     $ knaix upload ./README.md
+
+  3. Ask a question grounded in them:
+     $ knaix chat "what does this cover?"
+
+Step 1 makes 'local' your default node, so steps 2 and 3 need no '-n local'.
+Clear the node's store any time and start fresh with 'knaix local reset'.
+
+Prefer a hosted node? Run 'knaix login', then 'knaix up'.
+
+For more commands, run: knaix --help
+Documentation: https://knaix.com
+EOF

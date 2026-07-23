@@ -218,6 +218,34 @@ fn resolve_launch(
     }
 }
 
+/// Where the saved default node stood after a local start.
+enum DefaultOutcome {
+    /// Nothing was chosen before, so `local` is now the default.
+    JustSet,
+    /// `local` was already the default.
+    AlreadyLocal,
+    /// A different node is the default; it was left untouched.
+    Other(String),
+}
+
+/// Make `local` the default when the user has none, so later commands are just
+/// `knaix chat "..."` with no `-n local`. A default the user already chose is
+/// theirs to keep, hosted node included; we only fill an empty slot.
+fn make_local_default_if_unset() -> DefaultOutcome {
+    let mut cfg = crate::config::load_stored_config();
+    match cfg.default_node_id.clone() {
+        None => {
+            cfg.default_node_id = Some(LOCAL_NODE_ID.to_string());
+            // Failing here costs only the shorthand, not the running node, so
+            // it is not worth failing the start over.
+            let _ = crate::config::save_config(&cfg);
+            DefaultOutcome::JustSet
+        }
+        Some(id) if id == LOCAL_NODE_ID => DefaultOutcome::AlreadyLocal,
+        Some(other) => DefaultOutcome::Other(other),
+    }
+}
+
 pub async fn up(
     port: Option<u16>,
     model_url: Option<String>,
@@ -249,6 +277,15 @@ pub async fn up(
                 "{} Local node already running on {}.",
                 "Info:".blue(),
                 node.base_url().cyan()
+            );
+        }
+        // A second `up` on a live node is still a chance to grant the shorthand
+        // to someone who never set a default.
+        if let DefaultOutcome::JustSet = make_local_default_if_unset() {
+            println!(
+                "  {} Set as your default node, so you can drop {}.",
+                "✓".green(),
+                "-n local".cyan()
             );
         }
         return Ok(());
@@ -435,16 +472,34 @@ pub async fn up(
             }
         }
     }
+    // Grant the shorthand so the very next command can be a bare `knaix chat`.
+    let outcome = make_local_default_if_unset();
+    match &outcome {
+        DefaultOutcome::JustSet => println!(
+            "  {} Set as your default node, so you can drop {}.",
+            "✓".green(),
+            "-n local".cyan()
+        ),
+        DefaultOutcome::Other(other) => println!(
+            "  {} Your default node is {}; pass {} to reach this one.",
+            "Note:".blue(),
+            other.cyan(),
+            "-n local".cyan()
+        ),
+        DefaultOutcome::AlreadyLocal => {}
+    }
+
+    // Only a non-local default still needs the flag spelled out.
+    let flag = if matches!(outcome, DefaultOutcome::Other(_)) {
+        "-n local "
+    } else {
+        ""
+    };
     println!("\n  Try it:");
-    println!("    {}", "knaix upload -n local ./README.md".cyan());
+    println!("    {}", format!("knaix upload {}./README.md", flag).cyan());
     println!(
         "    {}",
-        "knaix chat -n local \"what is this about?\"".cyan()
-    );
-    println!(
-        "    {}   {}",
-        "knaix use local".cyan(),
-        "# make it the default for every command".dimmed()
+        format!("knaix chat {}\"what is this about?\"", flag).cyan()
     );
     Ok(())
 }
@@ -523,7 +578,7 @@ pub async fn setup() -> Result<()> {
             "\n{} The deterministic mock answers. Retrieval and citations stay real.",
             "✓".green()
         );
-        return offer_restart(&node).await;
+        return offer_start_or_restart(&node).await;
     }
 
     let (url, models) = if pick == manual_idx {
@@ -603,7 +658,7 @@ pub async fn setup() -> Result<()> {
         ),
         None => println!("\n{} The model at {} will answer.", "✓".green(), url.cyan()),
     }
-    offer_restart(&node).await
+    offer_start_or_restart(&node).await
 }
 
 /// Record the choice, creating state if the node has never been started.
@@ -625,28 +680,40 @@ fn remember_choice(
     Ok(node)
 }
 
-/// Offer to restart a running node, since the choice only takes effect on the
-/// next start and a node that keeps answering with the old one looks broken.
-async fn offer_restart(node: &LocalNode) -> Result<()> {
+/// Get the node running the choice just made. A running node is restarted (the
+/// choice only takes effect at startup, and a node still answering with the old
+/// one looks broken); a stopped or never-started node is offered a start, so
+/// `knaix local setup` can stand the whole thing up in one command.
+async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
     use dialoguer::{theme::ColorfulTheme, Confirm};
 
-    if container_state().as_deref() != Some("running") {
-        println!("  Start it with {}.", "knaix local up".cyan());
-        return Ok(());
-    }
+    let running = container_state().as_deref() == Some("running");
+    let prompt = if running {
+        "The node is running with the previous choice. Restart it now?"
+    } else {
+        "Start the local node now?"
+    };
     let go = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("The node is running with the previous choice. Restart it now?")
+        .with_prompt(prompt)
         .default(true)
         .interact()
         .unwrap_or(false);
     if !go {
-        println!(
-            "  It keeps answering with the previous choice until {}.",
-            "knaix local up".cyan()
-        );
+        if running {
+            println!(
+                "  It keeps answering with the previous choice until {}.",
+                "knaix local up".cyan()
+            );
+        } else {
+            println!("  Start it with {}.", "knaix local up".cyan());
+        }
         return Ok(());
     }
-    docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+    // A running node holds the name and port; free them first. up() starts a
+    // stopped or absent one on its own.
+    if running {
+        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+    }
     // The choice is passed explicitly, not left to memory: it silences the
     // "from last time" line, and mock=true when the mock was just chosen
     // silences the hint that suggests undoing what the user did.
@@ -712,6 +779,60 @@ async fn wait_until_ready(node: &LocalNode) -> Result<()> {
         "The local node did not become ready in time. Recent logs:\n{}",
         logs
     ))
+}
+
+/// `knaix local reset` -- empty the store and start fresh, keeping the model
+/// choice. `down --purge` also deletes the store, but it forgets the model and
+/// leaves the node stopped; reset is the friendlier front door for "clear what
+/// I ingested and let me start over", which is exactly what someone hits after
+/// testing against a corpus they no longer want in their answers.
+pub async fn reset(yes: bool) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+    use std::io::IsTerminal;
+
+    docker_available()?;
+
+    // The corpus is what the user wants gone, not the server they picked to
+    // answer with, so the model choice is read now and carried through.
+    let saved = load();
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "Refusing to delete the local store without confirmation. Pass --yes to reset in a script."
+            ));
+        }
+        let go = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Delete everything ingested into the local node and start fresh?")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !go {
+            println!("{} Nothing changed.", "Info:".blue());
+            return Ok(());
+        }
+    }
+
+    // The running container holds the volume open; remove it so the store can
+    // be deleted, then let up() recreate an empty one.
+    if container_state().is_some() {
+        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+    }
+    match docker(&["volume", "rm", VOLUME]) {
+        Ok(_) => println!("{} Local store deleted.", "✓".green()),
+        // A node that was never started has no volume yet, which is already the
+        // empty state reset is trying to reach.
+        Err(e) if e.to_string().contains("No such volume") => {}
+        Err(e) => return Err(anyhow!("Could not delete the local store: {}", e)),
+    }
+
+    let (model_url, model) = saved
+        .map(|n| (n.model_url, n.model))
+        .unwrap_or((None, None));
+    let mock = model_url.is_none();
+    // Start again, so reset leaves a running, empty node rather than a stopped
+    // one the user then has to bring up by hand.
+    up(None, model_url, model, mock, false).await
 }
 
 pub fn down(purge: bool) -> Result<()> {

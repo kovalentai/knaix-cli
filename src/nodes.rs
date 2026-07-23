@@ -1139,6 +1139,27 @@ pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
     Ok(())
 }
 
+/// How a citation names its source in the "Grounded in" list.
+///
+/// A `/remember` note is stored as a file in the corpus so retrieval can cite
+/// it like any document. Shown by its internal filename it means nothing to the
+/// reader -- they asked about their README, not a file called
+/// `_knaix_durable_memory.md` -- so name it for what it is: their own saved
+/// note. The index is left untouched, so the `[n]` the answer refers to still
+/// lines up.
+fn citation_source_name(citation: &Citation) -> String {
+    let raw = citation
+        .source
+        .as_ref()
+        .and_then(|s| s.name.clone())
+        .unwrap_or_else(|| "unknown source".to_string());
+    if raw == NOTES_FILE {
+        "your saved note (/remember)".to_string()
+    } else {
+        raw
+    }
+}
+
 /// Render the passages an answer was grounded in, so a claim can be checked
 /// against the node's own corpus rather than taken on trust.
 pub fn print_citations(citations: &[Citation]) {
@@ -1153,11 +1174,7 @@ pub fn print_citations(citations: &[Citation]) {
     println!("\n{}", "Grounded in:".dimmed());
     for citation in cited {
         let index = citation.index.unwrap_or(0);
-        let name = citation
-            .source
-            .as_ref()
-            .and_then(|s| s.name.clone())
-            .unwrap_or_else(|| "unknown source".to_string());
+        let name = citation_source_name(citation);
         let snippet = citation.content.clone().unwrap_or_default();
         let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
         let snippet: String = if snippet.chars().count() > 160 {
@@ -2120,6 +2137,35 @@ mod tests {
         assert_eq!(body["history"].as_array().unwrap().len(), 2);
         assert_eq!(body["history"][0]["role"], "user");
         assert_eq!(body["history"][1]["content"], "Within 30 days [1].");
+    }
+
+    fn citation_named(name: &str) -> Citation {
+        Citation {
+            source: Some(DocumentSource {
+                r#type: None,
+                name: Some(name.to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_remember_note_is_named_as_the_readers_own_note() {
+        // Shown by its internal filename, a saved note reads as noise the user
+        // never uploaded; it should be named for what it is instead.
+        let note = citation_named(NOTES_FILE);
+        assert_eq!(citation_source_name(&note), "your saved note (/remember)");
+    }
+
+    #[test]
+    fn an_uploaded_documents_name_is_left_alone() {
+        let doc = citation_named("README.md");
+        assert_eq!(citation_source_name(&doc), "README.md");
+    }
+
+    #[test]
+    fn a_sourceless_citation_falls_back_to_a_label() {
+        assert_eq!(citation_source_name(&Citation::default()), "unknown source");
     }
 
     #[test]
