@@ -2,6 +2,21 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.2] - 2026-07-23
+
+### Added
+- **Grounded, complete answers from the local node.** `knaix chat -n local` and the REPL send the node a grounding prompt, so an answer leads with the direct answer, adds the supporting detail and exceptions, and cites the passages it used with `[n]` markers, instead of a single terse line.
+- **Multi-turn REPL.** The REPL carries the conversation so far to the node, so a follow-up is answered in the context of what came before. History is bounded to a recent character budget. `/reset` forgets it and starts fresh.
+- **Answer length control.** `knaix chat --brief` and `--detailed`, and the REPL commands `/brief`, `/normal` and `/detailed`, choose how much detail an answer carries. On a hosted node the flags do not apply, and the command says so rather than dropping them silently.
+- **Streaming answers from the local node.** A local answer prints token by token as the model writes it, over the node's streaming endpoint. A node image that predates the endpoint is detected and the CLI falls back to the one-shot request, so a CLI ahead of the node still answers.
+
+### Changed
+- **The README follows the documentation register.** Corrected claims that were inaccurate rather than merely energetic (knaix is a command-line client, not a daemon; dropped unearned performance language), aligned the command reference with each command's real behavior, and added the missing `logout` row.
+- **One phrasing for an unreachable control plane**, matching the local-node error voice.
+
+### Fixed
+- **`knaix local up` no longer silently drops model flags against a running node.** `--mock`, `--model-url` or `-m` on an already-running node now warns that the node keeps its current model until it restarts, and names the two ways to apply the change, instead of printing the same line as a bare `up` and ignoring the flags.
+
 ## [0.4.1] - 2026-07-22
 
 ### Added
