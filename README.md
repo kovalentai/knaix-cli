@@ -106,7 +106,7 @@ cargo install --path .
 | `knaix chat`     | Ask a node one question and print the grounded answer.|
 | `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
-| `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`). |
+| `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
 | `knaix status`   | Show who is logged in, the default node, and the local node's state. |

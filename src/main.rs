@@ -244,6 +244,20 @@ enum LocalAction {
         #[clap(short, long, default_value = "50")]
         lines: usize,
     },
+
+    /// Connect a running local node to your account and stream its metrics and logs
+    Connect {
+        /// Keep relaying in the background after the command returns
+        #[clap(long)]
+        daemon: bool,
+
+        /// Internal: run the detached relay loop (used by --daemon)
+        #[clap(long, hide = true)]
+        worker: bool,
+    },
+
+    /// Stop relaying and mark the local node offline in your account
+    Disconnect,
 }
 
 #[tokio::main]
@@ -274,8 +288,12 @@ async fn main() -> Result<()> {
     match command {
         Commands::Login => {
             login::login().await?;
+            // If a local node is running, connect it so it shows up right away.
+            local::connect_snapshot().await;
         }
         Commands::Logout => {
+            // Best-effort disconnect while the token is still on disk.
+            let _ = local::disconnect().await;
             let mut stored = config::load_stored_config();
             if stored.token.is_none() {
                 println!("{} No session is stored on this machine.", "Info:".blue());
@@ -483,6 +501,8 @@ async fn main() -> Result<()> {
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
             LocalAction::Logs { lines } => local::logs(lines)?,
+            LocalAction::Connect { daemon, worker } => local::connect(daemon, worker).await?,
+            LocalAction::Disconnect => local::disconnect().await?,
         },
         Commands::Up => {
             nodes::up(&ctx).await?;

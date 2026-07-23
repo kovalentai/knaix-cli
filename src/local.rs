@@ -81,6 +81,13 @@ pub struct LocalNode {
     /// it, Ollama and vLLM require a name they actually host.
     #[serde(default, alias = "llama_model")]
     pub model: Option<String>,
+    /// The control-plane instance id this node registered as, saved by
+    /// `local connect` so telemetry and disconnect can address it.
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    /// PID of the background relay started by `local connect --daemon`.
+    #[serde(default)]
+    pub relay_pid: Option<u32>,
 }
 
 impl LocalNode {
@@ -352,7 +359,11 @@ pub async fn up(
 
     // Keep the instance id across restarts, or everything already ingested
     // becomes unreachable under a new one.
-    let instance_id = saved.map(|n| n.instance_id).unwrap_or_else(new_instance_id);
+    // Carry the identity and any live connection across a restart.
+    let (instance_id, prev_remote_id, prev_relay_pid) = match saved {
+        Some(n) => (n.instance_id, n.remote_id, n.relay_pid),
+        None => (new_instance_id(), None, None),
+    };
 
     let port_map = format!("{}:8080", launch.port);
     let volume_map = format!("{}:/data", VOLUME);
@@ -436,6 +447,8 @@ pub async fn up(
         image: tag,
         model_url: launch.model_url.clone(),
         model: launch.model.clone(),
+        remote_id: prev_remote_id,
+        relay_pid: prev_relay_pid,
     };
     save(&node)?;
 
@@ -673,6 +686,8 @@ fn remember_choice(
         image: image(),
         model_url: None,
         model: None,
+        remote_id: None,
+        relay_pid: None,
     });
     node.model_url = model_url;
     node.model = model;
@@ -984,9 +999,347 @@ pub fn logs(lines: usize) -> Result<()> {
     Ok(())
 }
 
+// Connecting a local node to the account. The node stays offline; the logged-in
+// CLI relays its metrics and logs to the control plane, so it shows up in the
+// dashboard next to hosted nodes.
+
+/// Register the local node with the account and stream its telemetry until
+/// interrupted. `--daemon` keeps relaying in the background instead.
+pub async fn connect(daemon: bool, worker: bool) -> Result<()> {
+    // The detached worker relays an already-registered node and nothing else.
+    if worker {
+        let node = load().ok_or_else(|| anyhow!("No local node to relay."))?;
+        let client_id = node
+            .remote_id
+            .clone()
+            .ok_or_else(|| anyhow!("Local node is not connected."))?;
+        let ctx = crate::nodes::KnaixContext::new("text".to_string());
+        return relay_loop(&ctx, &node, &client_id).await;
+    }
+
+    docker_available()?;
+    let node = load().ok_or_else(|| anyhow!("No local node. Start one with 'knaix local up'."))?;
+    if container_state().as_deref() != Some("running") {
+        return Err(anyhow!(
+            "The local node is not running. Start it with 'knaix local up'."
+        ));
+    }
+
+    let ctx = crate::nodes::KnaixContext::new("text".to_string());
+    ctx.get_token()
+        .context("Connecting a local node needs an account. Run 'knaix login' first.")?;
+
+    let client_id = register(&ctx, &node).await?;
+    let mut saved = node.clone();
+    saved.remote_id = Some(client_id.clone());
+    save(&saved)?;
+
+    println!(
+        "{} Connected {} to your account; it will appear in your dashboard.",
+        "✓".green(),
+        LOCAL_NODE_ID.cyan()
+    );
+
+    if daemon {
+        // Replace any previous relay so a second one is never left running.
+        if let Some(old) = saved.relay_pid {
+            let _ = Command::new("kill").arg(old.to_string()).status();
+        }
+        let pid = spawn_relay_worker()?;
+        saved.relay_pid = Some(pid);
+        save(&saved)?;
+        println!(
+            "  Relaying metrics and logs in the background (pid {}). {} stops it.",
+            pid,
+            "knaix local disconnect".cyan()
+        );
+        return Ok(());
+    }
+
+    println!("  Relaying metrics and logs. Press Ctrl-C to stop; the node stays connected.");
+    relay_loop(&ctx, &saved, &client_id).await
+}
+
+/// Stop relaying and mark the node offline in the account. The node keeps running.
+pub async fn disconnect() -> Result<()> {
+    let node = match load() {
+        Some(n) => n,
+        None => {
+            println!("{} No local node on this machine.", "Info:".blue());
+            return Ok(());
+        }
+    };
+
+    if let Some(pid) = node.relay_pid {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+
+    if let Some(client_id) = node.remote_id.as_deref() {
+        let ctx = crate::nodes::KnaixContext::new("text".to_string());
+        if let Ok(token) = ctx.get_token() {
+            let url = format!(
+                "{}/api/instances/{}/disconnect",
+                ctx.config.api_url, client_id
+            );
+            let _ = ctx.client.post(&url).bearer_auth(token).send().await;
+        }
+    }
+
+    let mut cleared = node;
+    cleared.remote_id = None;
+    cleared.relay_pid = None;
+    let _ = save(&cleared);
+    println!("{} Local node disconnected from your account.", "✓".green());
+    Ok(())
+}
+
+/// After login, register a running local node and push one snapshot so it shows
+/// up right away. Best-effort and quiet: does nothing if nothing is running.
+pub async fn connect_snapshot() {
+    // Bounded so a slow or unreachable control plane never holds up login.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), connect_snapshot_inner()).await;
+}
+
+async fn connect_snapshot_inner() {
+    let node = match load() {
+        Some(n) => n,
+        None => return,
+    };
+    if docker_available().is_err() || container_state().as_deref() != Some("running") {
+        return;
+    }
+    let ctx = crate::nodes::KnaixContext::new("text".to_string());
+    if ctx.get_token().is_err() {
+        return;
+    }
+    let client_id = match register(&ctx, &node).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut saved = node.clone();
+    saved.remote_id = Some(client_id.clone());
+    let _ = save(&saved);
+    let sample = gather_sample(&ctx, &node).await;
+    let logs = recent_log_lines(30);
+    let _ = push_telemetry(&ctx, &client_id, sample, logs).await;
+    println!(
+        "  Your local node is now connected; see it in the dashboard. {} streams live telemetry.",
+        "knaix local connect".cyan()
+    );
+}
+
+async fn register(ctx: &crate::nodes::KnaixContext, node: &LocalNode) -> Result<String> {
+    let token = ctx.get_token()?;
+    let url = format!("{}/api/instances/local/connect", ctx.config.api_url);
+    let resp = ctx
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "localInstanceId": node.instance_id,
+            "name": hostname_label(),
+            "port": node.port,
+            "model": node.model,
+        }))
+        .send()
+        .await
+        .context("Could not reach the control plane to register the node.")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Register failed ({}): {}", status, body));
+    }
+    let body: serde_json::Value = resp.json().await?;
+    body["data"]["clientId"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("The control plane did not return a node id."))
+}
+
+async fn push_telemetry(
+    ctx: &crate::nodes::KnaixContext,
+    client_id: &str,
+    metrics: serde_json::Value,
+    logs: Vec<String>,
+) -> Result<()> {
+    let token = ctx.get_token()?;
+    let url = format!(
+        "{}/api/instances/{}/telemetry",
+        ctx.config.api_url, client_id
+    );
+    let resp = ctx
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "metrics": metrics, "logs": logs }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("Telemetry push was refused ({}).", resp.status()));
+    }
+    Ok(())
+}
+
+async fn relay_loop(
+    ctx: &crate::nodes::KnaixContext,
+    node: &LocalNode,
+    client_id: &str,
+) -> Result<()> {
+    let mut since: Option<u64> = None;
+    loop {
+        let sample = gather_sample(ctx, node).await;
+        let logs = new_log_lines(&mut since);
+        if let Err(e) = push_telemetry(ctx, client_id, sample, logs).await {
+            eprintln!("{} {}", "Warning:".yellow(), e);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+}
+
+/// Container log lines written since the last call, so the same lines are not
+/// relayed over and over. Seeds with a recent tail on the first call.
+fn new_log_lines(since: &mut Option<u64>) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out = match *since {
+        None => docker(&["logs", "--tail", "30", CONTAINER]),
+        Some(ts) => docker(&["logs", "--since", &ts.to_string(), CONTAINER]),
+    };
+    *since = Some(now);
+    out.map(|o| o.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// One health + resource sample, shaped for the control plane's telemetry route.
+async fn gather_sample(ctx: &crate::nodes::KnaixContext, node: &LocalNode) -> serde_json::Value {
+    let url = format!("{}/health", node.base_url());
+    let started = std::time::Instant::now();
+    let healthy = matches!(ctx.client.get(&url).send().await, Ok(r) if r.status().is_success());
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let (cpu, mem, mem_used) = docker_stats();
+    serde_json::json!({
+        "healthy": healthy,
+        "latencyMs": latency_ms,
+        "cpuPct": cpu,
+        "memPct": mem,
+        "memUsedBytes": mem_used,
+    })
+}
+
+/// CPU %, memory %, and memory bytes from `docker stats`. None where unavailable.
+fn docker_stats() -> (Option<f64>, Option<f64>, Option<u64>) {
+    match docker(&[
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.CPUPerc}}\t{{.MemPerc}}\t{{.MemUsage}}",
+        CONTAINER,
+    ]) {
+        Ok(out) => parse_stats_line(&out),
+        Err(_) => (None, None, None),
+    }
+}
+
+/// Parse a `docker stats` line "cpu%\tmem%\tused / total" into (cpu, mem, bytes).
+fn parse_stats_line(out: &str) -> (Option<f64>, Option<f64>, Option<u64>) {
+    let parts: Vec<&str> = out.split('\t').collect();
+    let pct = |s: &&str| s.trim().trim_end_matches('%').parse::<f64>().ok();
+    let cpu = parts.first().and_then(pct);
+    let mem = parts.get(1).and_then(pct);
+    let mem_used = parts
+        .get(2)
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| parse_size(s.trim()));
+    (cpu, mem, mem_used)
+}
+
+/// Parse a docker size like "104.9MiB" or "1.5GB" into bytes.
+fn parse_size(s: &str) -> Option<u64> {
+    let idx = s.find(|c: char| c.is_alphabetic())?;
+    let (num, unit) = s.split_at(idx);
+    let n: f64 = num.trim().parse().ok()?;
+    let mult = match unit.trim() {
+        "B" => 1.0,
+        "KiB" | "kB" | "KB" => 1024.0,
+        "MiB" | "MB" => 1024.0 * 1024.0,
+        "GiB" | "GB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" | "TB" => 1024.0f64.powi(4),
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
+/// Recent container log lines (stdout), oldest first.
+fn recent_log_lines(n: usize) -> Vec<String> {
+    docker(&["logs", "--tail", &n.to_string(), CONTAINER])
+        .map(|out| out.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn hostname_label() -> String {
+    let name = Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    match name {
+        Some(h) => format!("Local node ({})", h),
+        None => "Local node".to_string(),
+    }
+}
+
+/// Re-exec this binary as a detached relay worker and return its pid.
+#[cfg(unix)]
+fn spawn_relay_worker() -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .context("Could not find the knaix binary to relay in the background.")?;
+    let child = Command::new(exe)
+        .args(["local", "connect", "--worker"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("Could not start the background relay.")?;
+    Ok(child.id())
+}
+
+#[cfg(not(unix))]
+fn spawn_relay_worker() -> Result<u32> {
+    Err(anyhow!("--daemon is only supported on macOS and Linux."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_size_reads_docker_units() {
+        assert_eq!(parse_size("512B"), Some(512));
+        assert_eq!(
+            parse_size("104.9MiB"),
+            Some((104.9 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
+        // A stopped container reports dashes; do not invent a number.
+        assert_eq!(parse_size("--"), None);
+        assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn parse_stats_line_reads_cpu_mem_and_bytes() {
+        let (cpu, mem, used) = parse_stats_line("1.23%\t4.50%\t104.9MiB / 1.945GiB");
+        assert_eq!(cpu, Some(1.23));
+        assert_eq!(mem, Some(4.5));
+        assert_eq!(used, Some((104.9 * 1024.0 * 1024.0) as u64));
+
+        // A stopped container yields no numbers rather than zeros.
+        assert_eq!(parse_stats_line("--\t--\t-- / --"), (None, None, None));
+    }
 
     #[test]
     fn generated_instance_ids_are_v4_shaped() {
@@ -1071,6 +1424,8 @@ mod tests {
         assert_eq!(node.port, 8080);
         assert_eq!(node.model_url, None);
         assert_eq!(node.model, None);
+        assert_eq!(node.remote_id, None);
+        assert_eq!(node.relay_pid, None);
     }
 
     fn saved(port: u16, url: Option<&str>, model: Option<&str>) -> LocalNode {
@@ -1080,6 +1435,8 @@ mod tests {
             image: "img".into(),
             model_url: url.map(String::from),
             model: model.map(String::from),
+            remote_id: None,
+            relay_pid: None,
         }
     }
 
