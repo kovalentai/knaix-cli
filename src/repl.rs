@@ -14,6 +14,11 @@ fn print_help() {
             "Save a fact to this node's notes and ingest it",
         ),
         ("/memory", "List the notes saved for this node"),
+        ("/reset", "Forget the conversation so far and start fresh"),
+        (
+            "/brief, /normal, /detailed",
+            "Set how much detail answers carry (local node)",
+        ),
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
     for (cmd, what) in rows {
@@ -65,6 +70,8 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     // answered in context. Trimmed to a recent window so a long session does
     // not grow the request without bound.
     let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
+    // How much detail answers carry, adjustable mid-session with /brief etc.
+    let mut verbosity = crate::nodes::Verbosity::Normal;
 
     loop {
         let prompt = format!("knaix [{}]> ", node_id);
@@ -102,6 +109,32 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             }
                             continue;
                         }
+                        "/reset" => {
+                            let had = !history.is_empty();
+                            history.clear();
+                            if had {
+                                println!(
+                                    "{} Conversation cleared. The next question starts fresh.",
+                                    "✓".green()
+                                );
+                            } else {
+                                println!("{} Nothing to clear yet.", "Info:".blue());
+                            }
+                            continue;
+                        }
+                        "/brief" | "/normal" | "/detailed" => {
+                            verbosity = match cmd {
+                                "/brief" => crate::nodes::Verbosity::Brief,
+                                "/detailed" => crate::nodes::Verbosity::Detailed,
+                                _ => crate::nodes::Verbosity::Normal,
+                            };
+                            println!(
+                                "{} Answers are now {}.",
+                                "✓".green(),
+                                cmd.trim_start_matches('/').cyan()
+                            );
+                            continue;
+                        }
                         _ => {
                             println!(
                                 "{} Unknown command {}. {} lists commands; a message without a leading '/' is sent to the node.",
@@ -116,7 +149,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
 
                 message_count += 1;
 
-                match crate::nodes::chat(ctx, target, &input, false, &history).await {
+                match crate::nodes::chat(ctx, target, &input, false, &history, verbosity).await {
                     Ok(Some(answer)) => {
                         println!();
                         skin.print_text(&answer.text);
@@ -131,7 +164,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             &mut history,
                             &input,
                             &answer.text,
-                            crate::nodes::HISTORY_WINDOW_TURNS,
+                            crate::nodes::HISTORY_CHAR_BUDGET,
                         );
                     }
                     Ok(None) => {

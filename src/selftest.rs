@@ -476,8 +476,18 @@ async fn run_questions(
 /// account-wide budget shared with everything else the user is doing. A raw
 /// "HTTP 429" mid-run reads as a broken node rather than a spent budget.
 async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::nodes::ChatAnswer> {
-    // Each self-test question stands alone; no conversation history to carry.
-    match crate::nodes::chat(ctx, target, query, false, &[]).await {
+    // Each self-test question stands alone; no conversation history to carry,
+    // and the default verbosity keeps the graded answers comparable.
+    match crate::nodes::chat(
+        ctx,
+        target,
+        query,
+        false,
+        &[],
+        crate::nodes::Verbosity::Normal,
+    )
+    .await
+    {
         Ok(Some(answer)) => Ok(answer),
         Ok(None) => Err(anyhow!("Node returned no answer")),
         Err(e) if e.to_string().contains("429") => Err(anyhow!(

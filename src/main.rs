@@ -59,6 +59,14 @@ enum Commands {
 
         /// The question to ask
         message: String,
+
+        /// Answer in one or two sentences (local node only)
+        #[clap(long, conflicts_with = "detailed")]
+        brief: bool,
+
+        /// Answer thoroughly, with all relevant detail (local node only)
+        #[clap(long)]
+        detailed: bool,
     },
 
     /// Ingest a file or directory into a node's knowledge base
@@ -289,13 +297,38 @@ async fn main() -> Result<()> {
             config::save_config(&config)?;
             println!("{} Set default node to {}", "Info:".blue(), node_id.bold());
         }
-        Commands::Chat { node_id, message } => {
+        Commands::Chat {
+            node_id,
+            message,
+            brief,
+            detailed,
+        } => {
+            let verbosity = if brief {
+                nodes::Verbosity::Brief
+            } else if detailed {
+                nodes::Verbosity::Detailed
+            } else {
+                nodes::Verbosity::Normal
+            };
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                // Verbosity shapes the local node's system prompt; a hosted node
+                // is prompted by the control plane, so say the flag had no effect
+                // rather than dropping it silently.
+                if verbosity != nodes::Verbosity::Normal && !target.is_local() {
+                    println!(
+                        "{} {} apply to the local node; a hosted node is prompted by the control plane.",
+                        "Note:".blue(),
+                        "--brief/--detailed".cyan()
+                    );
+                }
                 if ctx.output_format == "json" {
-                    if let Some(answer) = nodes::chat(&ctx, &target, &message, false, &[]).await? {
+                    if let Some(answer) =
+                        nodes::chat(&ctx, &target, &message, false, &[], verbosity).await?
+                    {
                         nodes::print_answer_json(&answer)?;
                     }
-                } else if let Some(answer) = nodes::chat(&ctx, &target, &message, true, &[]).await?
+                } else if let Some(answer) =
+                    nodes::chat(&ctx, &target, &message, true, &[], verbosity).await?
                 {
                     nodes::print_answer_footer(&target, &answer);
                 }
