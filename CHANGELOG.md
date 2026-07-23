@@ -2,6 +2,11 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.4] - 2026-07-23
+
+### Added
+- **`knaix local connect` / `knaix local disconnect`.** Connect a running local node to your Kovalent account and it appears in the dashboard next to hosted nodes, with its own health, metrics and logs. The node stays offline: the logged-in CLI relays a metrics sample and the container's new log lines on an interval, so nothing on the node itself talks to the control plane. `--daemon` keeps relaying in the background; `disconnect` stops it and marks the node offline. `knaix login` connects a running node automatically, and `knaix logout` disconnects. Connecting a local node is a Community-tier offering, so it needs an account but no paid plan.
+
 ## [0.4.3] - 2026-07-23
 
 ### Added
