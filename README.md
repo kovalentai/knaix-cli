@@ -30,33 +30,35 @@ no login, and no token. The image carries the model artifacts, so once it is
 pulled nothing needs the network.
 
 ```bash
-knaix local up
+knaix local setup
 ```
 
-`knaix local up` fetches the image the first time it runs (about 380 MB) and
-reuses it afterwards. Then point any command at the reserved node `local`:
+`knaix local setup` finds the model servers running on your machine (Ollama,
+LM Studio, vLLM, llama-server), lets you pick one (or the deterministic mock),
+and starts the node. The image is fetched the first time (about 380 MB) and
+reused afterwards. The local node becomes your default, so the commands that
+follow need no `-n local`:
 
 ```bash
-knaix upload -n local ./docs
-knaix chat -n local "what do these documents say about refunds?"
-knaix use local          # make it the default for every command
+knaix upload ./docs
+knaix chat "what do these documents say about refunds?"
 knaix local status       # is it running and healthy
+knaix local reset        # clear everything ingested and start fresh
 knaix local down         # stop it; the store is kept
 ```
 
-Answers come from a deterministic mock until you point the node at a model.
-`knaix local setup` finds the servers running on your machine (Ollama,
-LM Studio, vLLM, llama-server), lists the models they actually host, and
-remembers your pick:
+Already running a model server, or want to skip the picker? Start the node
+directly and name the server once; it is remembered, so later starts are just
+`knaix local up`:
 
 ```bash
-knaix local setup        # pick a server and model interactively
-knaix local up --model-url http://localhost:11434 -m qwen3.5:latest   # or say it once by hand
+knaix local up                                                        # the mock, no model needed
+knaix local up --model-url http://localhost:11434 -m qwen3.5:latest   # a model on this machine
 ```
 
-Both are remembered, so later starts are just `knaix local up`; `--mock` goes
-back to the mock deliberately. Retrieval, reranking and citations are real
-either way, so the part worth evaluating is the part that works out of the box.
+`--mock` goes back to the mock deliberately. Retrieval, reranking and citations
+are real either way, so the part worth evaluating is the part that works out of
+the box.
 
 ## Installation
 
@@ -104,7 +106,7 @@ cargo install --path .
 | `knaix chat`     | Ask a node one question and print the grounded answer.|
 | `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
-| `knaix local`    | Run the whole stack on this machine (`up`, `setup`, `down`, `status`, `logs`). |
+| `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`). |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
 | `knaix status`   | Show who is logged in, the default node, and the local node's state. |

@@ -2,6 +2,16 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.3] - 2026-07-23
+
+### Added
+- **`knaix local reset`**: empty the local store and start fresh in one command, keeping the model you picked. `down --purge` also clears the store but forgets the model and leaves the node stopped; `reset` is the front door for "clear what I ingested and let me start over", and it leaves the node running against an empty store. It confirms first, or takes `--yes` in a script.
+
+### Changed
+- **The local node becomes your default when you have none.** The first `knaix local up` (or `knaix local setup`) points later commands at `local`, so `knaix chat "..."` and `knaix upload ./file` work with no `-n local`. A default you already chose is kept, a hosted one included; the command then reminds you to pass `-n local` for the local node.
+- **`knaix local setup` starts the node when it is not running.** Picking a model, or the mock, now offers to stand the whole local stack up, so a first run is a single `knaix local setup` rather than `up` followed by `setup`. A running node is still restarted so the pick takes effect.
+- **A `/remember` note is named as your own note in citations.** In the "Grounded in" list a saved note reads as `your saved note (/remember)` rather than the internal `_knaix_durable_memory.md`, so grounding that came from a note you saved is recognisable as yours. The `[n]` marker is unchanged.
+
 ## [0.4.2] - 2026-07-23
 
 ### Added

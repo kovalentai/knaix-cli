@@ -218,8 +218,15 @@ enum LocalAction {
         pull: bool,
     },
 
-    /// Pick the model that answers, from the servers on this machine
+    /// Pick the model that answers, and start the node if it is not running
     Setup,
+
+    /// Empty the store and start fresh, keeping your model choice
+    Reset {
+        /// Skip the confirmation prompt
+        #[clap(long)]
+        yes: bool,
+    },
 
     /// Stop the local node
     Down {
@@ -472,6 +479,7 @@ async fn main() -> Result<()> {
                 pull,
             } => local::up(port, model_url, model, mock, pull).await?,
             LocalAction::Setup => local::setup().await?,
+            LocalAction::Reset { yes } => local::reset(yes).await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
             LocalAction::Logs { lines } => local::logs(lines)?,
