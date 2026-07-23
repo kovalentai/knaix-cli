@@ -731,6 +731,20 @@ pub fn down(purge: bool) -> Result<()> {
     Ok(())
 }
 
+/// The local node at a glance, for `knaix status`.
+pub struct LocalSummary {
+    /// "running", "none", or whatever docker reports for a stopped container.
+    pub state: String,
+    pub url: Option<String>,
+}
+
+/// Never fails: a machine without docker simply has no local node.
+pub fn summarize() -> LocalSummary {
+    let state = container_state().unwrap_or_else(|| "none".to_string());
+    let url = load().map(|n| n.base_url());
+    LocalSummary { state, url }
+}
+
 pub async fn status(json: bool) -> Result<()> {
     let node = load();
     let state = container_state();

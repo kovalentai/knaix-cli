@@ -34,7 +34,7 @@ pub struct Node {
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, serde::Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct DocumentSource {
@@ -64,7 +64,7 @@ pub struct ChatAnswer {
 }
 
 /// One grounded passage the node returned alongside an answer.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, serde::Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Citation {
@@ -301,9 +301,10 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
 
         if nodes.is_empty() {
             println!(
-                "{} No nodes provisioned. Visit {} to provision your first Sovereign Node.",
+                "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
                 "Info:".blue(),
-                "app.kovalentai.com".cyan().underline()
+                "knaix up".cyan(),
+                "knaix local up".cyan()
             );
         } else {
             println!("\n{}", "Your Kovalent Nodes:".bold().underline());
@@ -395,9 +396,10 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
 
     if nodes.is_empty() {
         println!(
-            "{} No nodes provisioned. Visit {} to provision your first Sovereign Node.",
+            "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
             "Info:".blue(),
-            "app.kovalentai.com".cyan().underline()
+            "knaix up".cyan(),
+            "knaix local up".cyan()
         );
         return Ok(None);
     }
@@ -548,6 +550,9 @@ pub async fn chat(
         .client
         .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
+        // An answer takes as long as the model takes; the client default that
+        // protects quick lookups would cut off a long generation mid-stream.
+        .timeout(Duration::from_secs(300))
         .json(&payload)
         .send()
         .await
@@ -603,6 +608,9 @@ async fn chat_local(
     let resp = ctx
         .client
         .post(format!("{}/api/query/answer", base))
+        // First question after a start can include a model server loading its
+        // weights, which routinely outlasts the client's default timeout.
+        .timeout(Duration::from_secs(300))
         .json(&serde_json::json!({ "instance_id": instance_id, "query": message }))
         .send()
         .await
@@ -812,6 +820,56 @@ async fn read_chat_stream(
     Ok((answer, citations, model))
 }
 
+/// True when the deterministic mock wrote the answer.
+///
+/// The local node reports the mock explicitly or omits the model entirely; a
+/// hosted node that omits it is merely not saying, which must not be read as
+/// "mock".
+fn is_mock_answer(target: &Target, model: Option<&str>) -> bool {
+    match model {
+        Some("mock") => true,
+        None => target.is_local(),
+        Some(_) => false,
+    }
+}
+
+/// One dim line under an answer whose wording came from the mock, so a
+/// transcript never reads as a model's work. Retrieval and citations are real
+/// either way; only the prose is synthetic.
+pub fn print_answer_footer(target: &Target, answer: &ChatAnswer) {
+    if !is_mock_answer(target, answer.model.as_deref()) {
+        return;
+    }
+    let hint = if target.is_local() {
+        "'knaix local setup' connects a model."
+    } else {
+        "No model is configured on this node."
+    };
+    println!(
+        "{}",
+        format!(
+            "Mock answer: the wording is synthetic; retrieval and citations are real. {}",
+            hint
+        )
+        .dimmed()
+    );
+}
+
+/// The answer as one JSON object, for scripting. Citations carry their
+/// `cited` flag rather than being pre-filtered, so a consumer can choose
+/// between "what the answer used" and "what the node considered".
+pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "answer": answer.text,
+            "model": answer.model,
+            "citations": answer.citations,
+        }))?
+    );
+    Ok(())
+}
+
 /// Render the passages an answer was grounded in, so a claim can be checked
 /// against the node's own corpus rather than taken on trust.
 pub fn print_citations(citations: &[Citation]) {
@@ -842,32 +900,6 @@ pub fn print_citations(citations: &[Citation]) {
         println!("      {}", snippet);
     }
     println!();
-}
-
-/// Chat without touching stdout, for the REPL's background summarizer.
-pub async fn chat_silent(
-    config: crate::config::Config,
-    node_uuid: String,
-    message: String,
-) -> Result<Option<String>> {
-    let token = config.token.clone().context("Not logged in")?;
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/nodes/{}/native-chat", config.api_url, node_uuid);
-
-    let resp = client
-        .post(&url)
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .json(&serde_json::json!({ "message": message }))
-        .send()
-        .await
-        .context("Networking error during chat request")?;
-
-    if !resp.status().is_success() {
-        return Err(anyhow!("Chat failed on node: HTTP {}", resp.status()));
-    }
-
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    Ok(body["answer"].as_str().map(|s| s.to_string()))
 }
 
 pub async fn upload_single_file(
@@ -930,6 +962,9 @@ pub async fn upload_single_file(
         .client
         .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
+        // Sized to the upload, not the default: a large document on a slow
+        // link outlasts the 30 seconds that protect quick lookups.
+        .timeout(Duration::from_secs(600))
         .multipart(form)
         .send()
         .await
@@ -988,6 +1023,8 @@ async fn upload_local(
     let resp = ctx
         .client
         .post(format!("{}/api/kb/ingest", base))
+        // Parsing and embedding a large document can outlast the default.
+        .timeout(Duration::from_secs(600))
         .json(&serde_json::json!({
             "instance_id": instance_id,
             "content_base64": encoded,
@@ -1564,9 +1601,17 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
     Ok(())
 }
 
-pub async fn memorize(ctx: &KnaixContext, node_id: &str, fact: &str, durable: bool) -> Result<()> {
+/// The notes file a `/remember` lands in. One file per node, appended to.
+const NOTES_FILE: &str = "_knaix_durable_memory.md";
+
+/// Append a fact to the target's notes file under ~/.knaix/memory.
+/// Returns the file written, so the caller can say where the note went.
+pub async fn save_note(target: &Target, fact: &str) -> Result<PathBuf> {
     let home_dir = home::home_dir().unwrap_or_else(|| Path::new(".").to_path_buf());
-    let mem_dir = home_dir.join(".knaix").join("memory").join(node_id);
+    let mem_dir = home_dir
+        .join(".knaix")
+        .join("memory")
+        .join(memory_key(target));
     tokio::fs::create_dir_all(&mem_dir)
         .await
         .context("Failed to create memory directory")?;
@@ -1579,15 +1624,9 @@ pub async fn memorize(ctx: &KnaixContext, node_id: &str, fact: &str, durable: bo
             .ok();
     }
 
-    let file_name = if durable {
-        "_knaix_durable_memory.md"
-    } else {
-        "_knaix_ephemeral_log.md"
-    };
-    let file_path = mem_dir.join(file_name);
-
+    let file_path = mem_dir.join(NOTES_FILE);
     if !file_path.exists() {
-        tokio::fs::write(&file_path, "# Sovereign Agentic Memory\n\n").await?;
+        tokio::fs::write(&file_path, "# Notes saved from the Knaix REPL\n\n").await?;
     }
 
     let timestamp_secs = std::time::SystemTime::now()
@@ -1610,17 +1649,46 @@ pub async fn memorize(ctx: &KnaixContext, node_id: &str, fact: &str, durable: bo
     }
 
     file.write_all(entry.as_bytes()).await?;
+    Ok(file_path)
+}
 
-    let config_clone = ctx.config.clone();
-    let nid = node_id.to_string();
-    let fpath = file_path.clone();
-    let fname = file_name.to_string();
-
-    tokio::spawn(async move {
-        let _ = upload_single_file_silent(config_clone, nid, fpath, fname).await;
-    });
-
-    Ok(())
+/// Send the notes file to the node's knowledge base without narrating, so a
+/// saved note is retrievable by later questions rather than only sitting on
+/// disk. The caller reports the outcome; failing silently would let "saved"
+/// mean less than it says.
+pub async fn ingest_note(ctx: &KnaixContext, target: &Target, path: &Path) -> Result<()> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let bytes = tokio::fs::read(path)
+                .await
+                .context("Could not read the notes file")?;
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/ingest", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "content_base64": BASE64.encode(&bytes),
+                    "filename": NOTES_FILE,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node")?;
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                Err(anyhow!("HTTP {}", resp.status()))
+            }
+        }
+        Target::Remote { uuid } => {
+            upload_single_file_silent(
+                ctx.config.clone(),
+                uuid.clone(),
+                path.to_path_buf(),
+                NOTES_FILE.to_string(),
+            )
+            .await
+        }
+    }
 }
 
 pub async fn upload_single_file_silent(
@@ -1684,9 +1752,10 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 
     if !memory_dir.exists() {
         println!(
-            "{} No memory data found for node {}.",
+            "{} No notes saved for node {}. In the REPL, {} saves one.",
             "Info:".blue(),
-            node_id.bold()
+            node_id.bold(),
+            "/remember <fact>".cyan()
         );
         return Ok(());
     }
@@ -1695,13 +1764,11 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         let file_path = memory_dir.join(file_name);
 
         if !file_path.exists() {
-            println!(
-                "{} File {} does not exist for node {}.",
-                "Error:".red(),
-                file_name.bold(),
-                node_id.bold()
-            );
-            return Ok(());
+            return Err(anyhow!(
+                "No file named {} for node {}. Run 'knaix memory' to list them.",
+                file_name,
+                node_id
+            ));
         }
 
         let contents = tokio::fs::read_to_string(&file_path)
@@ -1709,29 +1776,24 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
             .context("Failed to read memory file")?;
 
         println!(
-            "\n{} {} | {}: {}\n",
+            "\n{} Notes for node {} ({})\n",
             "●".magenta(),
-            "Sovereign Memory".bold(),
-            "Node".dimmed(),
-            node_id.bold()
+            node_id.bold(),
+            file_path.display().to_string().dimmed()
         );
 
         let skin = termimad::MadSkin::default_dark();
         skin.print_text(&contents);
 
-        println!("\n{}", "--- End of Memory ---".dimmed());
+        println!("\n{}", "--- End ---".dimmed());
     } else {
         println!(
-            "\n{} {} | {}: {}",
+            "\n{} Notes for node {} ({})",
             "●".magenta(),
-            "Sovereign Memory".bold(),
-            "Node".dimmed(),
-            node_id.bold()
+            node_id.bold(),
+            memory_dir.display().to_string().dimmed()
         );
-        println!(
-            "{}\n",
-            "Use `knaix memory --file <filename>` to read a file.".dimmed()
-        );
+        println!("{}\n", "knaix memory --file <filename> reads one.".dimmed());
 
         let mut entries = tokio::fs::read_dir(&memory_dir).await?;
         let mut files = Vec::new();
@@ -1749,7 +1811,7 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         } else {
             files.sort();
             for f in files {
-                println!("  📄 {}", f.cyan());
+                println!("  {} {}", "-".dimmed(), f.cyan());
             }
         }
         println!();
@@ -1793,6 +1855,23 @@ mod tests {
         assert_eq!(cites[0].cited, Some(true));
         // Retrieved but never referenced: context, not a source.
         assert_eq!(cites[1].cited, Some(false));
+    }
+
+    #[test]
+    fn mock_detection_reads_the_model_field_conservatively() {
+        let local = Target::Local {
+            base: "http://127.0.0.1:8080".into(),
+            instance_id: "a".into(),
+        };
+        let remote = Target::Remote { uuid: "u".into() };
+        // The node names the mock explicitly.
+        assert!(is_mock_answer(&local, Some("mock")));
+        assert!(is_mock_answer(&remote, Some("mock")));
+        // A local node that says nothing is running the mock; a hosted node
+        // that says nothing is merely not saying, and must not be accused.
+        assert!(is_mock_answer(&local, None));
+        assert!(!is_mock_answer(&remote, None));
+        assert!(!is_mock_answer(&local, Some("qwen3.5:latest")));
     }
 
     #[test]
