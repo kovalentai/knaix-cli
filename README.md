@@ -1,26 +1,26 @@
 # Knaix CLI (v0.4.1)
 
-The high-performance, single-tenant command-line daemon for Kovalent AI infrastructure. Engineered in Rust for memory safety, cryptographic isolation, and an uncompromising developer experience.
+The command-line client for Kovalent AI, written in Rust. Ingest documents into a private AI node and ask questions of them, either on your own machine with no account or on a hosted node over a zero-trust mesh.
 
-## Executive Overview
+## What it does
 
-Knaix CLI inverts the traditional cloud AI paradigm. Instead of sending sensitive IP to a centralized cloud, Knaix securely bridges your local development environment directly into your dedicated node or EKS Pod via a zero-trust Tailscale mesh.
+Instead of sending your documents to a shared cloud service, Knaix keeps them on a node you control: run the whole stack on your machine with `knaix local`, or bridge your terminal into a hosted node or EKS Pod over a Tailscale mesh. Either way, retrieval, reranking and citations run on the node.
 
-## Magic Developer Experience (DX)
+## Developer experience
 
-*   **Agent Memory**: Intelligent, cross-session persistent state. Knaix intercepts explicit "Remember..." commands, appending facts to `_knaix_durable_memory.md` under `~/.knaix/memory/<node-id>` and uploading them to the node's knowledge base, while older context is compressed into `_knaix_ephemeral_log.md`.
-*   **Terminal-Native Provisioning**: Execute `knaix up` to broker a compute request from the terminal. Infrastructure as Code abstracted directly to the CLI.
-*   **Enterprise Scriptability**: Native `-o json` global flag compatibility across all telemetry and list commands, eliminating string-parsing friction in CI/CD pipelines. Standard stdout is dynamically structured utilizing the `comfy-table` engine.
-*   **Recursive Ingestion**: The `knaix upload <path>` command leverages the highly optimized `walkdir` crate, seamlessly walking nested directories for massive bulk documentation embedding.
-*   **Smart Failover**: Automatic health checks detect unreachable nodes and dynamically prompt interactive recovery sequences.
-*   **REPL**: Persistent, markdown-rendered terminal sessions utilizing an intelligent local sliding window for context management.
+*   **Agent memory**: `/remember` in the REPL appends a fact to `_knaix_durable_memory.md` under `~/.knaix/memory/<node-id>` and ingests it into the node's knowledge base, so later questions can retrieve it. Older conversation context is compacted into `_knaix_ephemeral_log.md`.
+*   **Provision from the terminal**: `knaix up` requests a hosted node on your account and reports the instance id; `knaix list` shows it coming up.
+*   **JSON output for scripts**: the global `-o json` flag emits structured output from the list and telemetry commands, so CI pipelines don't parse tables. Text output is rendered with `comfy-table`.
+*   **Recursive ingestion**: `knaix upload <path>` walks a directory, skipping what is never documentation and files the node has no parser for, rather than sending them to be refused.
+*   **Node resolution**: name a node by its name, instance id or UUID; when no default is set, the CLI offers an interactive selector rather than failing.
+*   **REPL**: an interactive session with markdown-rendered answers and a local sliding window for context.
 
-## Security & Architecture
+## Security & architecture
 
-*   **Zero-Trust Mesh**: All network egress is routed strictly via an end-to-end encrypted WireGuard (Tailscale) tunnel. No inbound firewall ports required.
-*   **Config Hardening**: Strict zero-trust configurations. The system enforces `0o600` POSIX boundaries on all configuration files.
-*   **Atomic Saves**: Profile and configuration state mutations utilize the "Write-Sync-Rename" atomic pattern to guarantee token integrity against unexpected hardware halts.
-*   **Persistent Connection Pooling**: The HTTP client maintains active connection reuse and TLS warming, radically reducing P2P latency.
+*   **Zero-trust mesh**: traffic to a hosted node is routed over an end-to-end encrypted WireGuard (Tailscale) tunnel. No inbound firewall ports are required.
+*   **Config hardening**: on Unix, `~/.knaix/config.json` is written with `0o600` permissions so the session token is readable only by its owner.
+*   **Atomic saves**: configuration writes use a write-sync-rename pattern, so an interrupted write cannot leave a truncated or corrupt token on disk.
+*   **Connection reuse**: the HTTP client keeps idle connections warm with a pooled, keep-alive configuration, so back-to-back commands avoid a fresh handshake each time.
 
 ## Try it locally, with no account
 
@@ -72,21 +72,21 @@ cd knaix-cli
 cargo install --path .
 ```
 
-## Quick Start Topology
+## Quick start (hosted node)
 
-1.  **Identity Bootstrap**:
+1.  **Sign in** (opens the browser):
     ```bash
     knaix login
     ```
-2.  **Infrastructure Provisioning**:
+2.  **Provision a node**:
     ```bash
     knaix up
     ```
-3.  **Context Selection**:
+3.  **Set it as the default**:
     ```bash
     knaix use <node-id>
     ```
-4.  **Inference & Interaction**:
+4.  **Ask it questions**:
     ```bash
     knaix repl
     ```
@@ -95,20 +95,21 @@ cargo install --path .
 
 | Command          | Description                                           |
 | :--------------- | :---------------------------------------------------- |
-| `knaix login`    | Trigger SSO OAuth flow via Kovalent Identity Center.  |
-| `knaix up`       | Provision a new Agent Node dynamically.               |
-| `knaix list`     | List active nodes or browse ingested documents.       |
-| `knaix use`      | Define the default node identity for rapid inference. |
-| `knaix repl`     | Initiate an interactive conversation flow.            |
-| `knaix chat`     | Dispatch a stateless, one-shot prompt.                |
-| `knaix upload`   | Recursively ingest directories into vector storage.   |
-| `knaix memory`   | Interrogate durable and ephemeral node memories.      |
-| `knaix local`    | Run the whole stack on this machine (`up`, `down`, `status`, `logs`). |
+| `knaix login`    | Sign in through your browser, following your configured API URL. |
+| `knaix logout`   | Remove the saved session token from this machine.     |
+| `knaix up`       | Provision a hosted node on your Kovalent account.     |
+| `knaix list`     | List your hosted nodes, or the documents on one node. |
+| `knaix use`      | Set the default node for later commands.              |
+| `knaix repl`     | Start an interactive chat session with a node.        |
+| `knaix chat`     | Ask a node one question and print the grounded answer.|
+| `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
+| `knaix memory`   | List or read the notes saved with `/remember`.        |
+| `knaix local`    | Run the whole stack on this machine (`up`, `setup`, `down`, `status`, `logs`). |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
-| `knaix status`   | Show the local configuration and whether a session exists. |
-| `knaix metrics`  | Fetch a node's current health and latency.            |
-| `knaix logs`     | Fetch the most recent log lines from the agent pod.   |
+| `knaix status`   | Show who is logged in, the default node, and the local node's state. |
+| `knaix metrics`  | Show a node's health and latency.                     |
+| `knaix logs`     | Show a node's recent log lines.                       |
 | `knaix config`   | Show or set the API URL used by the CLI.              |
 
 **Global Flags:**

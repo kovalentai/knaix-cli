@@ -189,7 +189,7 @@ async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
-        .context("Failed to connect to Kovalent API")?;
+        .context("Could not reach the Kovalent API")?;
 
     if !resp.status().is_success() {
         return Err(anyhow!(
@@ -228,7 +228,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await
-            .context("Failed to connect to Kovalent API")?;
+            .context("Could not reach the Kovalent API")?;
 
         if resp.status().is_success() {
             let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -285,7 +285,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
-        .context("Failed to connect to Kovalent API")?;
+        .context("Could not reach the Kovalent API")?;
 
     if resp.status().is_success() {
         let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -377,7 +377,7 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
-        .context("Could not reach Kovalent API")?;
+        .context("Could not reach the Kovalent API")?;
 
     if !resp.status().is_success() {
         pb.finish_and_clear();
