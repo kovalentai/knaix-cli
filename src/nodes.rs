@@ -63,6 +63,65 @@ pub struct ChatAnswer {
     pub model: Option<String>,
 }
 
+/// One prior turn of a conversation, sent to the local node so a follow-up
+/// ("what about the exceptions?") is answered in the context of what came
+/// before rather than as a fresh, contextless question.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// The grounding instructions the local node answers under when a command does
+/// not supply its own. The direct `/api/query/answer` route applies no default
+/// of its own, so without this the model is handed an empty system prompt and
+/// tends to return a single terse line. This lives on the CLI because it is the
+/// one path that drives the node directly; the hosted path is prompted by the
+/// control plane in front of it.
+const LOCAL_ANSWER_SYSTEM: &str = "You are a helpful assistant answering questions from a private knowledge base. \
+Answer using only the provided context. Lead with a direct answer, then give the supporting detail, \
+conditions, and exceptions the context contains. Cite the passages you draw on with their [n] markers. \
+Keep formatting simple for a terminal: short paragraphs, and at most a single flat level of '- ' bullets \
+with no nesting and no indented lines. If the context does not contain the answer, say so plainly rather \
+than guessing.";
+
+/// The most recent turns to keep in a REPL transcript. The node caps history on
+/// its side too; this bounds the request body so a long session does not grow
+/// one without limit. Even, so complete user/assistant pairs are kept.
+pub const HISTORY_WINDOW_TURNS: usize = 20;
+
+/// Build the body for the local answer route in one place, so the system prompt
+/// and history it sends can be checked by a test without a live node.
+fn build_local_answer_body(
+    instance_id: &str,
+    message: &str,
+    history: &[ChatTurn],
+) -> serde_json::Value {
+    serde_json::json!({
+        "instance_id": instance_id,
+        "query": message,
+        "system": LOCAL_ANSWER_SYSTEM,
+        "history": history,
+    })
+}
+
+/// Append a finished exchange to a running transcript, keeping only the most
+/// recent `max_turns` so the request body stays bounded across a long session.
+pub fn record_turn(history: &mut Vec<ChatTurn>, user: &str, assistant: &str, max_turns: usize) {
+    history.push(ChatTurn {
+        role: "user".to_string(),
+        content: user.to_string(),
+    });
+    history.push(ChatTurn {
+        role: "assistant".to_string(),
+        content: assistant.to_string(),
+    });
+    if history.len() > max_turns {
+        let drop = history.len() - max_turns;
+        history.drain(0..drop);
+    }
+}
+
 /// One grounded passage the node returned alongside an answer.
 #[derive(Deserialize, serde::Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -524,10 +583,14 @@ pub async fn chat(
     target: &Target,
     message: &str,
     stream_to_stdout: bool,
+    history: &[ChatTurn],
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
-        return chat_local(ctx, base, instance_id, message, stream_to_stdout).await;
+        return chat_local(ctx, base, instance_id, message, stream_to_stdout, history).await;
     }
+    // The hosted path is prompted and, where supported, kept in session by the
+    // control plane; history threaded for the local node is not resent here.
+    let _ = history;
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
@@ -592,6 +655,7 @@ async fn chat_local(
     instance_id: &str,
     message: &str,
     print: bool,
+    history: &[ChatTurn],
 ) -> Result<Option<ChatAnswer>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -611,7 +675,7 @@ async fn chat_local(
         // First question after a start can include a model server loading its
         // weights, which routinely outlasts the client's default timeout.
         .timeout(Duration::from_secs(300))
-        .json(&serde_json::json!({ "instance_id": instance_id, "query": message }))
+        .json(&build_local_answer_body(instance_id, message, history))
         .send()
         .await
         .inspect_err(|_| pb.finish_and_clear())
@@ -1823,6 +1887,50 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_local_answer_body_carries_the_system_prompt_and_history() {
+        // The route applies no default system prompt, so an empty one is what
+        // makes the model answer in a single terse line. The body must always
+        // carry grounding instructions and the turns so far.
+        let history = vec![
+            ChatTurn {
+                role: "user".into(),
+                content: "when are receipts due?".into(),
+            },
+            ChatTurn {
+                role: "assistant".into(),
+                content: "Within 30 days [1].".into(),
+            },
+        ];
+        let body = build_local_answer_body("abc", "and cabin class?", &history);
+        assert_eq!(body["instance_id"], "abc");
+        assert_eq!(body["query"], "and cabin class?");
+        let system = body["system"].as_str().unwrap();
+        assert!(!system.is_empty(), "system prompt must not be empty");
+        assert!(
+            system.contains("[n]"),
+            "the prompt should ask the model to cite: {system}"
+        );
+        assert_eq!(body["history"].as_array().unwrap().len(), 2);
+        assert_eq!(body["history"][0]["role"], "user");
+        assert_eq!(body["history"][1]["content"], "Within 30 days [1].");
+    }
+
+    #[test]
+    fn record_turn_keeps_the_most_recent_window_in_pairs() {
+        let mut history = Vec::new();
+        for i in 0..30 {
+            record_turn(&mut history, &format!("q{i}"), &format!("a{i}"), 20);
+        }
+        // Never grows past the window, and the window is the recent turns.
+        assert_eq!(history.len(), 20);
+        assert_eq!(history.first().unwrap().content, "q20");
+        assert_eq!(history.last().unwrap().content, "a29");
+        // Whole exchanges are kept: the window opens on a user turn.
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+    }
 
     #[test]
     fn citation_markers_are_read_out_of_the_answer() {

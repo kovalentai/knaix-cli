@@ -61,6 +61,10 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     );
 
     let mut message_count = 0;
+    // The conversation so far, sent with each question so a follow-up is
+    // answered in context. Trimmed to a recent window so a long session does
+    // not grow the request without bound.
+    let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
 
     loop {
         let prompt = format!("knaix [{}]> ", node_id);
@@ -112,7 +116,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
 
                 message_count += 1;
 
-                match crate::nodes::chat(ctx, target, &input, false).await {
+                match crate::nodes::chat(ctx, target, &input, false, &history).await {
                     Ok(Some(answer)) => {
                         println!();
                         skin.print_text(&answer.text);
@@ -121,6 +125,14 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                         crate::nodes::print_citations(&answer.citations);
                         crate::nodes::print_answer_footer(target, &answer);
                         println!();
+                        // Record the exchange only once it succeeded, so a
+                        // failed turn does not poison the context of the next.
+                        crate::nodes::record_turn(
+                            &mut history,
+                            &input,
+                            &answer.text,
+                            crate::nodes::HISTORY_WINDOW_TURNS,
+                        );
                     }
                     Ok(None) => {
                         println!("{}", "Warning: Node returned an empty response.".yellow());

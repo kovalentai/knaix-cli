@@ -292,10 +292,11 @@ async fn main() -> Result<()> {
         Commands::Chat { node_id, message } => {
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 if ctx.output_format == "json" {
-                    if let Some(answer) = nodes::chat(&ctx, &target, &message, false).await? {
+                    if let Some(answer) = nodes::chat(&ctx, &target, &message, false, &[]).await? {
                         nodes::print_answer_json(&answer)?;
                     }
-                } else if let Some(answer) = nodes::chat(&ctx, &target, &message, true).await? {
+                } else if let Some(answer) = nodes::chat(&ctx, &target, &message, true, &[]).await?
+                {
                     nodes::print_answer_footer(&target, &answer);
                 }
             }
