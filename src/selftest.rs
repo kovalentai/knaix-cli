@@ -237,10 +237,10 @@ pub async fn run(
                 .underline()
         );
         println!(
-            "  {} synthetic documents, {} question{}. Everything uploaded is deleted afterwards.\n",
+            "  {} synthetic documents, {} questions{}. Everything uploaded is deleted afterwards.\n",
             corpus().len(),
             questions.len(),
-            if quick { " (quick subset)" } else { "s" }
+            if quick { " (quick subset)" } else { "" }
         );
     }
 

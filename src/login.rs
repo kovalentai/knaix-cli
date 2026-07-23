@@ -1,4 +1,5 @@
 use crate::config::{load_config, load_stored_config, save_config};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Extension, Query},
     response::Html,
@@ -9,6 +10,12 @@ use colored::*;
 use serde::Deserialize;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+
+/// How long to wait for the browser before giving up. Long enough for an MFA
+/// prompt and a password manager; short enough that a forgotten terminal does
+/// not sit on a listening socket all day.
+const LOGIN_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
@@ -21,6 +28,7 @@ pub struct CallbackParams {
 #[derive(Clone)]
 struct AppState {
     completed: Arc<Mutex<bool>>,
+    done: Arc<Notify>,
     expected_state: String,
 }
 
@@ -99,49 +107,14 @@ async fn handle_callback(
 
     println!("\n{} Successfully logged in!", "✓".green());
     println!("  Welcome, {}", params.username.cyan());
-
-    // --- Mesh Synchronization ---
-    println!("\n{} Synchronizing with private mesh...", "Info:".blue());
-
-    let client = reqwest::Client::new();
-    // The request itself honours KNAIX_API_URL, even though the saved file does not.
-    let api_url = load_config().api_url;
-    let token = params.token.clone();
-
-    // Trigger mesh join request in the background/async
-    tokio::spawn(async move {
-        match client
-            .post(format!("{}/mesh/join", api_url))
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-        {
-            Ok(res) => {
-                if let Ok(mesh) = res.json::<serde_json::Value>().await {
-                    if let (Some(key), Some(host)) =
-                        (mesh["authKey"].as_str(), mesh["hostname"].as_str())
-                    {
-                        println!("\n{}", "=== Mesh Credentials ===".bold());
-                        println!("{} {}", "Join Key:".black(), key.yellow());
-                        println!("{} {}", "Hostname:".black(), host.cyan());
-                        println!("\nTo finalize your connection, run:");
-                        println!(
-                            "{}",
-                            format!("  sudo tailscale up --authkey={} --hostname={}", key, host)
-                                .white()
-                                .on_blue()
-                        );
-                        println!("{} Tip: Knaix will now securely route all chat requests through this encrypted mesh.\n", "Info:".blue());
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed to sync mesh: {}", "Error:".red(), e);
-            }
-        }
-    });
+    println!(
+        "  {} lists your nodes; {} makes one the default.",
+        "knaix list".cyan(),
+        "knaix use <node-id>".cyan()
+    );
 
     *state.completed.lock().unwrap() = true;
+    state.done.notify_one();
 
     Html(
         r###"
@@ -402,38 +375,24 @@ async fn handle_callback(
     )
 }
 
-pub async fn login() {
+pub async fn login() -> Result<()> {
     // Bind the callback server to an OS-assigned loopback port. A random port
     // (rather than a fixed 4242) means other local processes cannot predict the
     // callback URL to race or forge it.
-    let listener = match TcpListener::bind(("127.0.0.1", 0)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "{} Could not start the local callback server: {}",
-                "Error:".red(),
-                e
-            );
-            return;
-        }
-    };
-    let port = match listener.local_addr() {
-        Ok(addr) => addr.port(),
-        Err(e) => {
-            eprintln!(
-                "{} Could not resolve the callback port: {}",
-                "Error:".red(),
-                e
-            );
-            return;
-        }
-    };
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("Could not start the local callback server")?;
+    let port = listener
+        .local_addr()
+        .context("Could not resolve the callback port")?
+        .port();
 
     // Single-use nonce the browser redirect must echo back (CSRF protection).
     let expected_state = new_state_token();
+    let done = Arc::new(Notify::new());
 
     let state = AppState {
         completed: Arc::new(Mutex::new(false)),
+        done: done.clone(),
         expected_state: expected_state.clone(),
     };
 
@@ -448,49 +407,51 @@ pub async fn login() {
 
     // Build the auth URL with the callback properly percent-encoded, so the
     // callback's own query string survives being nested as a parameter.
-    let auth_url = match url::Url::parse(&auth_base(&load_config().api_url)) {
-        Ok(mut u) => {
+    let auth_url = url::Url::parse(&auth_base(&load_config().api_url))
+        .map(|mut u| {
             u.query_pairs_mut().append_pair("callback", &callback_url);
             u.to_string()
-        }
-        Err(e) => {
-            eprintln!("{} Invalid authentication URL: {}", "Error:".red(), e);
-            return;
-        }
-    };
+        })
+        .context("Invalid authentication URL")?;
 
-    println!("{} Starting Knaix SSO Login...", "Info:".blue());
-    println!("  Opening browser: {}\n", auth_url.dimmed());
+    println!("{} Opening the browser to sign in.", "Info:".blue());
+    println!("  If nothing opened, visit: {}\n", auth_url.dimmed());
 
     if let Err(e) = open::that(&auth_url) {
-        eprintln!("{} {}", "Failed to open browser:".red(), e);
+        println!(
+            "{} Could not open the browser ({}). Visit the URL above to continue.",
+            "Warning:".yellow(),
+            e
+        );
     }
-
-    // Spawn polling task
-    let state_poll = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let completed = *state_poll.completed.lock().unwrap();
-            if completed {
-                std::process::exit(0);
-            }
-        }
-    });
 
     // axum 0.8 serves from a tokio listener, which must be non-blocking.
-    if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("{} Failed to start callback server: {}", "Error:".red(), e);
-        return;
-    }
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("{} Failed to start callback server: {}", "Error:".red(), e);
-            return;
+    listener
+        .set_nonblocking(true)
+        .context("Failed to start callback server")?;
+    let listener =
+        tokio::net::TcpListener::from_std(listener).context("Failed to start callback server")?;
+
+    // Serve until the callback lands or the wait stops being plausible. The
+    // hard timeout is what makes a walked-away-from login exit non-zero
+    // instead of holding the port forever.
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            result.context("The login callback server stopped unexpectedly")?;
         }
-    };
-    let _ = axum::serve(listener, app).await;
+        _ = done.notified() => {
+            // A beat for the browser to finish reading the success page
+            // before the server goes away with the process.
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS)) => {
+            return Err(anyhow!(
+                "No sign-in completed within {} minutes. Run 'knaix login' to try again.",
+                LOGIN_TIMEOUT_SECS / 60
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -562,6 +523,7 @@ mod tests {
     fn state_with(expected: &str) -> AppState {
         AppState {
             completed: Arc::new(Mutex::new(false)),
+            done: Arc::new(Notify::new()),
             expected_state: expected.to_string(),
         }
     }

@@ -15,7 +15,7 @@ use nodes::KnaixContext;
 
 #[derive(Parser)]
 #[clap(name = "knaix")]
-#[clap(about = "Sovereign AI Terminal - Connect to your Kovalent Private Stack", long_about = None)]
+#[clap(about = "The Kovalent command line: ingest documents into a private AI node and ask questions of them, locally or hosted", long_about = None)]
 struct Cli {
     /// Output format (text or json)
     #[clap(short = 'o', long = "output", default_value = "text", global = true)]
@@ -31,36 +31,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with Kovalent Identity Center (SSO)
+    /// Log in to your Kovalent account (opens the browser)
     Login,
 
-    /// List your provisioned AI nodes and their status
+    /// Log out, removing the saved session from this machine
+    Logout,
+
+    /// List your hosted nodes, or the documents on one node
     #[clap(alias = "ls")]
     List {
-        /// Optional: List documents in a specific node's knowledge base
+        /// A node to list the documents of, instead of listing nodes
         #[clap(name = "NODE_ID")]
         node_id: Option<String>,
     },
 
-    /// Set a default node context for one-shot commands
+    /// Set the default node for later commands ('local' for the local node)
     Use {
         /// The ID of the node to set as default
         node_id: String,
     },
 
-    /// Chat with an AI node (one-shot message)
+    /// Ask a node one question and print the grounded answer
     Chat {
-        /// The ID of the node to chat with (falls back to default)
+        /// The node to ask (falls back to the default)
         #[clap(short = 'n', long = "node-id")]
         node_id: Option<String>,
 
-        /// Your message to the AI
+        /// The question to ask
         message: String,
     },
 
-    /// Upload a file to a node's knowledge base
+    /// Ingest a file or directory into a node's knowledge base
     Upload {
-        /// The ID of the node (falls back to default)
+        /// The node to ingest into (falls back to the default)
         #[clap(short = 'n', long = "node-id")]
         node_id: Option<String>,
 
@@ -84,39 +87,51 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Show CLI configuration and connection status
+    /// Show who is logged in, the default node, and the local node's state
     Status,
 
-    /// Manage CLI configuration settings (API URL, token)
+    /// Show or change the API URL the CLI talks to
     Config {
-        /// Optional: Override the API URL
+        /// Set the API URL instead of showing it
         #[clap(long)]
         api_url: Option<String>,
     },
 
-    /// Show real-time performance metrics (latency, health) for a node
+    /// Show a node's health and latency
     Metrics {
-        /// The ID of the node (falls back to default)
+        /// The node to check (falls back to the default)
         node_id: Option<String>,
+
+        /// The node to check, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
     },
 
-    /// View system logs for a node (container logs)
+    /// Show a node's logs
     Logs {
-        /// The ID of the node (falls back to default)
+        /// The node to read (falls back to the default)
         node_id: Option<String>,
+
+        /// The node to read, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
 
         /// Number of lines to retrieve (default: 50)
         #[clap(short, long, default_value = "50")]
         lines: usize,
     },
 
-    /// Launch a continuous, immersive REPL session
+    /// Start an interactive chat session with a node
     Repl {
-        /// The ID of the node to chat with (falls back to default)
+        /// The node to chat with (falls back to the default)
         node_id: Option<String>,
+
+        /// The node to chat with, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
     },
 
-    /// Provision a new Sovereign Node instantly
+    /// Provision a hosted node on your Kovalent account
     Up,
 
     /// Run the whole stack on this machine, with no account and no network
@@ -127,8 +142,12 @@ enum Commands {
 
     /// Check that a node retrieves and cites correctly, using a bundled corpus
     Selftest {
-        /// The ID of the node to test (falls back to default)
+        /// The node to test (falls back to the default)
         node_id: Option<String>,
+
+        /// The node to test, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
 
         /// Leave the generated documents on the node instead of removing them
         #[clap(long)]
@@ -150,12 +169,16 @@ enum Commands {
         shell: clap_complete::Shell,
     },
 
-    /// View your Sovereign Agentic Memory for a node
+    /// List or read the notes saved with /remember in the REPL
     Memory {
-        /// The ID of the node (falls back to default)
+        /// The node whose notes to show (falls back to the default)
         node_id: Option<String>,
 
-        /// Optional: read a specific memory file instead of listing
+        /// The node whose notes to show, as a flag
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
+
+        /// Read a specific notes file instead of listing them
         #[clap(short, long)]
         file: Option<String>,
     },
@@ -235,7 +258,27 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Login => {
-            login::login().await;
+            login::login().await?;
+        }
+        Commands::Logout => {
+            let mut stored = config::load_stored_config();
+            if stored.token.is_none() {
+                println!("{} No session is stored on this machine.", "Info:".blue());
+            } else {
+                stored.token = None;
+                stored.username = None;
+                config::save_config(&stored)?;
+                println!(
+                    "{} Logged out. The saved session token has been removed.",
+                    "✓".green()
+                );
+            }
+            if std::env::var("KNAIX_TOKEN").is_ok() {
+                println!(
+                    "{} KNAIX_TOKEN is set in this shell and still authenticates requests.",
+                    "Note:".blue()
+                );
+            }
         }
         Commands::List { node_id } => {
             nodes::list_nodes(&ctx, node_id.as_deref()).await?;
@@ -248,7 +291,13 @@ async fn main() -> Result<()> {
         }
         Commands::Chat { node_id, message } => {
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                nodes::chat(&ctx, &target, &message, true).await?;
+                if ctx.output_format == "json" {
+                    if let Some(answer) = nodes::chat(&ctx, &target, &message, false).await? {
+                        nodes::print_answer_json(&answer)?;
+                    }
+                } else if let Some(answer) = nodes::chat(&ctx, &target, &message, true).await? {
+                    nodes::print_answer_footer(&target, &answer);
+                }
             }
         }
         Commands::Upload {
@@ -271,13 +320,15 @@ async fn main() -> Result<()> {
         }
         Commands::Status => {
             let config = config::load_config();
+            let local = local::summarize();
 
             if ctx.output_format == "json" {
                 let status_json = serde_json::json!({
                     "username": config.username,
                     "defaultNodeId": config.default_node_id,
                     "apiUrl": config.api_url,
-                    "authenticated": config.token.is_some()
+                    "authenticated": config.token.is_some(),
+                    "localNode": { "state": local.state, "url": local.url }
                 });
                 println!(
                     "{}",
@@ -314,16 +365,31 @@ async fn main() -> Result<()> {
                 "API URL".dimmed().to_string(),
                 config.api_url.dimmed().to_string(),
             ]);
+            table.add_row(vec![
+                "Local Node".dimmed().to_string(),
+                match (local.state.as_str(), &local.url) {
+                    ("running", Some(url)) => format!("running on {}", url).green().to_string(),
+                    ("running", None) => "running".green().to_string(),
+                    ("none", _) => "none (start one with 'knaix local up')"
+                        .dimmed()
+                        .to_string(),
+                    (state, _) => state.yellow().to_string(),
+                },
+            ]);
 
+            // A stored token is all this command can vouch for; whether the
+            // control plane still honours it is only knowable by asking it.
             if config.token.is_some() {
                 table.add_row(vec![
                     "Auth".dimmed().to_string(),
-                    "Connected (Active Session)".green().to_string(),
+                    "Session token saved ('knaix list' verifies it)"
+                        .green()
+                        .to_string(),
                 ]);
             } else {
                 table.add_row(vec![
                     "Auth".dimmed().to_string(),
-                    "Missing (Run 'knaix login')".red().to_string(),
+                    "Not logged in (run 'knaix login')".red().to_string(),
                 ]);
             }
             println!("{table}\n");
@@ -341,17 +407,24 @@ async fn main() -> Result<()> {
                 println!("  API URL: {}", config.api_url.cyan());
             }
         }
-        Commands::Metrics { node_id } => {
+        Commands::Metrics { node_id, node } => {
+            let node_id = node.or(node_id);
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::get_metrics_for(&ctx, &target).await?;
             }
         }
-        Commands::Logs { node_id, lines } => {
+        Commands::Logs {
+            node_id,
+            node,
+            lines,
+        } => {
+            let node_id = node.or(node_id);
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::get_logs_for(&ctx, &target, lines).await?;
             }
         }
-        Commands::Repl { node_id } => {
+        Commands::Repl { node_id, node } => {
+            let node_id = node.or(node_id);
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 repl::run(&ctx, &target).await?;
             }
@@ -374,10 +447,12 @@ async fn main() -> Result<()> {
         }
         Commands::Selftest {
             node_id,
+            node,
             keep,
             quick,
             sweep,
         } => {
+            let node_id = node.or(node_id);
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 selftest::run(&ctx, &target, keep, quick, sweep).await?;
             }
@@ -391,7 +466,12 @@ async fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
-        Commands::Memory { node_id, file } => {
+        Commands::Memory {
+            node_id,
+            node,
+            file,
+        } => {
+            let node_id = node.or(node_id);
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 let key = nodes::memory_key(&target);
                 nodes::view_memory(&ctx, &key, file.as_deref()).await?;

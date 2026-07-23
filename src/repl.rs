@@ -5,19 +5,62 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use termimad::MadSkin;
 
+fn print_help() {
+    println!("\n{}", "REPL commands:".bold().underline());
+    let rows: &[(&str, &str)] = &[
+        ("/help", "Show this help"),
+        (
+            "/remember <fact>",
+            "Save a fact to this node's notes and ingest it",
+        ),
+        ("/memory", "List the notes saved for this node"),
+        ("/exit, /quit", "End the session (Ctrl-D works too)"),
+    ];
+    for (cmd, what) in rows {
+        println!("  {:<18} {}", cmd.cyan(), what);
+    }
+    println!();
+}
+
+/// Save a fact and ingest it into the node, reporting exactly what happened.
+/// A note that only reached the disk must say so, or "saved" overstates it.
+async fn remember(ctx: &KnaixContext, target: &crate::nodes::Target, fact: &str) {
+    let path = match crate::nodes::save_note(target, fact).await {
+        Ok(p) => p,
+        Err(e) => {
+            println!("{} Could not save the note: {}", "Error:".red(), e);
+            return;
+        }
+    };
+    match crate::nodes::ingest_note(ctx, target, &path).await {
+        Ok(()) => println!(
+            "{} Noted. Saved to {} and ingested, so later questions can retrieve it.",
+            "✓".green(),
+            path.display().to_string().dimmed()
+        ),
+        Err(e) => println!(
+            "{} Noted. Saved to {}, but the node did not ingest it ({}); it will not surface in answers.",
+            "✓".yellow(),
+            path.display().to_string().dimmed(),
+            e
+        ),
+    }
+}
+
 pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()> {
     let node_id = &target.label();
     let mut rl = DefaultEditor::new().context("Failed to initialize readline")?;
     let skin = MadSkin::default_dark();
 
     println!(
-        "\n{} Knaix AI Session: {} (Type '/exit' to end or enter your message)",
+        "\n{} Chatting with {}. {} lists commands; {} ends the session.",
         "●".green(),
-        node_id.cyan().bold()
+        node_id.cyan().bold(),
+        "/help".cyan(),
+        "/exit".cyan()
     );
 
     let mut message_count = 0;
-    let mut history_buffer: Vec<String> = Vec::new();
 
     loop {
         let prompt = format!("knaix [{}]> ", node_id);
@@ -29,134 +72,54 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                 if input.is_empty() {
                     continue;
                 }
+                rl.add_history_entry(input.as_str()).ok();
 
-                let mut final_input = input.clone();
-
-                let mut is_memory_intent = false;
-                let mut fact_to_remember = "";
-
-                if let Some(fact) = input.strip_prefix("/remember ") {
-                    is_memory_intent = true;
-                    fact_to_remember = fact;
-                } else if input.to_lowercase().starts_with("remember ") {
-                    is_memory_intent = true;
-                    let lower = input.to_lowercase();
-                    if lower.starts_with("remember that ") {
-                        fact_to_remember = &input[14..];
-                    } else if lower.starts_with("remember ") {
-                        fact_to_remember = &input[9..];
-                    }
-                }
-
-                if is_memory_intent {
-                    println!(
-                        "{} Recognizing intent to memorize: {}",
-                        "Intent recognized:".magenta(),
-                        fact_to_remember.cyan()
-                    );
-
-                    if let Err(e) =
-                        crate::nodes::memorize(ctx, node_id, fact_to_remember, true).await
-                    {
-                        println!("{} Failed to save memory: {}", "Error:".red(), e);
-                    } else {
-                        println!(
-                            "{} Explicit memory securely stored and available across sessions.",
-                            "✓".green()
-                        );
-                    }
-
-                    final_input = format!("I have securely stored the following fact in your durable memory: {}. Please confirm.", fact_to_remember);
-                } else if input.starts_with('/') {
-                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-                    let cmd = parts[0];
-                    let args = if parts.len() > 1 { parts[1] } else { "" };
-
+                if input.starts_with('/') {
+                    let (cmd, args) = input.split_once(' ').unwrap_or((input.as_str(), ""));
                     match cmd {
                         "/exit" | "/quit" => break,
                         "/help" => {
-                            println!("\n{}", "Available REPL Commands:".bold().underline());
-                            println!("  {:<14} End the current session", "/exit, /quit".cyan());
-                            println!("  {:<14} Show this help message", "/help".cyan());
-                            println!(
-                                "  {:<14} Ask the AI to explain a concept in detail",
-                                "/explain <...>\t".cyan()
-                            );
-                            println!(
-                                "  {:<14} Ask the AI to summarize a topic or findings",
-                                "/summarize <...>\t".cyan()
-                            );
-                            println!(
-                                "  {:<14} Explicitly save a fact to your durable memory",
-                                "/remember <...>\t".cyan()
-                            );
-                            println!(
-                                "  {:<14} Ask the AI what it remembers about you\n",
-                                "/memory\t\t".cyan()
-                            );
+                            print_help();
                             continue;
                         }
-                        "/explain" => {
-                            if args.is_empty() {
-                                println!("{} Usage: /explain <topic>", "Error:".red());
-                                continue;
+                        "/remember" => {
+                            let fact = args.trim();
+                            if fact.is_empty() {
+                                println!("{} Usage: /remember <fact>", "Error:".red());
+                            } else {
+                                remember(ctx, target, fact).await;
                             }
-                            final_input = format!("Please explain this in detail: {}", args);
-                        }
-                        "/summarize" => {
-                            if args.is_empty() {
-                                println!("{} Usage: /summarize <text or topic>", "Error:".red());
-                                continue;
-                            }
-                            final_input = format!(
-                                "Please provide a concise summary of the key findings for: {}",
-                                args
-                            );
+                            continue;
                         }
                         "/memory" => {
-                            final_input = "Please review your durable memory and summarize what you know and remember about me and my environment.".to_string();
+                            let key = crate::nodes::memory_key(target);
+                            if let Err(e) = crate::nodes::view_memory(ctx, &key, None).await {
+                                println!("{} {}", "Error:".red(), e);
+                            }
+                            continue;
                         }
                         _ => {
-                            final_input = input.clone();
+                            println!(
+                                "{} Unknown command {}. {} lists commands; a message without a leading '/' is sent to the node.",
+                                "Error:".red(),
+                                cmd.cyan(),
+                                "/help".cyan()
+                            );
+                            continue;
                         }
                     }
                 }
 
-                rl.add_history_entry(input.as_str()).ok();
                 message_count += 1;
-                history_buffer.push(input.clone());
 
-                if history_buffer.len() >= 5 {
-                    println!("{} Session growing. Background worker compressing context into ephemeral log...", "Memory:".magenta());
-                    let history_text = history_buffer.join("\n");
-                    let summary_prompt = format!("Concisely summarize the technical facts or context from these messages:\n{}", history_text);
-
-                    let ctx_clone = ctx.clone();
-                    let node_id_clone = node_id.to_string();
-
-                    tokio::spawn(async move {
-                        if let Ok(Some(summary)) = crate::nodes::chat_silent(
-                            ctx_clone.config.clone(),
-                            node_id_clone.clone(),
-                            summary_prompt,
-                        )
-                        .await
-                        {
-                            let _ =
-                                crate::nodes::memorize(&ctx_clone, &node_id_clone, &summary, false)
-                                    .await;
-                        }
-                    });
-                    history_buffer.clear();
-                }
-
-                match crate::nodes::chat(ctx, target, &final_input, false).await {
+                match crate::nodes::chat(ctx, target, &input, false).await {
                     Ok(Some(answer)) => {
                         println!();
                         skin.print_text(&answer.text);
                         // Show sources here too: an ungrounded claim should be
                         // as visible in a session as in a one-shot command.
                         crate::nodes::print_citations(&answer.citations);
+                        crate::nodes::print_answer_footer(target, &answer);
                         println!();
                     }
                     Ok(None) => {
@@ -183,9 +146,10 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     }
 
     println!(
-        "\n{} Session closed ({} messages sent). Stay sovereign.\n",
+        "\n{} Session closed ({} message{} sent).\n",
         "✓".green(),
-        message_count
+        message_count,
+        if message_count == 1 { "" } else { "s" }
     );
 
     Ok(())
