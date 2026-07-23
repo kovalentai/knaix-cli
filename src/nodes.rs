@@ -720,18 +720,69 @@ async fn chat_local(
     pb.set_message("Thinking...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
+    let body = build_local_answer_body(instance_id, message, history, verbosity);
+
     let resp = ctx
         .client
-        .post(format!("{}/api/query/answer", base))
+        .post(format!("{}/api/query/answer/stream", base))
         // First question after a start can include a model server loading its
         // weights, which routinely outlasts the client's default timeout.
         .timeout(Duration::from_secs(300))
-        .json(&build_local_answer_body(
-            instance_id,
-            message,
-            history,
-            verbosity,
-        ))
+        .json(&body)
+        .send()
+        .await
+        .inspect_err(|_| pb.finish_and_clear())
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    // A node image built before streaming has no such route. Rather than fail
+    // against an older local node, answer through the blocking endpoint it does
+    // have: the reserved `local` node upgrades on its own schedule, not the CLI's.
+    if matches!(resp.status().as_u16(), 404 | 405) {
+        return chat_local_blocking(ctx, base, &body, &pb, print).await;
+    }
+
+    // Any other non-2xx never reaches the event stream: it is a normal JSON body.
+    if !resp.status().is_success() {
+        pb.finish_and_clear();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let detail = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("no detail");
+        return Err(anyhow!(
+            "Local node could not answer: HTTP {} - {}",
+            status,
+            detail
+        ));
+    }
+
+    let (text, citations, model) = read_local_answer_stream(resp, &pb, print).await?;
+
+    Ok(Some(ChatAnswer {
+        text,
+        citations,
+        model,
+    }))
+}
+
+/// The pre-streaming path: one blocking request that returns the whole answer.
+///
+/// Kept for a local node whose image predates the streaming route, so a CLI
+/// ahead of the node still answers. The request body is identical; only the
+/// endpoint and the one-shot parse differ.
+async fn chat_local_blocking(
+    ctx: &KnaixContext,
+    base: &str,
+    body: &serde_json::Value,
+    pb: &ProgressBar,
+    print: bool,
+) -> Result<Option<ChatAnswer>> {
+    let resp = ctx
+        .client
+        .post(format!("{}/api/query/answer", base))
+        .timeout(Duration::from_secs(300))
+        .json(body)
         .send()
         .await
         .inspect_err(|_| pb.finish_and_clear())
@@ -768,6 +819,104 @@ async fn chat_local(
         citations,
         model,
     }))
+}
+
+/// Consume the local node's SSE answer stream.
+///
+/// The stream carries a `meta` frame with the citations and model, then a
+/// `data:` frame per token, then a terminating `done` (or `error`). Tokens
+/// print as they arrive when `print` is set, so a long answer feels responsive;
+/// the REPL passes `print` false and accumulates the whole answer to render as
+/// markdown. Citations are mapped from the node's shape at the end, and which
+/// ones the answer used is read back out of its `[n]` markers, exactly as the
+/// non-streamed local path did.
+async fn read_local_answer_stream(
+    resp: reqwest::Response,
+    pb: &ProgressBar,
+    print: bool,
+) -> Result<(String, Vec<Citation>, Option<String>)> {
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut answer = String::new();
+    let mut raw_citations = serde_json::Value::Null;
+    let mut model: Option<String> = None;
+    let mut event = String::new();
+    let mut first_token = true;
+    let mut stream_error: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Answer stream ended unexpectedly")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Frames are newline-delimited; keep any partial tail for the next chunk.
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim_end_matches('\r').to_string();
+            buffer.drain(..=newline);
+
+            if let Some(name) = line.strip_prefix("event: ") {
+                event = name.trim().to_string();
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event.as_str() {
+                "meta" => {
+                    raw_citations = parsed["citations"].clone();
+                    model = parsed["model"].as_str().map(|s| s.to_string());
+                }
+                "error" => {
+                    stream_error = Some(
+                        parsed["message"]
+                            .as_str()
+                            .or_else(|| parsed["error"].as_str())
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    );
+                }
+                "done" => {}
+                _ => {
+                    if let Some(token) = parsed["token"].as_str() {
+                        if print {
+                            // Clear the spinner only once the first token is in
+                            // hand, so the line it occupied is reused.
+                            if first_token {
+                                pb.finish_and_clear();
+                                print!("{} ", "AI:".cyan().bold());
+                            }
+                            print!("{}", token);
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        first_token = false;
+                        answer.push_str(token);
+                    }
+                }
+            }
+            // Each frame carries its whole payload on one `data:` line, so the
+            // event ends with it; leaving the name set would misread the next.
+            event.clear();
+        }
+    }
+
+    pb.finish_and_clear();
+    if print && !first_token {
+        println!();
+    }
+
+    if let Some(code) = stream_error {
+        return Err(anyhow!("Local node could not answer: {}", code));
+    }
+
+    let citations = node_citations(&raw_citations, &answer);
+    if print {
+        print_citations(&citations);
+    }
+    Ok((answer, citations, model))
 }
 
 /// Map the node's citation shape onto the CLI's.
