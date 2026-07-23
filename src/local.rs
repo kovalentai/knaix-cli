@@ -275,7 +275,11 @@ pub async fn up(
 
     if launch.remembered {
         let what = match &launch.model {
-            Some(m) => format!("{} at {}", m, launch.model_url.as_deref().unwrap_or_default()),
+            Some(m) => format!(
+                "{} at {}",
+                m,
+                launch.model_url.as_deref().unwrap_or_default()
+            ),
             None => launch.model_url.clone().unwrap_or_default(),
         };
         println!(
@@ -296,9 +300,7 @@ pub async fn up(
 
     // Keep the instance id across restarts, or everything already ingested
     // becomes unreachable under a new one.
-    let instance_id = saved
-        .map(|n| n.instance_id)
-        .unwrap_or_else(new_instance_id);
+    let instance_id = saved.map(|n| n.instance_id).unwrap_or_else(new_instance_id);
 
     let port_map = format!("{}:8080", launch.port);
     let volume_map = format!("{}:/data", VOLUME);
@@ -578,7 +580,12 @@ pub async fn setup() -> Result<()> {
 
     let node = remember_choice(saved, Some(url.clone()), model.clone())?;
     match &model {
-        Some(m) => println!("\n{} {} at {} will answer.", "✓".green(), m.cyan(), url.cyan()),
+        Some(m) => println!(
+            "\n{} {} at {} will answer.",
+            "✓".green(),
+            m.cyan(),
+            url.cyan()
+        ),
         None => println!("\n{} The model at {} will answer.", "✓".green(), url.cyan()),
     }
     offer_restart(&node).await
@@ -943,13 +950,7 @@ mod tests {
         // Model names are the server's, not the machine's: qwen3.5:latest
         // means nothing to a vLLM that hosts something else.
         let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch = resolve_launch(
-            Some(&node),
-            None,
-            Some("http://h:8000".into()),
-            None,
-            false,
-        );
+        let launch = resolve_launch(Some(&node), None, Some("http://h:8000".into()), None, false);
         assert_eq!(launch.model_url.as_deref(), Some("http://h:8000"));
         assert_eq!(launch.model, None);
         assert!(!launch.remembered);
@@ -971,8 +972,7 @@ mod tests {
     #[test]
     fn an_explicit_model_beats_the_remembered_one() {
         let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch =
-            resolve_launch(Some(&node), None, None, Some("phi4:latest".into()), false);
+        let launch = resolve_launch(Some(&node), None, None, Some("phi4:latest".into()), false);
         assert_eq!(launch.model.as_deref(), Some("phi4:latest"));
         assert_eq!(launch.model_url.as_deref(), Some("http://h:11434"));
     }
