@@ -1041,6 +1041,10 @@ pub async fn connect(daemon: bool, worker: bool) -> Result<()> {
     );
 
     if daemon {
+        // Replace any previous relay so a second one is never left running.
+        if let Some(old) = saved.relay_pid {
+            let _ = Command::new("kill").arg(old.to_string()).status();
+        }
         let pid = spawn_relay_worker()?;
         saved.relay_pid = Some(pid);
         save(&saved)?;
@@ -1092,6 +1096,11 @@ pub async fn disconnect() -> Result<()> {
 /// After login, register a running local node and push one snapshot so it shows
 /// up right away. Best-effort and quiet: does nothing if nothing is running.
 pub async fn connect_snapshot() {
+    // Bounded so a slow or unreachable control plane never holds up login.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), connect_snapshot_inner()).await;
+}
+
+async fn connect_snapshot_inner() {
     let node = match load() {
         Some(n) => n,
         None => return,
@@ -1176,14 +1185,31 @@ async fn relay_loop(
     node: &LocalNode,
     client_id: &str,
 ) -> Result<()> {
+    let mut since: Option<u64> = None;
     loop {
         let sample = gather_sample(ctx, node).await;
-        let logs = recent_log_lines(30);
+        let logs = new_log_lines(&mut since);
         if let Err(e) = push_telemetry(ctx, client_id, sample, logs).await {
             eprintln!("{} {}", "Warning:".yellow(), e);
         }
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
+}
+
+/// Container log lines written since the last call, so the same lines are not
+/// relayed over and over. Seeds with a recent tail on the first call.
+fn new_log_lines(since: &mut Option<u64>) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out = match *since {
+        None => docker(&["logs", "--tail", "30", CONTAINER]),
+        Some(ts) => docker(&["logs", "--since", &ts.to_string(), CONTAINER]),
+    };
+    *since = Some(now);
+    out.map(|o| o.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// One health + resource sample, shaped for the control plane's telemetry route.
@@ -1204,16 +1230,20 @@ async fn gather_sample(ctx: &crate::nodes::KnaixContext, node: &LocalNode) -> se
 
 /// CPU %, memory %, and memory bytes from `docker stats`. None where unavailable.
 fn docker_stats() -> (Option<f64>, Option<f64>, Option<u64>) {
-    let out = match docker(&[
+    match docker(&[
         "stats",
         "--no-stream",
         "--format",
         "{{.CPUPerc}}\t{{.MemPerc}}\t{{.MemUsage}}",
         CONTAINER,
     ]) {
-        Ok(o) => o,
-        Err(_) => return (None, None, None),
-    };
+        Ok(out) => parse_stats_line(&out),
+        Err(_) => (None, None, None),
+    }
+}
+
+/// Parse a `docker stats` line "cpu%\tmem%\tused / total" into (cpu, mem, bytes).
+fn parse_stats_line(out: &str) -> (Option<f64>, Option<f64>, Option<u64>) {
     let parts: Vec<&str> = out.split('\t').collect();
     let pct = |s: &&str| s.trim().trim_end_matches('%').parse::<f64>().ok();
     let cpu = parts.first().and_then(pct);
@@ -1286,6 +1316,30 @@ fn spawn_relay_worker() -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_size_reads_docker_units() {
+        assert_eq!(parse_size("512B"), Some(512));
+        assert_eq!(
+            parse_size("104.9MiB"),
+            Some((104.9 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
+        // A stopped container reports dashes; do not invent a number.
+        assert_eq!(parse_size("--"), None);
+        assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn parse_stats_line_reads_cpu_mem_and_bytes() {
+        let (cpu, mem, used) = parse_stats_line("1.23%\t4.50%\t104.9MiB / 1.945GiB");
+        assert_eq!(cpu, Some(1.23));
+        assert_eq!(mem, Some(4.5));
+        assert_eq!(used, Some((104.9 * 1024.0 * 1024.0) as u64));
+
+        // A stopped container yields no numbers rather than zeros.
+        assert_eq!(parse_stats_line("--\t--\t-- / --"), (None, None, None));
+    }
 
     #[test]
     fn generated_instance_ids_are_v4_shaped() {
