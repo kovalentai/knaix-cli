@@ -1,6 +1,7 @@
 mod config;
 mod local;
 mod login;
+mod model_server;
 mod nodes;
 mod repl;
 mod selftest;
@@ -168,22 +169,26 @@ enum LocalAction {
         #[clap(long)]
         port: Option<u16>,
 
-        /// Use a local model served at this URL instead of the mock
-        #[clap(long)]
-        llama_url: Option<String>,
+        /// Answer with a model served at this URL instead of the mock; any
+        /// OpenAI-compatible server (Ollama, LM Studio, vLLM, llama-server)
+        #[clap(long, alias = "llama-url", value_name = "URL")]
+        model_url: Option<String>,
 
-        /// Model to request from that server, e.g. an Ollama model name
-        #[clap(long)]
-        llama_model: Option<String>,
+        /// Model to ask that server for, e.g. an Ollama model name
+        #[clap(short = 'm', long, alias = "llama-model", value_name = "NAME")]
+        model: Option<String>,
 
         /// Ignore any remembered model server and use the deterministic mock
-        #[clap(long, conflicts_with = "llama_url")]
+        #[clap(long, conflicts_with = "model_url")]
         mock: bool,
 
         /// Re-pull the image even if it is already present
         #[clap(long)]
         pull: bool,
     },
+
+    /// Pick the model that answers, from the servers on this machine
+    Setup,
 
     /// Stop the local node
     Down {
@@ -354,11 +359,12 @@ async fn main() -> Result<()> {
         Commands::Local { action } => match action {
             LocalAction::Up {
                 port,
-                llama_url,
-                llama_model,
+                model_url,
+                model,
                 mock,
                 pull,
-            } => local::up(port, llama_url, llama_model, mock, pull).await?,
+            } => local::up(port, model_url, model, mock, pull).await?,
+            LocalAction::Setup => local::setup().await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
             LocalAction::Logs { lines } => local::logs(lines)?,

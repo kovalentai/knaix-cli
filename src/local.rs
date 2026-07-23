@@ -75,12 +75,12 @@ pub struct LocalNode {
     /// The model server the node was last started against, remembered so a
     /// later `up` does not silently drop back to the mock. Absent on state
     /// written before this was recorded, and when the mock is in use.
-    #[serde(default)]
-    pub llama_url: Option<String>,
-    /// Which model to ask that server for. Servings vary: llama-server ignores
+    #[serde(default, alias = "llama_url")]
+    pub model_url: Option<String>,
+    /// Which model to ask that server for. Servers vary: llama-server ignores
     /// it, Ollama and vLLM require a name they actually host.
-    #[serde(default)]
-    pub llama_model: Option<String>,
+    #[serde(default, alias = "llama_model")]
+    pub model: Option<String>,
 }
 
 impl LocalNode {
@@ -163,10 +163,65 @@ fn image_present(tag: &str) -> bool {
     docker(&["image", "inspect", tag]).is_ok()
 }
 
+/// What this start should actually run with, after memory has its say.
+struct Launch {
+    port: u16,
+    model_url: Option<String>,
+    model: Option<String>,
+    /// True when the server came from memory rather than a flag, so `up` can
+    /// say so instead of reusing it silently.
+    remembered: bool,
+}
+
+/// Merge flags with the remembered node. Forgetting a flag must not change
+/// what answers: the difference between a model and the mock is visible only
+/// in the wording, and a dropped model name is worse -- Ollama and vLLM meet
+/// it with a 404 at the first question, long after startup looked fine.
+/// `--mock` is the deliberate way back.
+fn resolve_launch(
+    saved: Option<&LocalNode>,
+    port: Option<u16>,
+    model_url: Option<String>,
+    model: Option<String>,
+    mock: bool,
+) -> Launch {
+    let port = port.or(saved.map(|n| n.port)).unwrap_or(DEFAULT_PORT);
+    if mock {
+        return Launch {
+            port,
+            model_url: None,
+            model: None,
+            remembered: false,
+        };
+    }
+    let saved_url = saved.and_then(|n| n.model_url.clone());
+    let saved_model = saved.and_then(|n| n.model.clone());
+    match model_url {
+        Some(url) => {
+            // A remembered model name belongs to its server; it does not
+            // transfer to a different one.
+            let same_server = saved_url.as_deref() == Some(url.as_str());
+            let model = model.or(if same_server { saved_model } else { None });
+            Launch {
+                port,
+                model_url: Some(url),
+                model,
+                remembered: false,
+            }
+        }
+        None => Launch {
+            port,
+            remembered: saved_url.is_some(),
+            model_url: saved_url,
+            model: model.or(saved_model),
+        },
+    }
+}
+
 pub async fn up(
     port: Option<u16>,
-    llama_url: Option<String>,
-    llama_model: Option<String>,
+    model_url: Option<String>,
+    model: Option<String>,
     mock: bool,
     pull: bool,
 ) -> Result<()> {
@@ -214,34 +269,38 @@ pub async fn up(
         let _ = docker(&["rm", "-f", CONTAINER]);
     }
 
-    // Reuse the model server this node was last started against. Forgetting a
-    // flag should not quietly change what is answering: the difference between
-    // a real model and the mock is visible in the wording and nowhere else, so
-    // a silent downgrade is one a user would not notice until they trusted an
-    // answer. `--mock` is how you go back deliberately.
-    let saved_llama = load().and_then(|n| n.llama_url);
-    let llama_url = if mock {
-        None
-    } else {
-        llama_url.or(saved_llama.clone())
-    };
-    if !mock && llama_url.is_some() && llama_url == saved_llama {
+    let saved = load();
+    let model_flag_given = model.is_some();
+    let launch = resolve_launch(saved.as_ref(), port, model_url, model, mock);
+
+    if launch.remembered {
+        let what = match &launch.model {
+            Some(m) => format!("{} at {}", m, launch.model_url.as_deref().unwrap_or_default()),
+            None => launch.model_url.clone().unwrap_or_default(),
+        };
         println!(
             "{} Using the model server from last time: {}. {} to go back to the mock.",
             "Info:".blue(),
-            llama_url.as_deref().unwrap_or_default().cyan(),
+            what.cyan(),
             "--mock".cyan()
         );
     }
+    if model_flag_given && launch.model_url.is_none() {
+        println!(
+            "{} A model name was given but no server is configured to ask for it.\n  Run {} or pass {} as well.",
+            "Warning:".yellow(),
+            "knaix local setup".cyan(),
+            "--model-url".cyan()
+        );
+    }
 
-    let port = port.unwrap_or(DEFAULT_PORT);
     // Keep the instance id across restarts, or everything already ingested
     // becomes unreachable under a new one.
-    let instance_id = load()
+    let instance_id = saved
         .map(|n| n.instance_id)
         .unwrap_or_else(new_instance_id);
 
-    let port_map = format!("{}:8080", port);
+    let port_map = format!("{}:8080", launch.port);
     let volume_map = format!("{}:/data", VOLUME);
     let bound = format!("KB_INSTANCE_ID={}", instance_id);
     let mut args: Vec<String> = vec![
@@ -276,7 +335,7 @@ pub async fn up(
         args.push(arg.to_string());
     }
 
-    match &llama_url {
+    match &launch.model_url {
         // A real model, if one is being served on this machine.
         Some(url) => {
             let (reachable, rewritten) = reachable_from_container(url);
@@ -299,7 +358,7 @@ pub async fn up(
             // and vLLM route on it and refuse a name they do not host. Sending
             // the wrong one fails at the first question rather than at startup,
             // which is the worst time to find out.
-            if let Some(model) = &llama_model {
+            if let Some(model) = &launch.model {
                 args.push("-e".into());
                 args.push(format!("LLAMA_MODEL_ID={}", model));
             }
@@ -318,11 +377,11 @@ pub async fn up(
     docker(&arg_refs).map_err(|e| anyhow!("Could not start the local node: {}", e))?;
 
     let node = LocalNode {
-        port,
+        port: launch.port,
         instance_id,
         image: tag,
-        llama_url: llama_url.clone(),
-        llama_model: llama_model.clone(),
+        model_url: launch.model_url.clone(),
+        model: launch.model.clone(),
     };
     save(&node)?;
 
@@ -333,12 +392,31 @@ pub async fn up(
         "✓".green(),
         node.base_url().cyan()
     );
-    if llama_url.is_none() {
-        println!(
-            "  {} No model is configured, so answers come from the deterministic mock.\n  Retrieval and citations are real; pass {} to use a local model.",
-            "Note:".blue(),
-            "--llama-url".cyan()
-        );
+    if launch.model_url.is_none() {
+        if mock {
+            println!(
+                "  {} The deterministic mock answers, as asked. {} when you want a model again.",
+                "Note:".blue(),
+                "knaix local setup".cyan()
+            );
+        } else {
+            // Worth one probe: someone with a model server already running is
+            // a single command away from real answers.
+            match crate::model_server::discover(None).await.first() {
+                Some(s) => println!(
+                    "  {} No model is configured, so answers come from the deterministic mock.\n  {} is running at {}; {} to answer with it.",
+                    "Note:".blue(),
+                    s.label,
+                    s.url.cyan(),
+                    "knaix local setup".cyan()
+                ),
+                None => println!(
+                    "  {} No model is configured, so answers come from the deterministic mock.\n  Retrieval and citations are real; {} picks a model to answer.",
+                    "Note:".blue(),
+                    "knaix local setup".cyan()
+                ),
+            }
+        }
     }
     println!("\n  Try it:");
     println!("    {}", "knaix upload -n local ./README.md".cyan());
@@ -352,6 +430,212 @@ pub async fn up(
         "# make it the default for every command".dimmed()
     );
     Ok(())
+}
+
+/// `knaix local setup` -- choose what answers, by looking rather than asking.
+///
+/// Probes the ports the common stacks listen on, lists the models the chosen
+/// server actually hosts, and remembers the pick. Every choice offered is one
+/// that answered a request seconds ago, so the failure mode of a typed URL
+/// and model name -- a 404 at the first question -- is off the table.
+pub async fn setup() -> Result<()> {
+    use crossterm::{cursor, execute};
+    use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input, Select};
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(anyhow!(
+            "Setup is interactive. In a script, pass --model-url and --model to 'knaix local up' instead."
+        ));
+    }
+
+    let saved = load();
+    println!(
+        "{} Looking for model servers on this machine...",
+        "Info:".blue()
+    );
+    let found =
+        crate::model_server::discover(saved.as_ref().and_then(|n| n.model_url.clone())).await;
+
+    if found.is_empty() {
+        println!(
+            "  None answering on the usual ports: Ollama (11434), LM Studio (1234), vLLM (8000), llama-server (8081)."
+        );
+    }
+
+    let mut items: Vec<String> = found
+        .iter()
+        .map(|s| {
+            let count = match s.models.len() {
+                0 => "no models pulled".to_string(),
+                1 => "1 model".to_string(),
+                n => format!("{} models", n),
+            };
+            format!("{} at {} ({})", s.label, s.url, count)
+        })
+        .collect();
+    let manual_idx = items.len();
+    items.push("A server somewhere else...".to_string());
+    let mock_idx = items.len();
+    items.push("No model: the deterministic mock (retrieval and citations stay real)".to_string());
+
+    // Land the cursor on what is already chosen, so Enter changes nothing.
+    let default = saved
+        .as_ref()
+        .and_then(|n| n.model_url.as_deref())
+        .and_then(|u| found.iter().position(|s| s.url == u))
+        .unwrap_or(0);
+
+    let _ = execute!(std::io::stderr(), cursor::Hide);
+    let pick = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What should answer?")
+        .items(&items)
+        .default(default)
+        .interact_opt()
+        .unwrap_or(None);
+    let _ = execute!(std::io::stderr(), cursor::Show);
+
+    let Some(pick) = pick else {
+        println!("{} Nothing changed.", "Info:".blue());
+        return Ok(());
+    };
+
+    if pick == mock_idx {
+        let node = remember_choice(saved, None, None)?;
+        println!(
+            "\n{} The deterministic mock answers. Retrieval and citations stay real.",
+            "✓".green()
+        );
+        return offer_restart(&node).await;
+    }
+
+    let (url, models) = if pick == manual_idx {
+        let raw: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Server URL (the base, e.g. http://192.168.1.50:11434)")
+            .interact_text()?;
+        let url = raw.trim().trim_end_matches('/').to_string();
+        let label = crate::model_server::label_for(&url);
+        match crate::model_server::probe(&url, label, std::time::Duration::from_secs(2)).await {
+            Some(s) => (s.url, s.models),
+            None => {
+                // Maybe it is not running yet; refusing to save would make
+                // setup unusable for a server someone is about to start.
+                let keep = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Nothing answered there. Remember it anyway?")
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                if !keep {
+                    println!("{} Nothing changed.", "Info:".blue());
+                    return Ok(());
+                }
+                (url, Vec::new())
+            }
+        }
+    } else {
+        let s = &found[pick];
+        (s.url.clone(), s.models.clone())
+    };
+
+    let model = match models.len() {
+        0 => {
+            let name: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Model to request (Enter for none; llama-server ignores the name)")
+                .allow_empty(true)
+                .interact_text()?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        }
+        1 => {
+            println!("{} One model hosted: {}.", "Info:".blue(), models[0].cyan());
+            Some(models[0].clone())
+        }
+        _ => {
+            let current = saved
+                .as_ref()
+                .and_then(|n| n.model.as_deref())
+                .and_then(|m| models.iter().position(|x| x == m))
+                .unwrap_or(0);
+            let _ = execute!(std::io::stderr(), cursor::Hide);
+            let choice = FuzzySelect::with_theme(&ColorfulTheme::default())
+                .with_prompt("Which model?")
+                .items(&models)
+                .default(current)
+                .interact_opt()
+                .unwrap_or(None);
+            let _ = execute!(std::io::stderr(), cursor::Show);
+            let Some(i) = choice else {
+                println!("{} Nothing changed.", "Info:".blue());
+                return Ok(());
+            };
+            Some(models[i].clone())
+        }
+    };
+
+    let node = remember_choice(saved, Some(url.clone()), model.clone())?;
+    match &model {
+        Some(m) => println!("\n{} {} at {} will answer.", "✓".green(), m.cyan(), url.cyan()),
+        None => println!("\n{} The model at {} will answer.", "✓".green(), url.cyan()),
+    }
+    offer_restart(&node).await
+}
+
+/// Record the choice, creating state if the node has never been started.
+fn remember_choice(
+    saved: Option<LocalNode>,
+    model_url: Option<String>,
+    model: Option<String>,
+) -> Result<LocalNode> {
+    let mut node = saved.unwrap_or_else(|| LocalNode {
+        port: DEFAULT_PORT,
+        instance_id: new_instance_id(),
+        image: image(),
+        model_url: None,
+        model: None,
+    });
+    node.model_url = model_url;
+    node.model = model;
+    save(&node)?;
+    Ok(node)
+}
+
+/// Offer to restart a running node, since the choice only takes effect on the
+/// next start and a node that keeps answering with the old one looks broken.
+async fn offer_restart(node: &LocalNode) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+
+    if container_state().as_deref() != Some("running") {
+        println!("  Start it with {}.", "knaix local up".cyan());
+        return Ok(());
+    }
+    let go = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("The node is running with the previous choice. Restart it now?")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+    if !go {
+        println!(
+            "  It keeps answering with the previous choice until {}.",
+            "knaix local up".cyan()
+        );
+        return Ok(());
+    }
+    docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+    // The choice is passed explicitly, not left to memory: it silences the
+    // "from last time" line, and mock=true when the mock was just chosen
+    // silences the hint that suggests undoing what the user did.
+    up(
+        None,
+        node.model_url.clone(),
+        node.model.clone(),
+        node.model_url.is_none(),
+        false,
+    )
+    .await
 }
 
 fn new_instance_id() -> String {
@@ -465,7 +749,8 @@ pub async fn status(json: bool) -> Result<()> {
                 "healthy": healthy,
                 "state": state,
                 "url": node.as_ref().map(|n| n.base_url()),
-                "llamaUrl": node.as_ref().and_then(|n| n.llama_url.clone()),
+                "modelUrl": node.as_ref().and_then(|n| n.model_url.clone()),
+                "model": node.as_ref().and_then(|n| n.model.clone()),
                 "instanceId": node.as_ref().map(|n| n.instance_id.clone()),
                 "image": node.as_ref().map(|n| n.image.clone()),
             }))?
@@ -507,8 +792,8 @@ pub async fn status(json: bool) -> Result<()> {
         // mock shows up only in the wording, so it has to be stated somewhere.
         table.add_row(vec![
             "Answers".dimmed().to_string(),
-            match &n.llama_url {
-                Some(url) => match &n.llama_model {
+            match &n.model_url {
+                Some(url) => match &n.model {
                     Some(model) => format!("{} at {}", model, url).green().to_string(),
                     None => format!("model at {}", url).green().to_string(),
                 },
@@ -597,36 +882,116 @@ mod tests {
 
     #[test]
     fn the_local_node_is_addressed_on_loopback() {
-        let node = LocalNode {
-            port: 9123,
-            instance_id: "x".into(),
-            image: "img".into(),
-            llama_url: None,
-            llama_model: None,
-        };
+        let node = saved(9123, None, None);
         assert_eq!(node.base_url(), "http://127.0.0.1:9123");
     }
 
     #[test]
-    fn the_model_name_is_remembered_with_its_server() {
-        // Ollama and vLLM route on the model name and refuse one they do not
-        // host, so losing it turns every question into a 404 after a startup
-        // that looked fine.
+    fn state_written_under_the_old_llama_keys_still_loads() {
+        // Anyone upgrading has a local.json written under the old names.
+        // Failing to read it would silently drop them back to the mock.
         let json = r#"{"port":8080,"instance_id":"a","image":"i","llama_url":"http://h:11434","llama_model":"qwen3.5:latest"}"#;
         let node: LocalNode = serde_json::from_str(json).unwrap();
-        assert_eq!(node.llama_model.as_deref(), Some("qwen3.5:latest"));
-        assert_eq!(node.llama_url.as_deref(), Some("http://h:11434"));
+        assert_eq!(node.model.as_deref(), Some("qwen3.5:latest"));
+        assert_eq!(node.model_url.as_deref(), Some("http://h:11434"));
+    }
+
+    #[test]
+    fn the_model_and_its_server_survive_a_round_trip() {
+        let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let json = serde_json::to_string(&node).unwrap();
+        let back: LocalNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model_url.as_deref(), Some("http://h:11434"));
+        assert_eq!(back.model.as_deref(), Some("qwen3.5:latest"));
     }
 
     #[test]
     fn state_written_before_the_model_url_existed_still_loads() {
-        // Someone upgrading has a local.json with no llama_url in it. Failing
-        // to parse would look like the node was never started.
+        // Someone upgrading has a local.json with no model server in it.
+        // Failing to parse would look like the node was never started.
         let old = r#"{"port":8080,"instance_id":"abc","image":"img"}"#;
         let node: LocalNode = serde_json::from_str(old).expect("old state must still parse");
         assert_eq!(node.port, 8080);
-        assert_eq!(node.llama_url, None);
-        assert_eq!(node.llama_model, None);
+        assert_eq!(node.model_url, None);
+        assert_eq!(node.model, None);
+    }
+
+    fn saved(port: u16, url: Option<&str>, model: Option<&str>) -> LocalNode {
+        LocalNode {
+            port,
+            instance_id: "x".into(),
+            image: "img".into(),
+            model_url: url.map(String::from),
+            model: model.map(String::from),
+        }
+    }
+
+    #[test]
+    fn a_bare_up_reuses_the_server_and_its_model() {
+        // The model name is half of the choice: reusing the server but
+        // dropping the name turns every Ollama question into a 404.
+        let node = saved(9000, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let launch = resolve_launch(Some(&node), None, None, None, false);
+        assert_eq!(launch.model_url.as_deref(), Some("http://h:11434"));
+        assert_eq!(launch.model.as_deref(), Some("qwen3.5:latest"));
+        assert_eq!(launch.port, 9000, "the port is part of what was chosen");
+        assert!(launch.remembered);
+    }
+
+    #[test]
+    fn a_different_server_does_not_inherit_the_old_model_name() {
+        // Model names are the server's, not the machine's: qwen3.5:latest
+        // means nothing to a vLLM that hosts something else.
+        let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let launch = resolve_launch(
+            Some(&node),
+            None,
+            Some("http://h:8000".into()),
+            None,
+            false,
+        );
+        assert_eq!(launch.model_url.as_deref(), Some("http://h:8000"));
+        assert_eq!(launch.model, None);
+        assert!(!launch.remembered);
+    }
+
+    #[test]
+    fn restating_the_same_server_keeps_its_model() {
+        let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let launch = resolve_launch(
+            Some(&node),
+            None,
+            Some("http://h:11434".into()),
+            None,
+            false,
+        );
+        assert_eq!(launch.model.as_deref(), Some("qwen3.5:latest"));
+    }
+
+    #[test]
+    fn an_explicit_model_beats_the_remembered_one() {
+        let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let launch =
+            resolve_launch(Some(&node), None, None, Some("phi4:latest".into()), false);
+        assert_eq!(launch.model.as_deref(), Some("phi4:latest"));
+        assert_eq!(launch.model_url.as_deref(), Some("http://h:11434"));
+    }
+
+    #[test]
+    fn mock_clears_the_whole_choice_deliberately() {
+        let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
+        let launch = resolve_launch(Some(&node), None, None, None, true);
+        assert_eq!(launch.model_url, None);
+        assert_eq!(launch.model, None);
+        assert!(!launch.remembered, "asked for, not reused");
+    }
+
+    #[test]
+    fn a_first_start_defaults_quietly() {
+        let launch = resolve_launch(None, None, None, None, false);
+        assert_eq!(launch.port, DEFAULT_PORT);
+        assert_eq!(launch.model_url, None);
+        assert!(!launch.remembered);
     }
 
     #[test]

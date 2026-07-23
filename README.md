@@ -44,9 +44,19 @@ knaix local status       # is it running and healthy
 knaix local down         # stop it; the store is kept
 ```
 
-Answers come from a deterministic mock unless you serve a model yourself and
-pass `--llama-url`. Retrieval, reranking and citations are real either way, so
-the part worth evaluating is the part that works out of the box.
+Answers come from a deterministic mock until you point the node at a model.
+`knaix local setup` finds the servers running on your machine (Ollama,
+LM Studio, vLLM, llama-server), lists the models they actually host, and
+remembers your pick:
+
+```bash
+knaix local setup        # pick a server and model interactively
+knaix local up --model-url http://localhost:11434 -m qwen3.5:latest   # or say it once by hand
+```
+
+Both are remembered, so later starts are just `knaix local up`; `--mock` goes
+back to the mock deliberately. Retrieval, reranking and citations are real
+either way, so the part worth evaluating is the part that works out of the box.
 
 ## Installation
 
