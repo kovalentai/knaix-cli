@@ -63,6 +63,104 @@ pub struct ChatAnswer {
     pub model: Option<String>,
 }
 
+/// One prior turn of a conversation, sent to the local node so a follow-up
+/// ("what about the exceptions?") is answered in the context of what came
+/// before rather than as a fresh, contextless question.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// How long an answer the local node is asked for. The difference is only in
+/// the system prompt; retrieval and citations are the same at every level.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Verbosity {
+    /// One or two sentences, the essential point only.
+    Brief,
+    /// A direct answer plus the supporting detail worth having.
+    #[default]
+    Normal,
+    /// Everything the context supports, organized.
+    Detailed,
+}
+
+/// The grounding instructions the local node answers under when a command does
+/// not supply its own. The direct `/api/query/answer` route applies no default
+/// of its own, so without this the model is handed an empty system prompt and
+/// tends to return a single terse line. This lives on the CLI because it is the
+/// one path that drives the node directly; the hosted path is prompted by the
+/// control plane in front of it. The `shape` clause is the only part that moves
+/// with verbosity; grounding, citation, and formatting rules are constant.
+fn answer_system(verbosity: Verbosity) -> String {
+    let grounding =
+        "You are a helpful assistant answering questions from a private knowledge base. \
+Answer using only the provided context. Cite the passages you draw on with their [n] markers. \
+If the context does not contain the answer, say so plainly rather than guessing.";
+    let shape = match verbosity {
+        Verbosity::Brief => "Answer in one or two sentences, the essential point only.",
+        Verbosity::Normal => {
+            "Lead with a direct answer, then add the supporting detail, conditions, and exceptions the context contains."
+        }
+        Verbosity::Detailed => {
+            "Give a thorough answer: the direct answer, then all the relevant detail, conditions, exceptions, and caveats the context contains, organized clearly."
+        }
+    };
+    let formatting =
+        "Keep formatting simple for a terminal: short paragraphs, and at most a single flat \
+level of '- ' bullets with no nesting and no indented lines.";
+    format!("{grounding} {shape} {formatting}")
+}
+
+/// Char budget for the REPL transcript sent as history. Roughly 1500 tokens, so
+/// a long session does not grow the request body without bound; the node caps
+/// the turn count on its side as well. Whole exchanges are dropped, oldest
+/// first, so the model never sees a half a turn.
+pub const HISTORY_CHAR_BUDGET: usize = 6000;
+
+fn history_chars(history: &[ChatTurn]) -> usize {
+    history.iter().map(|t| t.content.len()).sum()
+}
+
+/// Drop whole oldest user/assistant pairs until the transcript fits the budget,
+/// always keeping at least the most recent exchange so a follow-up still has its
+/// immediate context even when a single turn is unusually long.
+fn trim_history(history: &mut Vec<ChatTurn>, char_budget: usize) {
+    while history.len() > 2 && history_chars(history) > char_budget {
+        history.drain(0..2);
+    }
+}
+
+/// Build the body for the local answer route in one place, so the system prompt
+/// and history it sends can be checked by a test without a live node.
+fn build_local_answer_body(
+    instance_id: &str,
+    message: &str,
+    history: &[ChatTurn],
+    verbosity: Verbosity,
+) -> serde_json::Value {
+    serde_json::json!({
+        "instance_id": instance_id,
+        "query": message,
+        "system": answer_system(verbosity),
+        "history": history,
+    })
+}
+
+/// Append a finished exchange to a running transcript, then trim the oldest
+/// turns so the history stays within `char_budget`.
+pub fn record_turn(history: &mut Vec<ChatTurn>, user: &str, assistant: &str, char_budget: usize) {
+    history.push(ChatTurn {
+        role: "user".to_string(),
+        content: user.to_string(),
+    });
+    history.push(ChatTurn {
+        role: "assistant".to_string(),
+        content: assistant.to_string(),
+    });
+    trim_history(history, char_budget);
+}
+
 /// One grounded passage the node returned alongside an answer.
 #[derive(Deserialize, serde::Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -524,10 +622,25 @@ pub async fn chat(
     target: &Target,
     message: &str,
     stream_to_stdout: bool,
+    history: &[ChatTurn],
+    verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
-        return chat_local(ctx, base, instance_id, message, stream_to_stdout).await;
+        return chat_local(
+            ctx,
+            base,
+            instance_id,
+            message,
+            stream_to_stdout,
+            history,
+            verbosity,
+        )
+        .await;
     }
+    // The hosted path is prompted and, where supported, kept in session by the
+    // control plane; the history and verbosity that shape the local node's
+    // system prompt do not apply to it.
+    let _ = (history, verbosity);
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
@@ -592,6 +705,8 @@ async fn chat_local(
     instance_id: &str,
     message: &str,
     print: bool,
+    history: &[ChatTurn],
+    verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -611,7 +726,12 @@ async fn chat_local(
         // First question after a start can include a model server loading its
         // weights, which routinely outlasts the client's default timeout.
         .timeout(Duration::from_secs(300))
-        .json(&serde_json::json!({ "instance_id": instance_id, "query": message }))
+        .json(&build_local_answer_body(
+            instance_id,
+            message,
+            history,
+            verbosity,
+        ))
         .send()
         .await
         .inspect_err(|_| pb.finish_and_clear())
@@ -1823,6 +1943,80 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_local_answer_body_carries_the_system_prompt_and_history() {
+        // The route applies no default system prompt, so an empty one is what
+        // makes the model answer in a single terse line. The body must always
+        // carry grounding instructions and the turns so far.
+        let history = vec![
+            ChatTurn {
+                role: "user".into(),
+                content: "when are receipts due?".into(),
+            },
+            ChatTurn {
+                role: "assistant".into(),
+                content: "Within 30 days [1].".into(),
+            },
+        ];
+        let body = build_local_answer_body("abc", "and cabin class?", &history, Verbosity::Normal);
+        assert_eq!(body["instance_id"], "abc");
+        assert_eq!(body["query"], "and cabin class?");
+        let system = body["system"].as_str().unwrap();
+        assert!(!system.is_empty(), "system prompt must not be empty");
+        assert!(
+            system.contains("[n]"),
+            "the prompt should ask the model to cite: {system}"
+        );
+        assert_eq!(body["history"].as_array().unwrap().len(), 2);
+        assert_eq!(body["history"][0]["role"], "user");
+        assert_eq!(body["history"][1]["content"], "Within 30 days [1].");
+    }
+
+    #[test]
+    fn verbosity_changes_the_prompt_but_never_the_grounding_rules() {
+        let brief = answer_system(Verbosity::Brief);
+        let normal = answer_system(Verbosity::Normal);
+        let detailed = answer_system(Verbosity::Detailed);
+        // The three differ in the length instruction.
+        assert!(brief.contains("one or two sentences"));
+        assert!(detailed.contains("thorough"));
+        assert_ne!(brief, normal);
+        assert_ne!(normal, detailed);
+        // But every level still grounds and cites.
+        for s in [&brief, &normal, &detailed] {
+            assert!(s.contains("[n]"), "must ask for citations: {s}");
+            assert!(s.contains("only the provided context"), "must ground: {s}");
+        }
+    }
+
+    #[test]
+    fn record_turn_drops_whole_oldest_pairs_to_fit_the_budget() {
+        let mut history = Vec::new();
+        // Each turn is 10 chars of content; a 45-char budget holds two pairs
+        // (four turns, 40 chars) but not three.
+        for i in 0..10 {
+            record_turn(
+                &mut history,
+                &format!("qqqqq{i:04}"),
+                &format!("aaaaa{i:04}"),
+                45,
+            );
+        }
+        assert!(history_chars(&history) <= 45, "stays within budget");
+        assert_eq!(history.len(), 4, "two whole pairs kept");
+        assert_eq!(history[0].role, "user", "a pair opens on a user turn");
+        assert_eq!(history.last().unwrap().content, "aaaaa0009", "recent kept");
+    }
+
+    #[test]
+    fn record_turn_keeps_the_last_exchange_even_when_it_exceeds_the_budget() {
+        // A single very long turn must not trim itself to nothing, or a
+        // follow-up loses the context it was actually about.
+        let mut history = Vec::new();
+        record_turn(&mut history, &"x".repeat(500), &"y".repeat(500), 10);
+        assert_eq!(history.len(), 2, "the most recent pair is always kept");
+    }
 
     #[test]
     fn citation_markers_are_read_out_of_the_answer() {
