@@ -80,34 +80,156 @@ fn to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * idx(r) + 6 * idx(g) + idx(b)
 }
 
+/// Terminals that render true 24-bit colour, identified by `TERM_PROGRAM`.
+///
+/// An allowlist rather than a guess: a terminal that renders 24-bit colour and
+/// forgets to advertise it is common, and the failure is silent. `COLORTERM` is
+/// the only signal that is supposed to carry this, and plenty of capable
+/// terminals never set it.
+const TRUECOLOR_TERM_PROGRAMS: &[&str] = &[
+    "iTerm.app",
+    "WezTerm",
+    "vscode",
+    "Hyper",
+    "ghostty",
+    "Tabby",
+    "rio",
+    "WarpTerminal",
+];
+
+/// Terminals known to stop at 256 colours, identified by `TERM_PROGRAM`.
+///
+/// macOS Terminal.app is the one that matters here, and it is a genuine trap:
+/// it *parses* a 24-bit SGR sequence and approximates it to its own palette
+/// rather than ignoring it. So printing a truecolor gradient to it appears to
+/// work, which means the obvious "do I see distinct colours?" test cannot tell
+/// the two apart. Naming it explicitly means we emit what it actually renders
+/// rather than relying on it to quietly clean up after us.
+const ANSI256_TERM_PROGRAMS: &[&str] = &["Apple_Terminal"];
+
+/// `TERM` values that imply 24-bit colour on their own.
+const TRUECOLOR_TERMS: &[&str] = &["kitty", "alacritty", "wezterm", "contour", "foot", "ghostty"];
+
+/// The environment the decision is made from, captured so the decision itself
+/// is a pure function.
+///
+/// Reading the process environment inside the tests would make them race: env
+/// vars are process-global and `cargo test` runs threads in parallel, so one
+/// test's `set_var` lands in the middle of another's read. Passing the
+/// environment in means every branch below is testable and none of it is racy.
+pub struct TermEnv<'a> {
+    pub knaix_color: Option<&'a str>,
+    pub knaix_no_gradient: bool,
+    pub no_color: Option<&'a str>,
+    pub clicolor_force: Option<&'a str>,
+    pub colorterm: Option<&'a str>,
+    pub term: Option<&'a str>,
+    pub term_program: Option<&'a str>,
+    pub is_tty: bool,
+}
+
+/// Decide the colour level from a captured environment.
+pub fn level_for(env: &TermEnv) -> Level {
+    // An explicit answer wins over every heuristic below. Terminal detection is
+    // guesswork at the edges, so anyone in a setup we guess wrong about needs a
+    // way to say so that does not involve waiting for a release.
+    if let Some(forced) = env.knaix_color {
+        match forced.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "0" => return Level::None,
+            "16" | "ansi" | "basic" => return Level::Ansi16,
+            "256" | "ansi256" => return Level::Ansi256,
+            "truecolor" | "24bit" | "rgb" => return Level::TrueColor,
+            // An unrecognised value falls through rather than failing: a typo in
+            // an env var should not cost someone their output.
+            _ => {}
+        }
+    }
+
+    // Opt out of the gradient specifically, for a terminal background it reads
+    // badly against, without giving up colour altogether.
+    if env.knaix_no_gradient {
+        return Level::Ansi16;
+    }
+
+    // The NO_COLOR spec is "present and not an empty string". An empty value is
+    // not opting out, and treating it as though it were is a common bug.
+    if env.no_color.is_some_and(|v| !v.is_empty()) {
+        return Level::None;
+    }
+
+    // CLICOLOR_FORCE keeps colour on when output is redirected, which is what
+    // recording a demo through a pipe needs. Zero means "no force", not "off".
+    let forced_on = env
+        .clicolor_force
+        .is_some_and(|v| !v.is_empty() && v != "0");
+
+    if !env.is_tty && !forced_on {
+        return Level::None;
+    }
+
+    let term = env.term.unwrap_or("");
+    if term == "dumb" || (term.is_empty() && env.term_program.is_none()) {
+        return Level::None;
+    }
+
+    // The one signal that is actually meant to carry this.
+    if matches!(env.colorterm, Some("truecolor") | Some("24bit")) {
+        return Level::TrueColor;
+    }
+
+    // terminfo's convention for a direct-colour entry (xterm-direct, and so on).
+    // This previously mapped to 256, which was backwards: `-direct` is precisely
+    // the name for 24-bit.
+    if term.contains("direct") {
+        return Level::TrueColor;
+    }
+
+    if let Some(program) = env.term_program {
+        if TRUECOLOR_TERM_PROGRAMS.iter().any(|p| p == &program) {
+            return Level::TrueColor;
+        }
+        if ANSI256_TERM_PROGRAMS.iter().any(|p| p == &program) {
+            return Level::Ansi256;
+        }
+    }
+
+    if TRUECOLOR_TERMS.iter().any(|t| term.contains(t)) {
+        return Level::TrueColor;
+    }
+
+    // Inside tmux or screen, 24-bit only reaches the outer terminal if the
+    // multiplexer was configured to pass it through, and nothing in the
+    // environment says whether it was. Stay at 256: the gradient bands a little
+    // and still reads, where guessing wrong produces garbage.
+    if term.contains("256color") || term.starts_with("screen") || term.starts_with("tmux") {
+        return Level::Ansi256;
+    }
+
+    Level::Ansi16
+}
+
 /// What the current terminal supports.
 ///
 /// Deliberately checks stdout rather than stderr: the wordmark appears in
 /// output a user reads, and `knaix ... | grep` must get clean bytes.
 pub fn level() -> Level {
-    // An explicit opt-out, for a terminal whose background the gradient reads
-    // badly against. Honoured before anything else.
-    if std::env::var_os("KNAIX_NO_GRADIENT").is_some() {
-        return Level::Ansi16;
-    }
-    if std::env::var_os("NO_COLOR").is_some() {
-        return Level::None;
-    }
-    if !std::io::stdout().is_terminal() {
-        return Level::None;
-    }
+    let knaix_color = std::env::var("KNAIX_COLOR").ok();
+    let no_color = std::env::var("NO_COLOR").ok();
+    let clicolor_force = std::env::var("CLICOLOR_FORCE").ok();
+    let colorterm = std::env::var("COLORTERM").ok();
+    let term = std::env::var("TERM").ok();
+    let term_program = std::env::var("TERM_PROGRAM").ok();
 
-    match std::env::var("COLORTERM").as_deref() {
-        Ok("truecolor") | Ok("24bit") => return Level::TrueColor,
-        _ => {}
-    }
-
-    match std::env::var("TERM") {
-        Err(_) => Level::None,
-        Ok(term) if term.is_empty() || term == "dumb" => Level::None,
-        Ok(term) if term.contains("256color") || term.contains("direct") => Level::Ansi256,
-        Ok(_) => Level::Ansi16,
-    }
+    level_for(&TermEnv {
+        knaix_color: knaix_color.as_deref(),
+        knaix_no_gradient: std::env::var_os("KNAIX_NO_GRADIENT").is_some(),
+        no_color: no_color.as_deref(),
+        clicolor_force: clicolor_force.as_deref(),
+        colorterm: colorterm.as_deref(),
+        term: term.as_deref(),
+        term_program: term_program.as_deref(),
+        is_tty: std::io::stdout().is_terminal(),
+    })
 }
 
 const RESET: &str = "\x1b[0m";
@@ -238,6 +360,132 @@ mod tests {
         assert_eq!(gradient("", Level::TrueColor), "");
         let one = gradient("k", Level::TrueColor);
         assert!(one.contains("\x1b[38;2;253;164;60mk"));
+    }
+
+    /// A terminal that is a TTY and says nothing else about itself.
+    fn env() -> TermEnv<'static> {
+        TermEnv {
+            knaix_color: None,
+            knaix_no_gradient: false,
+            no_color: None,
+            clicolor_force: None,
+            colorterm: None,
+            term: Some("xterm"),
+            term_program: None,
+            is_tty: true,
+        }
+    }
+
+    #[test]
+    fn not_a_tty_emits_nothing() {
+        let e = TermEnv { is_tty: false, ..env() };
+        assert_eq!(level_for(&e), Level::None);
+    }
+
+    #[test]
+    fn clicolor_force_keeps_colour_through_a_pipe() {
+        let e = TermEnv {
+            is_tty: false,
+            clicolor_force: Some("1"),
+            colorterm: Some("truecolor"),
+            ..env()
+        };
+        assert_eq!(level_for(&e), Level::TrueColor);
+        // Zero is "no force", not "force off".
+        let e = TermEnv { is_tty: false, clicolor_force: Some("0"), ..env() };
+        assert_eq!(level_for(&e), Level::None);
+    }
+
+    #[test]
+    fn empty_no_color_does_not_opt_out() {
+        // The spec is "present and not an empty string".
+        let e = TermEnv { no_color: Some(""), colorterm: Some("truecolor"), ..env() };
+        assert_eq!(level_for(&e), Level::TrueColor);
+        let e = TermEnv { no_color: Some("1"), colorterm: Some("truecolor"), ..env() };
+        assert_eq!(level_for(&e), Level::None);
+    }
+
+    #[test]
+    fn colorterm_is_honoured() {
+        for v in ["truecolor", "24bit"] {
+            let e = TermEnv { colorterm: Some(v), ..env() };
+            assert_eq!(level_for(&e), Level::TrueColor, "COLORTERM={v}");
+        }
+        // A terminal name in COLORTERM does not mean 24-bit.
+        let e = TermEnv { colorterm: Some("gnome-terminal"), ..env() };
+        assert_eq!(level_for(&e), Level::Ansi16);
+    }
+
+    #[test]
+    fn direct_terminfo_entries_are_truecolor() {
+        // This is the branch that was backwards: `-direct` means 24-bit.
+        let e = TermEnv { term: Some("xterm-direct"), ..env() };
+        assert_eq!(level_for(&e), Level::TrueColor);
+    }
+
+    #[test]
+    fn known_terminals_are_recognised_without_colorterm() {
+        for p in TRUECOLOR_TERM_PROGRAMS {
+            let e = TermEnv { term_program: Some(p), term: Some("xterm-256color"), ..env() };
+            assert_eq!(level_for(&e), Level::TrueColor, "TERM_PROGRAM={p}");
+        }
+        for t in ["xterm-kitty", "alacritty", "xterm-ghostty", "foot"] {
+            let e = TermEnv { term: Some(t), ..env() };
+            assert_eq!(level_for(&e), Level::TrueColor, "TERM={t}");
+        }
+    }
+
+    #[test]
+    fn apple_terminal_stops_at_256() {
+        // It approximates a 24-bit sequence to its own palette rather than
+        // ignoring it, so "I can see distinct colours" does not prove 24-bit.
+        // Emit what it actually renders.
+        let e = TermEnv {
+            term_program: Some("Apple_Terminal"),
+            term: Some("xterm-256color"),
+            ..env()
+        };
+        assert_eq!(level_for(&e), Level::Ansi256);
+    }
+
+    #[test]
+    fn multiplexers_stay_conservative() {
+        for t in ["screen-256color", "tmux-256color", "screen"] {
+            let e = TermEnv { term: Some(t), ..env() };
+            assert_eq!(level_for(&e), Level::Ansi256, "TERM={t}");
+        }
+        // Unless the multiplexer was configured to pass 24-bit through and says so.
+        let e = TermEnv { term: Some("tmux-256color"), colorterm: Some("truecolor"), ..env() };
+        assert_eq!(level_for(&e), Level::TrueColor);
+    }
+
+    #[test]
+    fn dumb_and_unset_terminals_emit_nothing() {
+        assert_eq!(level_for(&TermEnv { term: Some("dumb"), ..env() }), Level::None);
+        assert_eq!(level_for(&TermEnv { term: None, ..env() }), Level::None);
+    }
+
+    #[test]
+    fn explicit_override_beats_every_heuristic() {
+        for (v, want) in [
+            ("none", Level::None),
+            ("16", Level::Ansi16),
+            ("256", Level::Ansi256),
+            ("truecolor", Level::TrueColor),
+            ("TrueColor", Level::TrueColor),
+        ] {
+            let e = TermEnv { knaix_color: Some(v), term: Some("dumb"), ..env() };
+            assert_eq!(level_for(&e), want, "KNAIX_COLOR={v}");
+        }
+        // A typo falls through to detection rather than costing someone output.
+        let e = TermEnv { knaix_color: Some("nonsense"), colorterm: Some("truecolor"), ..env() };
+        assert_eq!(level_for(&e), Level::TrueColor);
+    }
+
+    #[test]
+    fn no_gradient_keeps_colour_but_drops_the_ramp() {
+        let e = TermEnv { knaix_no_gradient: true, colorterm: Some("truecolor"), ..env() };
+        assert_eq!(level_for(&e), Level::Ansi16);
     }
 
     #[test]
