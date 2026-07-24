@@ -1,3 +1,4 @@
+mod brand;
 mod config;
 mod local;
 mod login;
@@ -269,7 +270,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.version {
-        println!("knaix {}", env!("CARGO_PKG_VERSION"));
+        println!("{} {}", brand::wordmark(), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 

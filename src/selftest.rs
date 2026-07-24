@@ -615,7 +615,7 @@ async fn cleanup(
                 "{} Keeping {} self-test document(s) on the node (--keep). Remove them with {}.",
                 "Info:".blue(),
                 document_ids.len(),
-                "knaix selftest --sweep".cyan()
+                crate::brand::cmd("selftest --sweep")
             );
         }
         return;
