@@ -109,8 +109,8 @@ async fn handle_callback(
     println!("  Welcome, {}", params.username.cyan());
     println!(
         "  {} lists your nodes; {} makes one the default.",
-        "knaix list".cyan(),
-        "knaix use <node-id>".cyan()
+        crate::brand::cmd("list"),
+        crate::brand::cmd("use <node-id>")
     );
 
     *state.completed.lock().unwrap() = true;

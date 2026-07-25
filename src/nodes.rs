@@ -401,8 +401,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
             println!(
                 "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
                 "Info:".blue(),
-                "knaix up".cyan(),
-                "knaix local up".cyan()
+                crate::brand::cmd("up"),
+                crate::brand::cmd("local up")
             );
         } else {
             println!("\n{}", "Your Kovalent Nodes:".bold().underline());
@@ -496,8 +496,8 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         println!(
             "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
             "Info:".blue(),
-            "knaix up".cyan(),
-            "knaix local up".cyan()
+            crate::brand::cmd("up"),
+            crate::brand::cmd("local up")
         );
         return Ok(None);
     }
@@ -1858,12 +1858,12 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
                 match instance_id {
                     Some(id) => println!(
                         "  Boot takes a few minutes. Check on it with {} or {}.",
-                        "knaix list".cyan(),
-                        format!("knaix metrics {}", id).cyan()
+                        crate::brand::cmd("list"),
+                        crate::brand::cmd(&format!("metrics {}", id))
                     ),
                     None => println!(
                         "  Boot takes a few minutes. Run {} to see it come up.",
-                        "knaix list".cyan()
+                        crate::brand::cmd("list")
                     ),
                 }
             } else {

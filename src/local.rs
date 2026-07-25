@@ -275,9 +275,9 @@ pub async fn up(
                 "{} Local node already running on {}. Model flags only apply at startup, so it keeps its current answer source.\n  Run {} then {} to apply this, or {} to change it and restart in place.",
                 "Warning:".yellow(),
                 node.base_url().cyan(),
-                "knaix local down".cyan(),
-                "knaix local up".cyan(),
-                "knaix local setup".cyan()
+                crate::brand::cmd("local down"),
+                crate::brand::cmd("local up"),
+                crate::brand::cmd("local setup")
             );
         } else {
             println!(
@@ -352,7 +352,7 @@ pub async fn up(
         println!(
             "{} A model name was given but no server is configured to ask for it.\n  Run {} or pass {} as well.",
             "Warning:".yellow(),
-            "knaix local setup".cyan(),
+            crate::brand::cmd("local setup"),
             "--model-url".cyan()
         );
     }
@@ -464,7 +464,7 @@ pub async fn up(
             println!(
                 "  {} The deterministic mock answers, as asked. {} when you want a model again.",
                 "Note:".blue(),
-                "knaix local setup".cyan()
+                crate::brand::cmd("local setup")
             );
         } else {
             // Worth one probe: someone with a model server already running is
@@ -475,12 +475,12 @@ pub async fn up(
                     "Note:".blue(),
                     s.label,
                     s.url.cyan(),
-                    "knaix local setup".cyan()
+                    crate::brand::cmd("local setup")
                 ),
                 None => println!(
                     "  {} No model is configured, so answers come from the deterministic mock.\n  Retrieval and citations are real; {} picks a model to answer.",
                     "Note:".blue(),
-                    "knaix local setup".cyan()
+                    crate::brand::cmd("local setup")
                 ),
             }
         }
@@ -509,7 +509,10 @@ pub async fn up(
         ""
     };
     println!("\n  Try it:");
-    println!("    {}", format!("knaix upload {}./README.md", flag).cyan());
+    println!(
+        "    {}",
+        crate::brand::cmd(&format!("upload {}./README.md", flag))
+    );
     println!(
         "    {}",
         format!("knaix chat {}\"what is this about?\"", flag).cyan()
@@ -717,10 +720,10 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
         if running {
             println!(
                 "  It keeps answering with the previous choice until {}.",
-                "knaix local up".cyan()
+                crate::brand::cmd("local up")
             );
         } else {
-            println!("  Start it with {}.", "knaix local up".cyan());
+            println!("  Start it with {}.", crate::brand::cmd("local up"));
         }
         return Ok(());
     }
@@ -876,7 +879,7 @@ pub fn down(purge: bool) -> Result<()> {
         println!(
             "  Its store is kept in the {} volume; {} to delete it.",
             VOLUME.cyan(),
-            "knaix local down --purge".cyan()
+            crate::brand::cmd("local down --purge")
         );
     }
     Ok(())
@@ -978,7 +981,7 @@ pub async fn status(json: bool) -> Result<()> {
     println!("{table}");
 
     if !running {
-        println!("  Start it with {}.\n", "knaix local up".cyan());
+        println!("  Start it with {}.\n", crate::brand::cmd("local up"));
     } else {
         println!();
     }
@@ -1051,7 +1054,7 @@ pub async fn connect(daemon: bool, worker: bool) -> Result<()> {
         println!(
             "  Relaying metrics and logs in the background (pid {}). {} stops it.",
             pid,
-            "knaix local disconnect".cyan()
+            crate::brand::cmd("local disconnect")
         );
         return Ok(());
     }
@@ -1124,7 +1127,7 @@ async fn connect_snapshot_inner() {
     let _ = push_telemetry(&ctx, &client_id, sample, logs).await;
     println!(
         "  Your local node is now connected; see it in the dashboard. {} streams live telemetry.",
-        "knaix local connect".cyan()
+        crate::brand::cmd("local connect")
     );
 }
 

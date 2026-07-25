@@ -58,8 +58,9 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     let skin = MadSkin::default_dark();
 
     println!(
-        "\n{} Chatting with {}. {} lists commands; {} ends the session.",
+        "\n{} {} session with {}. {} lists commands; {} ends the session.",
         "●".green(),
+        crate::brand::wordmark(),
         node_id.cyan().bold(),
         "/help".cyan(),
         "/exit".cyan()
