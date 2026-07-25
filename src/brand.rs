@@ -266,9 +266,38 @@ fn gradient(text: &str, lvl: Level) -> String {
     }
 }
 
+/// The word the gradient is for.
+pub const WORDMARK: &str = "knaix";
+
 /// The `knaix` wordmark in the brand gradient.
 pub fn wordmark() -> String {
-    gradient("knaix", level())
+    gradient(WORDMARK, level())
+}
+
+/// Sample the ramp once per letter of the wordmark.
+fn ramp() -> Vec<(u8, u8, u8)> {
+    let n = WORDMARK.chars().count();
+    let last = n.saturating_sub(1);
+    (0..n)
+        .map(|i| sample(if last == 0 { 0.0 } else { i as f32 / last as f32 }))
+        .collect()
+}
+
+/// The wordmark colours as `#RRGGBB`, for a shell integration to embed.
+///
+/// Exposed so the shell snippet is generated from this stop list rather than
+/// carrying its own copy. A copy in a dotfile is a copy that goes stale the
+/// first time the brand gradient is retuned, and nobody ever goes back for it.
+pub fn ramp_hex() -> Vec<String> {
+    ramp()
+        .into_iter()
+        .map(|(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}"))
+        .collect()
+}
+
+/// The wordmark colours as xterm-256 indices, for terminals without 24-bit.
+pub fn ramp_256() -> Vec<u8> {
+    ramp().into_iter().map(|(r, g, b)| to_ansi256(r, g, b)).collect()
 }
 
 /// A command hint: the wordmark in the gradient, the rest in cyan.

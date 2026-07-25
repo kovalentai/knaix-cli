@@ -5,6 +5,7 @@ mod login;
 mod model_server;
 mod nodes;
 mod repl;
+mod shell;
 mod selftest;
 mod update;
 mod upload_filter;
@@ -169,6 +170,21 @@ enum Commands {
         /// Remove self-test documents left behind by an earlier interrupted run
         #[clap(long)]
         sweep: bool,
+    },
+
+    /// Print the shell integration that paints the knaix wordmark as you type
+    ShellInit {
+        /// Shell to generate for
+        #[clap(value_enum)]
+        shell: shell::InitShell,
+
+        /// Add it to your shell profile, after showing you what will change
+        #[clap(long, conflicts_with = "uninstall")]
+        install: bool,
+
+        /// Remove a previously installed integration
+        #[clap(long)]
+        uninstall: bool,
     },
 
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
@@ -520,6 +536,23 @@ async fn main() -> Result<()> {
                 selftest::run(&ctx, &target, keep, quick, sweep).await?;
             }
         }
+        Commands::ShellInit {
+            shell: init_shell,
+            install,
+            uninstall,
+        } => {
+            if uninstall {
+                shell::uninstall(init_shell)?;
+            } else if install {
+                shell::install(init_shell)?;
+            } else {
+                // Straight to stdout so `eval "$(knaix shell-init zsh)"` works;
+                // anything else here would be evaluated as shell code.
+                print!("{}", shell::init_script(init_shell)?);
+            }
+            return Ok(());
+        }
+
         Commands::Completions { shell } => {
             // Written to stdout so it can be sourced or redirected directly;
             // anything else on stdout here would be sourced as shell code.
