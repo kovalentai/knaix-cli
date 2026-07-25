@@ -290,7 +290,7 @@ mod tests {
         // The eval's status is what the first prompt sees, and oh-my-zsh's
         // default theme paints its arrow red on a non-zero one.
         let s = init_script(InitShell::Zsh).unwrap();
-        let last = s.lines().filter(|l| !l.trim().is_empty()).next_back().unwrap();
+        let last = s.lines().rfind(|l| !l.trim().is_empty()).unwrap();
         assert_eq!(last.trim(), "true");
     }
 
@@ -308,7 +308,10 @@ mod tests {
     #[test]
     fn detects_an_existing_install() {
         assert!(!already_installed("alias ls='ls -G'\n"));
-        assert!(already_installed(&format!("x\n{}\n", block(InitShell::Zsh))));
+        assert!(already_installed(&format!(
+            "x\n{}\n",
+            block(InitShell::Zsh)
+        )));
     }
 
     #[test]

@@ -12,10 +12,10 @@ use std::io::IsTerminal;
 
 /// The brand gradient, as (position, RGB) stops. Same four stops the sites use.
 const STOPS: &[(f32, (u8, u8, u8))] = &[
-    (0.00, (253, 164, 60)),  // #FDA43C
-    (0.30, (236, 72, 153)),  // #EC4899
-    (0.62, (124, 92, 255)),  // #7C5CFF
-    (1.00, (34, 211, 238)),  // #22D3EE
+    (0.00, (253, 164, 60)), // #FDA43C
+    (0.30, (236, 72, 153)), // #EC4899
+    (0.62, (124, 92, 255)), // #7C5CFF
+    (1.00, (34, 211, 238)), // #22D3EE
 ];
 
 /// How much colour the attached terminal can actually render.
@@ -44,7 +44,11 @@ fn sample(t: f32) -> (u8, u8, u8) {
         if t <= t1 {
             let span = t1 - t0;
             // Coincident stops would divide by zero; treat them as a hard edge.
-            let local = if span <= f32::EPSILON { 0.0 } else { (t - t0) / span };
+            let local = if span <= f32::EPSILON {
+                0.0
+            } else {
+                (t - t0) / span
+            };
             return (
                 lerp(c0.0, c1.0, local),
                 lerp(c0.1, c1.1, local),
@@ -57,7 +61,9 @@ fn sample(t: f32) -> (u8, u8, u8) {
 }
 
 fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// The six levels each channel of the xterm-256 colour cube can take.
@@ -108,7 +114,14 @@ const TRUECOLOR_TERM_PROGRAMS: &[&str] = &[
 const ANSI256_TERM_PROGRAMS: &[&str] = &["Apple_Terminal"];
 
 /// `TERM` values that imply 24-bit colour on their own.
-const TRUECOLOR_TERMS: &[&str] = &["kitty", "alacritty", "wezterm", "contour", "foot", "ghostty"];
+const TRUECOLOR_TERMS: &[&str] = &[
+    "kitty",
+    "alacritty",
+    "wezterm",
+    "contour",
+    "foot",
+    "ghostty",
+];
 
 /// The environment the decision is made from, captured so the decision itself
 /// is a pure function.
@@ -251,7 +264,11 @@ fn gradient(text: &str, lvl: Level) -> String {
             let last = chars.len().saturating_sub(1);
             let mut out = String::with_capacity(text.len() + chars.len() * 20);
             for (i, ch) in chars.iter().enumerate() {
-                let t = if last == 0 { 0.0 } else { i as f32 / last as f32 };
+                let t = if last == 0 {
+                    0.0
+                } else {
+                    i as f32 / last as f32
+                };
                 let (r, g, b) = sample(t);
                 if lvl == Level::TrueColor {
                     out.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
@@ -279,7 +296,13 @@ fn ramp() -> Vec<(u8, u8, u8)> {
     let n = WORDMARK.chars().count();
     let last = n.saturating_sub(1);
     (0..n)
-        .map(|i| sample(if last == 0 { 0.0 } else { i as f32 / last as f32 }))
+        .map(|i| {
+            sample(if last == 0 {
+                0.0
+            } else {
+                i as f32 / last as f32
+            })
+        })
         .collect()
 }
 
@@ -297,7 +320,10 @@ pub fn ramp_hex() -> Vec<String> {
 
 /// The wordmark colours as xterm-256 indices, for terminals without 24-bit.
 pub fn ramp_256() -> Vec<u8> {
-    ramp().into_iter().map(|(r, g, b)| to_ansi256(r, g, b)).collect()
+    ramp()
+        .into_iter()
+        .map(|(r, g, b)| to_ansi256(r, g, b))
+        .collect()
 }
 
 /// A command hint: the wordmark in the gradient, the rest in cyan.
@@ -326,11 +352,11 @@ mod tests {
     #[test]
     fn samples_the_five_letters() {
         let expected = [
-            (253, 164, 60),  // k
-            (239, 87, 138),  // n
-            (166, 85, 217),  // a
-            (93, 133, 249),  // i
-            (34, 211, 238),  // x
+            (253, 164, 60), // k
+            (239, 87, 138), // n
+            (166, 85, 217), // a
+            (93, 133, 249), // i
+            (34, 211, 238), // x
         ];
         for (i, want) in expected.iter().enumerate() {
             let t = i as f32 / 4.0;
@@ -407,7 +433,10 @@ mod tests {
 
     #[test]
     fn not_a_tty_emits_nothing() {
-        let e = TermEnv { is_tty: false, ..env() };
+        let e = TermEnv {
+            is_tty: false,
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::None);
     }
 
@@ -421,45 +450,73 @@ mod tests {
         };
         assert_eq!(level_for(&e), Level::TrueColor);
         // Zero is "no force", not "force off".
-        let e = TermEnv { is_tty: false, clicolor_force: Some("0"), ..env() };
+        let e = TermEnv {
+            is_tty: false,
+            clicolor_force: Some("0"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::None);
     }
 
     #[test]
     fn empty_no_color_does_not_opt_out() {
         // The spec is "present and not an empty string".
-        let e = TermEnv { no_color: Some(""), colorterm: Some("truecolor"), ..env() };
+        let e = TermEnv {
+            no_color: Some(""),
+            colorterm: Some("truecolor"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::TrueColor);
-        let e = TermEnv { no_color: Some("1"), colorterm: Some("truecolor"), ..env() };
+        let e = TermEnv {
+            no_color: Some("1"),
+            colorterm: Some("truecolor"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::None);
     }
 
     #[test]
     fn colorterm_is_honoured() {
         for v in ["truecolor", "24bit"] {
-            let e = TermEnv { colorterm: Some(v), ..env() };
+            let e = TermEnv {
+                colorterm: Some(v),
+                ..env()
+            };
             assert_eq!(level_for(&e), Level::TrueColor, "COLORTERM={v}");
         }
         // A terminal name in COLORTERM does not mean 24-bit.
-        let e = TermEnv { colorterm: Some("gnome-terminal"), ..env() };
+        let e = TermEnv {
+            colorterm: Some("gnome-terminal"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::Ansi16);
     }
 
     #[test]
     fn direct_terminfo_entries_are_truecolor() {
         // This is the branch that was backwards: `-direct` means 24-bit.
-        let e = TermEnv { term: Some("xterm-direct"), ..env() };
+        let e = TermEnv {
+            term: Some("xterm-direct"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::TrueColor);
     }
 
     #[test]
     fn known_terminals_are_recognised_without_colorterm() {
         for p in TRUECOLOR_TERM_PROGRAMS {
-            let e = TermEnv { term_program: Some(p), term: Some("xterm-256color"), ..env() };
+            let e = TermEnv {
+                term_program: Some(p),
+                term: Some("xterm-256color"),
+                ..env()
+            };
             assert_eq!(level_for(&e), Level::TrueColor, "TERM_PROGRAM={p}");
         }
         for t in ["xterm-kitty", "alacritty", "xterm-ghostty", "foot"] {
-            let e = TermEnv { term: Some(t), ..env() };
+            let e = TermEnv {
+                term: Some(t),
+                ..env()
+            };
             assert_eq!(level_for(&e), Level::TrueColor, "TERM={t}");
         }
     }
@@ -480,18 +537,37 @@ mod tests {
     #[test]
     fn multiplexers_stay_conservative() {
         for t in ["screen-256color", "tmux-256color", "screen"] {
-            let e = TermEnv { term: Some(t), ..env() };
+            let e = TermEnv {
+                term: Some(t),
+                ..env()
+            };
             assert_eq!(level_for(&e), Level::Ansi256, "TERM={t}");
         }
         // Unless the multiplexer was configured to pass 24-bit through and says so.
-        let e = TermEnv { term: Some("tmux-256color"), colorterm: Some("truecolor"), ..env() };
+        let e = TermEnv {
+            term: Some("tmux-256color"),
+            colorterm: Some("truecolor"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::TrueColor);
     }
 
     #[test]
     fn dumb_and_unset_terminals_emit_nothing() {
-        assert_eq!(level_for(&TermEnv { term: Some("dumb"), ..env() }), Level::None);
-        assert_eq!(level_for(&TermEnv { term: None, ..env() }), Level::None);
+        assert_eq!(
+            level_for(&TermEnv {
+                term: Some("dumb"),
+                ..env()
+            }),
+            Level::None
+        );
+        assert_eq!(
+            level_for(&TermEnv {
+                term: None,
+                ..env()
+            }),
+            Level::None
+        );
     }
 
     #[test]
@@ -503,17 +579,29 @@ mod tests {
             ("truecolor", Level::TrueColor),
             ("TrueColor", Level::TrueColor),
         ] {
-            let e = TermEnv { knaix_color: Some(v), term: Some("dumb"), ..env() };
+            let e = TermEnv {
+                knaix_color: Some(v),
+                term: Some("dumb"),
+                ..env()
+            };
             assert_eq!(level_for(&e), want, "KNAIX_COLOR={v}");
         }
         // A typo falls through to detection rather than costing someone output.
-        let e = TermEnv { knaix_color: Some("nonsense"), colorterm: Some("truecolor"), ..env() };
+        let e = TermEnv {
+            knaix_color: Some("nonsense"),
+            colorterm: Some("truecolor"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::TrueColor);
     }
 
     #[test]
     fn no_gradient_keeps_colour_but_drops_the_ramp() {
-        let e = TermEnv { knaix_no_gradient: true, colorterm: Some("truecolor"), ..env() };
+        let e = TermEnv {
+            knaix_no_gradient: true,
+            colorterm: Some("truecolor"),
+            ..env()
+        };
         assert_eq!(level_for(&e), Level::Ansi16);
     }
 

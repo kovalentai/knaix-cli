@@ -5,8 +5,8 @@ mod login;
 mod model_server;
 mod nodes;
 mod repl;
-mod shell;
 mod selftest;
+mod shell;
 mod update;
 mod upload_filter;
 

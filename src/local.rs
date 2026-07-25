@@ -509,7 +509,10 @@ pub async fn up(
         ""
     };
     println!("\n  Try it:");
-    println!("    {}", crate::brand::cmd(&format!("upload {}./README.md", flag)));
+    println!(
+        "    {}",
+        crate::brand::cmd(&format!("upload {}./README.md", flag))
+    );
     println!(
         "    {}",
         format!("knaix chat {}\"what is this about?\"", flag).cyan()
