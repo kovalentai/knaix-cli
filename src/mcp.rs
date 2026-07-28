@@ -66,7 +66,14 @@ pub async fn run(ctx: &KnaixContext, node_id: Option<String>) -> Result<()> {
 }
 
 /// A local node: mint a key, install it, and print a block that works as-is.
+///
+/// The surface is checked before the key is minted, and the order is the point.
+/// Installing a key replaces the node's entire key set, so doing it first and
+/// discovering afterwards that the node cannot serve MCP would destroy a working
+/// key in exchange for nothing.
 async fn local(ctx: &KnaixContext, base: &str, instance_id: &str) -> Result<()> {
+    require_mcp_surface(ctx, base).await?;
+
     let token = mint_token();
     install_key(ctx, base, instance_id, &token).await?;
 
@@ -136,6 +143,51 @@ async fn remote(ctx: &KnaixContext, uuid: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Refuse early if the node cannot serve MCP, and say which reason it is.
+///
+/// A `GET` on the endpoint is the whole probe. It changes nothing, needs no key,
+/// and the three answers a node can give are already distinct:
+///
+/// - **405** — served. The endpoint is stateless and offers no SSE stream, so
+///   the spec has it refuse a GET; reaching that refusal proves the route is
+///   mounted. A node that later grows a stream would answer 200, which is just
+///   as good an answer to the only question being asked.
+/// - **404** — no MCP surface. The node predates it. This is the case worth
+///   catching, because the credential push it would otherwise be followed by
+///   succeeds on these nodes, leaving a printed config that looks ready and
+///   fails in the user's editor instead.
+/// - **503** — mounted but refusing, because the node is not bound to an
+///   instance. Telling this user to pull a newer image would send them to fix
+///   something that is not broken.
+///
+/// Anything else is treated as served: the question is whether the route exists,
+/// and a node answering 401 or 400 has answered it.
+async fn require_mcp_surface(ctx: &KnaixContext, base: &str) -> Result<()> {
+    let url = format!("{}/mcp", base);
+    let response = ctx.client.get(&url).send().await.with_context(|| {
+        format!(
+            "Could not reach the local node at {}. Is it running? Try '{}'.",
+            base,
+            crate::brand::cmd("local up")
+        )
+    })?;
+
+    match response.status().as_u16() {
+        404 => Err(anyhow!(
+            "This node does not serve MCP. Its image predates the endpoint, so there \
+             is nothing for a client to connect to yet.\n       Fetch the current \
+             runtime with '{}', then run this again.",
+            crate::brand::cmd("local up --pull")
+        )),
+        503 => Err(anyhow!(
+            "This node is running but not bound to an instance, so it refuses every \
+             route including MCP.\n       Restart it with '{}'.",
+            crate::brand::cmd("local up")
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Mint a `kvk_` token. Same shape as a control-plane key so the node's guard,
@@ -389,6 +441,113 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().nth(14), Some('4'));
         assert!(matches!(id.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
+    }
+
+    /// Serve one canned status on a loopback port and return its base URL.
+    /// Records how many requests arrived, which is how the ordering assertion
+    /// below tells a probe that refused from one that went on to push a key.
+    fn node_answering(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<usize>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counted = hits.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                *counted.lock().unwrap() += 1;
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (format!("http://127.0.0.1:{}", port), hits)
+    }
+
+    /// The answer a node that serves MCP actually gives a GET: the endpoint is
+    /// stateless, so the spec has it refuse the stream. Verified against a real
+    /// Node Runtime, which is where this status comes from.
+    #[tokio::test]
+    async fn treats_the_spec_s_refusal_of_a_get_as_proof_the_route_is_mounted() {
+        let (base, _) = node_answering(
+            "405 Method Not Allowed",
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"This endpoint offers no SSE stream."}}"#,
+        );
+        let ctx = KnaixContext::new("text".to_string());
+        assert!(require_mcp_surface(&ctx, &base).await.is_ok());
+    }
+
+    /// The case this probe exists for. A node whose image predates MCP still
+    /// accepts the credential push, so without the probe the command installs a
+    /// key, prints a config, and fails only once the user opens their editor.
+    #[tokio::test]
+    async fn names_the_remedy_when_the_node_predates_the_endpoint() {
+        let (base, _) = node_answering("404 Not Found", r#"{"error":"not found"}"#);
+        let ctx = KnaixContext::new("text".to_string());
+
+        let err = require_mcp_surface(&ctx, &base)
+            .await
+            .expect_err("a node without the route must not be printed a config");
+        let message = err.to_string();
+        assert!(message.contains("predates"), "{}", message);
+        assert!(
+            message.contains("--pull"),
+            "the remedy must be named: {}",
+            message
+        );
+    }
+
+    /// An unbound node has the route and refuses it. Telling this user to pull a
+    /// newer image would send them to fix something that is not broken.
+    #[tokio::test]
+    async fn tells_an_unbound_node_apart_from_an_old_one() {
+        let (base, _) = node_answering(
+            "503 Service Unavailable",
+            r#"{"error":"node is not bound to an instance (KB_INSTANCE_ID unset); refusing routes"}"#,
+        );
+        let ctx = KnaixContext::new("text".to_string());
+
+        let message = require_mcp_surface(&ctx, &base)
+            .await
+            .expect_err("an unbound node cannot serve MCP either")
+            .to_string();
+        assert!(message.contains("not bound"), "{}", message);
+        assert!(
+            !message.contains("--pull"),
+            "an unbound node is not an old one: {}",
+            message
+        );
+    }
+
+    /// The whole reason the probe runs before the mint: installing a key
+    /// replaces the node's entire key set, so a command that cannot succeed must
+    /// not have touched it.
+    #[tokio::test]
+    async fn refuses_before_it_can_replace_the_node_s_key_set() {
+        let (base, hits) = node_answering("404 Not Found", r#"{"error":"not found"}"#);
+        let ctx = KnaixContext::new("text".to_string());
+
+        local(&ctx, &base, "3f2504e0-4f89-41d3-9a0c-0305e82c3301")
+            .await
+            .expect_err("a node without MCP must not get a key installed");
+
+        assert_eq!(
+            *hits.lock().unwrap(),
+            1,
+            "only the probe should have been sent; a credential push would be a \
+             second request and would have replaced the node's key set"
+        );
     }
 
     /// The staleness rule the node applies is `version <= held`, so a push has

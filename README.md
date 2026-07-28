@@ -137,6 +137,14 @@ with a placeholder, because those keys are issued from the dashboard (Keys tab)
 and the address is on your tailnet -- the machine running the client has to be
 on it too.
 
+The node has to be new enough to serve MCP. A local node running an older image
+is told so, with the command that fetches the current runtime, rather than being
+handed a config that fails later in your editor:
+
+```bash
+knaix local up --pull    # if 'knaix mcp' says the node predates the endpoint
+```
+
 It prints three shapes, because that is what clients differ on -- not on the
 protocol, which they all speak. A command for clients that register servers
 themselves (Claude Code); an HTTP server object for config files (Cursor,
