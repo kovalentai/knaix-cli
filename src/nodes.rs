@@ -426,7 +426,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 let mut node_type = "MANAGED".cyan();
                 if let Some(cfg) = &node.config {
                     if cfg.get("isByot").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        node_type = "SOVEREIGN (BYOT)".yellow();
+                        node_type = "BYO TAILNET".yellow();
                     }
                 }
 

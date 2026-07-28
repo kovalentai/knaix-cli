@@ -358,7 +358,7 @@ async fn handle_callback(
                     You can safely close this window and return to your terminal.
                 </div>
 
-                <div class="brand">Kovalent · Private AI Stack · Sovereign Intelligence</div>
+                <div class="brand">Kovalent · Private AI Stack</div>
             </div>
 
             <script>
