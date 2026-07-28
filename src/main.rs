@@ -2,6 +2,7 @@ mod brand;
 mod config;
 mod local;
 mod login;
+mod mcp;
 mod model_server;
 mod nodes;
 mod repl;
@@ -206,6 +207,16 @@ enum Commands {
         /// Read a specific notes file instead of listing them
         #[clap(short, long)]
         file: Option<String>,
+    },
+
+    /// Print the MCP client config that points an editor at a node
+    Mcp {
+        /// The node to configure for (falls back to the default)
+        node_id: Option<String>,
+
+        /// The node to configure for, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
     },
 }
 
@@ -562,6 +573,10 @@ async fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
+        Commands::Mcp { node_id, node } => {
+            mcp::run(&ctx, node_id.or(node)).await?;
+        }
+
         Commands::Memory {
             node_id,
             node,
