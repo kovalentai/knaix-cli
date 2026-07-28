@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.5] - 2026-07-28
+
+### Added
+- **`knaix mcp`.** The Node Runtime speaks the Model Context Protocol, so Claude Code, Claude Desktop, Cursor and anything else that speaks it can search a node's knowledge base, ask it grounded questions, list its documents and add to them. What stood between you and that was a URL and a key in the right JSON shape. This prints it, filled in. The output is organised by the three shapes a client asks for its config in, a command, an HTTP server object, and a stdio bridge for clients that only launch local processes, with clients named as examples rather than as a list that would be wrong the week a new one appears. Against a local node it mints a key and installs it, so the printed block works as it stands; against a hosted node it prints the real address with a placeholder key, and says plainly that the address is on your tailnet and the key comes from the dashboard. Needs a node running the 0.29.0 runtime or newer; an older local node is told so, and given the command that fetches the current one, before anything is minted.
+- **`knaix shell-init zsh`.** An opt-in shell integration that renders the knaix wordmark in the brand gradient as you type it. `--install` adds it to your profile after showing exactly what will change, `--uninstall` takes it back out, and both are idempotent through a fenced marker block. Install backs the profile up before touching a file it did not write. What the profile gets is an `eval` line rather than the snippet itself, so upgrading the CLI upgrades the integration and no dotfile can hold a stale copy. zsh only: bash and fish cannot colour individual characters of the line being typed, so there is nothing honest to ship for them yet.
+
+### Changed
+- **A node on your own tailnet reads as `BYO TAILNET` in `knaix list`**, not `SOVEREIGN (BYOT)`. The distinction it drew is real, that node is on your tailnet rather than our managed mesh, so the label names what is actually different instead of reaching for an adjective, and it matches the badge the dashboard shows for the same node.
+
+### Fixed
+- **Terminal colour depth is detected from more than `COLORTERM`.** That variable is the only one meant to carry 24-bit support and plenty of capable terminals never set it, so the wordmark fell through to the 16-colour branch and emitted a single cyan, which many themes render distinctly green. Detection now consults an explicit `KNAIX_COLOR` override, `NO_COLOR`, `CLICOLOR_FORCE`, `COLORTERM`, the terminfo `-direct` convention, a `TERM_PROGRAM` allowlist, known `TERM` values, and finally 256-colour.
+
 ## [0.4.4] - 2026-07-23
 
 ### Added
