@@ -137,10 +137,15 @@ with a placeholder, because those keys are issued from the dashboard (Keys tab)
 and the address is on your tailnet -- the machine running the client has to be
 on it too.
 
-It prints three shapes because clients differ in what they accept: a command
-(Claude Code), an HTTP server object (Cursor and most others), and a stdio
+It prints three shapes, because that is what clients differ on -- not on the
+protocol, which they all speak. A command for clients that register servers
+themselves (Claude Code); an HTTP server object for config files (Cursor,
+Windsurf and most others use `mcpServers`, VS Code uses `servers`); and a stdio
 bridge for clients that only launch local processes and cannot dial an HTTP
 server, Claude Desktop among them.
+
+A client whose format is none of the three needs only the URL and the key as an
+`Authorization: Bearer` header.
 
 What the client gets: `search_knowledge_base` returns source passages,
 `ask_knowledge_base` returns an answer generated on the node with citations,

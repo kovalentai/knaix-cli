@@ -1,10 +1,15 @@
-//! `knaix mcp` — the config block that points an editor at your node.
+//! `knaix mcp` — the config block that points an MCP client at your node.
 //!
-//! The node speaks the Model Context Protocol, so Claude Code, Claude Desktop
-//! and anything else that speaks it can search a knowledge base, ask it grounded
-//! questions, and read its documents. What stands between a user and that is a
-//! URL and a key in the right JSON shape, which is exactly the kind of thing
-//! people get wrong once and give up on.
+//! The node speaks the Model Context Protocol and knows nothing about any
+//! particular client, so any of them can search a knowledge base, ask it
+//! grounded questions, and read its documents. What stands between a user and
+//! that is a URL and a key in the right shape, which is exactly the kind of
+//! thing people get wrong once and give up on.
+//!
+//! So the output is organised by the three shapes a client asks for its config
+//! in -- a command, an HTTP server object, a stdio bridge -- with clients named
+//! only as examples. A list of vendors would misdescribe what the node does and
+//! would be wrong the week a new client appears.
 //!
 //! The two node kinds need different help, and pretending otherwise is what
 //! would make this command useless:
@@ -259,18 +264,21 @@ async fn push_key(
         .context("The local node answered the key push in a shape this version cannot read")
 }
 
-/// The three shapes a client takes, because they are genuinely different.
+/// The three shapes a client asks for its config in.
 ///
-/// Claude Code speaks HTTP natively and takes one command. Cursor and the other
-/// config-file clients take an HTTP server object. Claude Desktop takes neither:
-/// its config file validates stdio servers only, and its remote-connector flow
-/// needs a server reachable from Anthropic's own network, which a node on
-/// loopback or a private tailnet never is. It reaches one through a stdio
-/// bridge, which is why that block runs `npx` instead of naming a URL.
+/// Named by shape, not by vendor. The node implements the protocol and nothing
+/// else, so what a user needs is the shape their client takes: a command, an
+/// HTTP server object, or a stdio bridge for a client that only launches local
+/// processes. Every client falls into one, including ones that do not exist yet.
 ///
-/// The bridge's header argument carries no space around the colon and puts the
-/// value in `env`: the client mangles spaces inside `args` when it invokes npx,
-/// and the token would arrive truncated.
+/// Two facts are all any of them carry -- the node's URL and the key as an
+/// `Authorization` header -- so a client whose format is none of these three is
+/// still one substitution away.
+///
+/// The wrapper key is the one thing that genuinely differs between config-file
+/// clients: most take `mcpServers`, and VS Code takes `servers`. It is called
+/// out rather than picked, because guessing wrong produces a file the client
+/// silently ignores.
 fn print_block(url: &str, token: &str, json_only: bool) -> Result<()> {
     let block = serde_json::json!({
         "mcpServers": {
@@ -288,24 +296,43 @@ fn print_block(url: &str, token: &str, json_only: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", "Claude Code".bold());
+    println!(
+        "{}",
+        "A command, for a client that registers servers itself".bold()
+    );
+    println!("  {} Claude Code", "·".dimmed());
     println!(
         "  claude mcp add --transport http {} {} --header \"Authorization: Bearer {}\"",
         SERVER_NAME, url, token
     );
     println!();
+    println!("{}", "An HTTP server object, for a config file".bold());
     println!(
-        "{}",
-        "Cursor, and anything else that takes an HTTP MCP server".bold()
+        "  {} Cursor, Windsurf and most others use {}; VS Code uses {}",
+        "·".dimmed(),
+        "\"mcpServers\"".cyan(),
+        "\"servers\"".cyan()
     );
     println!("{}", rendered);
     println!();
-    println!("{}", "Claude Desktop (via the stdio bridge)".bold());
+    println!(
+        "{}",
+        "A stdio bridge, for a client that cannot dial HTTP".bold()
+    );
+    println!(
+        "  {} Claude Desktop, and anything else that only launches local processes",
+        "·".dimmed()
+    );
     println!("{}", bridge_block(url, token)?);
     Ok(())
 }
 
-/// The Claude Desktop entry: a stdio bridge to the node's HTTP endpoint.
+/// A stdio bridge to the node's HTTP endpoint, for a client that launches
+/// servers as local processes and cannot dial one.
+///
+/// The header argument carries no space around the colon and its value lives in
+/// `env`: several clients mangle spaces inside `args` when they invoke npx, and
+/// the token would arrive truncated.
 fn bridge_block(url: &str, token: &str) -> Result<String> {
     let block = serde_json::json!({
         "mcpServers": {
