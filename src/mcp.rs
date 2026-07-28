@@ -167,14 +167,53 @@ fn hash_token(token: &str) -> String {
     digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Install the key on the local node. The push replaces the node's key set, so
-/// the version advances past whatever it holds — a push that does not is
-/// discarded as stale and the printed key would silently not work.
+/// What the node says it did with a pushed key set.
+#[derive(Deserialize)]
+struct SyncResponse {
+    /// False when the node already holds a set at this version or newer, in
+    /// which case the pushed key was discarded and does not work.
+    applied: bool,
+    held_version: u64,
+}
+
+/// Install the key on the local node.
+///
+/// A push only lands if its version is strictly newer than the one the node
+/// holds; anything older or equal is discarded as stale, and the node reports
+/// that in `applied` rather than as an error. So this reads the answer instead
+/// of trusting the status code, and retries once just past whatever the node
+/// turned out to be holding. Without that, two runs in the same instant printed
+/// a second key that had never been installed and answered 401 on first use.
 async fn install_key(ctx: &KnaixContext, base: &str, instance_id: &str, token: &str) -> Result<()> {
+    let first = push_key(ctx, base, instance_id, token, now_millis()).await?;
+    if first.applied {
+        return Ok(());
+    }
+
+    let retry = push_key(ctx, base, instance_id, token, first.held_version + 1).await?;
+    if retry.applied {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "The local node kept a newer key set (version {}) and did not install this key. \
+         Run the command again.",
+        retry.held_version
+    ))
+}
+
+/// One credential push. The set is a replacement, so this is also what removes
+/// whatever key the node held before.
+async fn push_key(
+    ctx: &KnaixContext,
+    base: &str,
+    instance_id: &str,
+    token: &str,
+    version: u64,
+) -> Result<SyncResponse> {
     let url = format!("{}/api/credentials/sync", base);
     let body = serde_json::json!({
         "instance_id": instance_id,
-        "version": now_secs(),
+        "version": version,
         "keys": [{
             "id": new_key_id(),
             "token_hash": hash_token(token),
@@ -205,16 +244,21 @@ async fn install_key(ctx: &KnaixContext, base: &str, instance_id: &str, token: &
             detail.trim()
         ));
     }
-    Ok(())
+
+    response
+        .json::<SyncResponse>()
+        .await
+        .context("The local node answered the key push in a shape this version cannot read")
 }
 
-/// Seconds since the epoch, used as the key-set version. Monotonic in practice
-/// and requires no state on this machine, which matters because the node is the
-/// only thing that knows what version it currently holds.
-fn now_secs() -> u64 {
+/// Milliseconds since the epoch, used as the key-set version. Requires no state
+/// on this machine, which matters because the node is the only thing that knows
+/// what version it currently holds. Milliseconds rather than seconds because two
+/// runs in the same second is an ordinary thing to do and produced a collision.
+fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -294,5 +338,71 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().nth(14), Some('4'));
         assert!(matches!(id.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
+    }
+
+    /// The staleness rule the node applies is `version <= held`, so two runs in
+    /// the same instant used to produce a second key that was never installed
+    /// and answered 401 on first use -- the worst shape for the bug to take,
+    /// because the key the user just copied was the dead one. This pins both
+    /// halves of the fix: the version is millisecond-scaled, and a discarded
+    /// push is retried just past what the node turned out to be holding.
+    #[test]
+    fn versions_a_push_in_milliseconds_not_seconds() {
+        // Seconds since the epoch passed 2 billion in 2033; milliseconds passed
+        // it in 1970. Anything below this is the old seconds-scaled value.
+        assert!(now_millis() > 1_600_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn retries_past_the_version_the_node_turned_out_to_hold() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // First push is discarded as stale, second must carry held + 1.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (i, stream) in listener.incoming().enumerate().take(2) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let version = request
+                    .split("\"version\":")
+                    .nth(1)
+                    .and_then(|rest| rest.split(&[',', '}'][..]).next())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap();
+                recorded.lock().unwrap().push(version);
+
+                let body = if i == 0 {
+                    r#"{"accepted":1,"applied":false,"held_version":9000}"#
+                } else {
+                    r#"{"accepted":1,"applied":true,"held_version":9001}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let ctx = KnaixContext::new("text".to_string());
+        let base = format!("http://127.0.0.1:{}", port);
+        install_key(
+            &ctx,
+            &base,
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            "kvk_test",
+        )
+        .await
+        .expect("the retry should install the key");
+
+        let versions = seen.lock().unwrap().clone();
+        assert_eq!(versions.len(), 2, "a discarded push must be retried");
+        assert_eq!(versions[1], 9001, "the retry must clear the version held");
     }
 }
