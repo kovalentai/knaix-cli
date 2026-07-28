@@ -1,4 +1,4 @@
-//! `knaix mcp` — the config block that points an MCP client at your node.
+//! `knaix mcp`: the config block that points an MCP client at your node.
 //!
 //! The node speaks the Model Context Protocol and knows nothing about any
 //! particular client, so any of them can search a knowledge base, ask it
@@ -20,7 +20,8 @@
 //!   local up` sets `A2A_AUTH_DISABLED`), and it is only ever taken against
 //!   127.0.0.1.
 //! - A **hosted** node holds keys the control plane issued, and this machine
-//!   very likely cannot even reach it — the endpoint is on the tenant's tailnet.
+//!   very likely cannot even reach it, since the endpoint is on the tenant's
+//!   tailnet.
 //!   So the block is printed with the real address and a placeholder key, and
 //!   the output says plainly what else has to be true.
 
@@ -150,15 +151,15 @@ async fn remote(ctx: &KnaixContext, uuid: &str) -> Result<()> {
 /// A `GET` on the endpoint is the whole probe. It changes nothing, needs no key,
 /// and the three answers a node can give are already distinct:
 ///
-/// - **405** — served. The endpoint is stateless and offers no SSE stream, so
+/// - **405**: served. The endpoint is stateless and offers no SSE stream, so
 ///   the spec has it refuse a GET; reaching that refusal proves the route is
 ///   mounted. A node that later grows a stream would answer 200, which is just
 ///   as good an answer to the only question being asked.
-/// - **404** — no MCP surface. The node predates it. This is the case worth
+/// - **404**: no MCP surface. The node predates it. This is the case worth
 ///   catching, because the credential push it would otherwise be followed by
 ///   succeeds on these nodes, leaving a printed config that looks ready and
 ///   fails in the user's editor instead.
-/// - **503** — mounted but refusing, because the node is not bound to an
+/// - **503**: mounted but refusing, because the node is not bound to an
 ///   instance. Telling this user to pull a newer image would send them to fix
 ///   something that is not broken.
 ///
