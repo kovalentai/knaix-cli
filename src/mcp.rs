@@ -181,11 +181,19 @@ struct SyncResponse {
 /// A push only lands if its version is strictly newer than the one the node
 /// holds; anything older or equal is discarded as stale, and the node reports
 /// that in `applied` rather than as an error. So this reads the answer instead
-/// of trusting the status code, and retries once just past whatever the node
+/// of trusting the status code, and pushes again one past whatever the node
 /// turned out to be holding. Without that, two runs in the same instant printed
 /// a second key that had never been installed and answered 401 on first use.
+///
+/// The first push deliberately carries version 0, the lowest a node can accept.
+/// A timestamp would be simpler and is wrong: the control plane versions its own
+/// pushes with a per-instance counter that increments by one, so a key set
+/// stamped with the current epoch would sit billions of versions above anything
+/// it can ever send, and every later push it made -- including a revocation --
+/// would be discarded while it reported success. Staying in the counter's number
+/// space costs one extra round trip against loopback and cannot poison it.
 async fn install_key(ctx: &KnaixContext, base: &str, instance_id: &str, token: &str) -> Result<()> {
-    let first = push_key(ctx, base, instance_id, token, now_millis()).await?;
+    let first = push_key(ctx, base, instance_id, token, 0).await?;
     if first.applied {
         return Ok(());
     }
@@ -251,19 +259,18 @@ async fn push_key(
         .context("The local node answered the key push in a shape this version cannot read")
 }
 
-/// Milliseconds since the epoch, used as the key-set version. Requires no state
-/// on this machine, which matters because the node is the only thing that knows
-/// what version it currently holds. Milliseconds rather than seconds because two
-/// runs in the same second is an ordinary thing to do and produced a collision.
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// The config every MCP client takes, and the one line that configures Claude
-/// Code without editing a file at all.
+/// The three shapes a client takes, because they are genuinely different.
+///
+/// Claude Code speaks HTTP natively and takes one command. Cursor and the other
+/// config-file clients take an HTTP server object. Claude Desktop takes neither:
+/// its config file validates stdio servers only, and its remote-connector flow
+/// needs a server reachable from Anthropic's own network, which a node on
+/// loopback or a private tailnet never is. It reaches one through a stdio
+/// bridge, which is why that block runs `npx` instead of naming a URL.
+///
+/// The bridge's header argument carries no space around the colon and puts the
+/// value in `env`: the client mangles spaces inside `args` when it invokes npx,
+/// and the token would arrive truncated.
 fn print_block(url: &str, token: &str, json_only: bool) -> Result<()> {
     let block = serde_json::json!({
         "mcpServers": {
@@ -289,10 +296,27 @@ fn print_block(url: &str, token: &str, json_only: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        "Claude Desktop, Cursor, and anything else that reads a config file".bold()
+        "Cursor, and anything else that takes an HTTP MCP server".bold()
     );
     println!("{}", rendered);
+    println!();
+    println!("{}", "Claude Desktop (via the stdio bridge)".bold());
+    println!("{}", bridge_block(url, token)?);
     Ok(())
+}
+
+/// The Claude Desktop entry: a stdio bridge to the node's HTTP endpoint.
+fn bridge_block(url: &str, token: &str) -> Result<String> {
+    let block = serde_json::json!({
+        "mcpServers": {
+            SERVER_NAME: {
+                "command": "npx",
+                "args": ["-y", "mcp-remote", url, "--header", "Authorization:${AUTH_HEADER}"],
+                "env": { "AUTH_HEADER": format!("Bearer {}", token) }
+            }
+        }
+    });
+    Ok(serde_json::to_string_pretty(&block)?)
 }
 
 #[cfg(test)]
@@ -340,21 +364,13 @@ mod tests {
         assert!(matches!(id.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
     }
 
-    /// The staleness rule the node applies is `version <= held`, so two runs in
-    /// the same instant used to produce a second key that was never installed
-    /// and answered 401 on first use -- the worst shape for the bug to take,
-    /// because the key the user just copied was the dead one. This pins both
-    /// halves of the fix: the version is millisecond-scaled, and a discarded
-    /// push is retried just past what the node turned out to be holding.
-    #[test]
-    fn versions_a_push_in_milliseconds_not_seconds() {
-        // Seconds since the epoch passed 2 billion in 2033; milliseconds passed
-        // it in 1970. Anything below this is the old seconds-scaled value.
-        assert!(now_millis() > 1_600_000_000_000);
-    }
-
+    /// The staleness rule the node applies is `version <= held`, so a push has
+    /// to clear what the node holds -- and must not overshoot it, because the
+    /// control plane versions its own pushes with a counter that steps by one
+    /// and could never catch up to a timestamp. Both halves are pinned here:
+    /// the first push starts at 0, and a discarded one is retried at held + 1.
     #[tokio::test]
-    async fn retries_past_the_version_the_node_turned_out_to_hold() {
+    async fn retries_one_past_the_version_the_node_turned_out_to_hold() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -403,6 +419,11 @@ mod tests {
 
         let versions = seen.lock().unwrap().clone();
         assert_eq!(versions.len(), 2, "a discarded push must be retried");
-        assert_eq!(versions[1], 9001, "the retry must clear the version held");
+        assert_eq!(versions[0], 0, "the probe must start at the lowest version");
+        assert_eq!(
+            versions[1], 9001,
+            "the retry must clear the held version by exactly one, staying in \
+             the control plane's counter space"
+        );
     }
 }

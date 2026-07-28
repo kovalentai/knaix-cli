@@ -137,6 +137,11 @@ with a placeholder, because those keys are issued from the dashboard (Keys tab)
 and the address is on your tailnet -- the machine running the client has to be
 on it too.
 
+It prints three shapes because clients differ in what they accept: a command
+(Claude Code), an HTTP server object (Cursor and most others), and a stdio
+bridge for clients that only launch local processes and cannot dial an HTTP
+server, Claude Desktop among them.
+
 What the client gets: `search_knowledge_base` returns source passages,
 `ask_knowledge_base` returns an answer generated on the node with citations,
 `list_documents` enumerates the corpus, and `ingest_document` adds to it. Each
