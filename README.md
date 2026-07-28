@@ -106,6 +106,7 @@ cargo install --path .
 | `knaix chat`     | Ask a node one question and print the grounded answer.|
 | `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
+| `knaix mcp`      | Print the MCP client config that points Claude Code, Claude Desktop or Cursor at a node. |
 | `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
@@ -117,6 +118,30 @@ cargo install --path .
 **Global Flags:**
 - `-o json`, `--output json`: Emit structured JSON instead of formatted tables.
 - `--version`: Output the current installed binary version.
+
+## Using a node from your editor
+
+The node speaks the Model Context Protocol, so any MCP client can search its
+knowledge base, ask it grounded questions, list its documents, and add to them.
+`knaix mcp` prints the config, already filled in:
+
+```bash
+knaix mcp                # for the default node
+knaix mcp -n <node-id>   # for a specific one
+knaix mcp -o json        # just the config object, for piping into a file
+```
+
+Against the local node this also mints a key and installs it, so the printed
+block works as it stands. Against a hosted node it prints the node's address
+with a placeholder, because those keys are issued from the dashboard (Keys tab)
+and the address is on your tailnet -- the machine running the client has to be
+on it too.
+
+What the client gets: `search_knowledge_base` returns source passages,
+`ask_knowledge_base` returns an answer generated on the node with citations,
+`list_documents` enumerates the corpus, and `ingest_document` adds to it. Each
+document is also readable as a resource. A key's scopes decide which of those
+the client sees.
 
 ## Ingesting a directory
 
