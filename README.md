@@ -128,6 +128,8 @@ cargo install --path .
 
 **Global Flags:**
 - `-o json`, `--output json`: Emit structured JSON instead of formatted tables.
+- `-q`, `--quiet`: Suppress progress and commentary. Results and errors still
+  print, so a script can use it without hiding a failure.
 - `--version`: Output the current installed binary version.
 
 ### Project settings (`.knaix.toml`)
@@ -176,9 +178,22 @@ generate-report | knaix upload - --name weekly-report.md
 ```
 
 `--name` sets what piped content is filed under, which is what citations will
-show. Only a bare `-` is special; a path that merely starts with one is a path.
-Empty input is refused with exit code 2, because the usual way to reach it is a
-pipeline whose first stage produced nothing.
+show. It must be a plain file name, not a path. Only a bare `-` is special; a
+path that merely starts with one is a path. Empty input is refused with exit
+code 2, because the usual way to reach it is a pipeline whose first stage
+produced nothing.
+
+### Previewing without a node
+
+`--dry-run` reports what an upload would send. Which files qualify is decided by
+the directory and the filters, so it needs no node and no account:
+
+```bash
+knaix upload . --dry-run
+```
+
+It runs the same planning code a real upload does, so the preview cannot drift
+from what would actually happen.
 
 ## Using a node from your editor
 
