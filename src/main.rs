@@ -1,5 +1,6 @@
 mod brand;
 mod config;
+mod exit;
 mod local;
 mod login;
 mod mcp;
@@ -289,7 +290,24 @@ enum LocalAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::from(exit::Code::Ok.as_u8()),
+        Err(e) => {
+            // anyhow used to render this via Termination's Debug formatting.
+            // Taking the exit code back means rendering it here, so the causes
+            // are printed in the house style rather than anyhow's numbered
+            // "Caused by:" block.
+            eprintln!("{} {}", "Error:".red(), e);
+            for cause in e.chain().skip(1) {
+                eprintln!("  {} {}", "caused by:".dimmed(), cause);
+            }
+            std::process::ExitCode::from(exit::code_of(&e).as_u8())
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let update_task = tokio::spawn(async {
         update::check_for_update_async().await;
     });
@@ -307,7 +325,8 @@ async fn main() -> Result<()> {
             use clap::CommandFactory;
             let mut cmd = Cli::command();
             let _ = cmd.print_help();
-            std::process::exit(2);
+            // Matches what clap exits with for a bad argument.
+            std::process::exit(exit::Code::Usage.as_u8() as i32);
         }
     };
 

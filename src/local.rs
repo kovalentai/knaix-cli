@@ -10,6 +10,7 @@
 //! is what makes it worth testing against, and what makes "your data never
 //! leaves the machine" checkable rather than promised.
 
+use crate::exit::{Code, WithCode};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use serde::{Deserialize, Serialize};
@@ -122,7 +123,8 @@ fn docker(args: &[&str]) -> Result<String> {
     let out = Command::new("docker")
         .args(args)
         .output()
-        .context("Could not run docker. Is Docker installed and running?")?;
+        .context("Could not run docker. Is Docker installed and running?")
+        .coded(Code::Precondition)?;
 
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -141,7 +143,8 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
     let status = Command::new("docker")
         .args(args)
         .status()
-        .context("Could not run docker. Is Docker installed and running?")?;
+        .context("Could not run docker. Is Docker installed and running?")
+        .coded(Code::Precondition)?;
 
     if status.success() {
         Ok(())
@@ -151,14 +154,14 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
 }
 
 fn docker_available() -> Result<()> {
+    // Context rather than a rebuilt error: rebuilding drops the code the
+    // helper attached, and a missing Docker is the precondition case the exit
+    // codes exist for. A daemon that is installed but not running is the same
+    // precondition, so it is tagged here too.
     docker(&["info", "--format", "{{.ServerVersion}}"])
         .map(|_| ())
-        .map_err(|e| {
-            anyhow!(
-                "Docker is not available: {}. Start Docker and try again.",
-                e
-            )
-        })
+        .context("Docker is not available. Start Docker and try again.")
+        .coded(Code::Precondition)
 }
 
 /// Container state as docker reports it: running, exited, or absent.
@@ -439,7 +442,7 @@ pub async fn up(
     args.push(tag.clone());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker(&arg_refs).map_err(|e| anyhow!("Could not start the local node: {}", e))?;
+    docker(&arg_refs).context("Could not start the local node")?;
 
     let node = LocalNode {
         port: launch.port,
@@ -730,7 +733,7 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
     // A running node holds the name and port; free them first. up() starts a
     // stopped or absent one on its own.
     if running {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
     }
     // The choice is passed explicitly, not left to memory: it silences the
     // "from last time" line, and mock=true when the mock was just chosen
@@ -818,7 +821,8 @@ pub async fn reset(yes: bool) -> Result<()> {
         if !std::io::stdin().is_terminal() {
             return Err(anyhow!(
                 "Refusing to delete the local store without confirmation. Pass --yes to reset in a script."
-            ));
+            ))
+            .coded(Code::Denied);
         }
         let go = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt("Delete everything ingested into the local node and start fresh?")
@@ -834,7 +838,7 @@ pub async fn reset(yes: bool) -> Result<()> {
     // The running container holds the volume open; remove it so the store can
     // be deleted, then let up() recreate an empty one.
     if container_state().is_some() {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
     }
     match docker(&["volume", "rm", VOLUME]) {
         Ok(_) => println!("{} Local store deleted.", "✓".green()),
@@ -859,7 +863,7 @@ pub fn down(purge: bool) -> Result<()> {
     if container_state().is_none() {
         println!("{} No local node is running.", "Info:".blue());
     } else {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
         println!("{} Local node stopped.", "✓".green());
     }
 
@@ -996,8 +1000,8 @@ pub fn logs(lines: usize) -> Result<()> {
         ));
     }
     let n = lines.to_string();
-    let out = docker(&["logs", "--tail", &n, CONTAINER])
-        .map_err(|e| anyhow!("Could not read the node's logs: {}", e))?;
+    let out =
+        docker(&["logs", "--tail", &n, CONTAINER]).context("Could not read the node's logs")?;
     println!("{}", out);
     Ok(())
 }
