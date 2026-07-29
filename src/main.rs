@@ -404,7 +404,10 @@ async fn run() -> Result<()> {
             let _ = local::disconnect().await;
             let mut stored = config::load_stored_config();
             if stored.token.is_none() {
-                println!("{} No session is stored on this machine.", "Info:".blue());
+                ctx.info(&format!(
+                    "{} No session is stored on this machine.",
+                    "Info:".blue()
+                ));
             } else {
                 stored.token = None;
                 stored.username = None;
@@ -428,7 +431,11 @@ async fn run() -> Result<()> {
             let mut config = config::load_stored_config();
             config.default_node_id = Some(node_id.clone());
             config::save_config(&config)?;
-            println!("{} Set default node to {}", "Info:".blue(), node_id.bold());
+            ctx.info(&format!(
+                "{} Set default node to {}",
+                "Info:".blue(),
+                node_id.bold()
+            ));
         }
         Commands::Chat {
             node_id,
@@ -510,7 +517,7 @@ async fn run() -> Result<()> {
                 // the directory and the filters. Doing it first means --dry-run
                 // needs no node, and a bad path is reported as a bad path
                 // rather than as whatever the node happened to say.
-                let plan = nodes::plan_upload(&file_path, &opts)?;
+                let plan = nodes::plan_upload(&ctx, &file_path, &opts)?;
                 if dry_run {
                     nodes::report_plan(&plan, &file_path);
                 } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
@@ -635,7 +642,11 @@ async fn run() -> Result<()> {
                 let mut stored = config::load_stored_config();
                 stored.api_url = url.clone();
                 config::save_config(&stored)?;
-                println!("{} Updated API URL to {}", "Info:".blue(), url.bold());
+                ctx.info(&format!(
+                    "{} Updated API URL to {}",
+                    "Info:".blue(),
+                    url.bold()
+                ));
             } else {
                 // Report the URL requests actually go to, overrides included.
                 let config = config::load_config();

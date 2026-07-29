@@ -197,7 +197,9 @@ pub async fn run(
     let node_uuid = &target.label();
     let all = questions()?;
     let questions = if quick { quick_subset(&all) } else { all };
-    let human = ctx.output_format != "json";
+    // Quiet hides the spinner for the same reason JSON does: it is commentary,
+    // and the result prints either way.
+    let human = ctx.output_format != "json" && !ctx.quiet;
 
     // A run interrupted before cleanup leaves its corpus behind, and the next
     // run would then measure against two copies of every document. Report that

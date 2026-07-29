@@ -1439,7 +1439,11 @@ pub struct UploadPlan {
     pub single_file: Option<String>,
 }
 
-pub fn plan_upload(file_path: &str, opts: &UploadOptions) -> Result<UploadPlan> {
+pub fn plan_upload(
+    ctx: &KnaixContext,
+    file_path: &str,
+    opts: &UploadOptions,
+) -> Result<UploadPlan> {
     let base_path = Path::new(file_path);
     if !base_path.exists() {
         return Err(anyhow!("Path not found: {}", file_path)).coded(Code::NotFound);
@@ -1456,6 +1460,11 @@ pub fn plan_upload(file_path: &str, opts: &UploadOptions) -> Result<UploadPlan> 
             single_file: Some(file_name_of(base_path)),
         });
     }
+
+    // Said before the walk, not after it. It is the only thing that speaks
+    // during a long scan, so printing it once the scan is done makes it a
+    // report of the past rather than a sign of life.
+    ctx.info(&format!("{} Scanning {}", "Info:".blue(), file_path.bold()));
 
     let mut queue: Vec<PathBuf> = Vec::new();
     let mut summary = UploadSummary::default();
@@ -1532,8 +1541,6 @@ pub async fn upload(
             .await
             .map(|_| ());
     }
-
-    ctx.info(&format!("{} Scanning {}", "Info:".blue(), file_path.bold()));
 
     if queue.is_empty() {
         ctx.info(&format!(

@@ -417,3 +417,33 @@ fn quiet_never_hides_an_error() {
         "quiet must not silence the reason"
     );
 }
+
+/// Commands whose product is a saved setting confirm it, and that confirmation
+/// is commentary: the setting is the result. The gap this covers is a command
+/// that forgets to ask, which is invisible until someone pipes it.
+#[test]
+fn quiet_reaches_the_settings_commands_too() {
+    let home = scratch("quietset-home");
+    let repo = scratch("quietset-repo");
+
+    for args in [
+        vec!["use", "local"],
+        vec!["config", "--api-url", "https://example.invalid"],
+    ] {
+        let mut loud_args = args.clone();
+        let (code, loud, stderr) = run(knaix(&home, &repo).args(&loud_args));
+        assert_eq!(code, 0, "{args:?} should succeed: {stderr}");
+        assert!(
+            !loud.trim().is_empty(),
+            "{args:?} should confirm when not quiet"
+        );
+
+        loud_args.insert(0, "-q");
+        let (code, quiet, stderr) = run(knaix(&home, &repo).args(&loud_args));
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            quiet.trim().is_empty(),
+            "{args:?} should say nothing under -q: {quiet:?}"
+        );
+    }
+}
