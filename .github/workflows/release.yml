@@ -119,10 +119,12 @@ jobs:
           pattern: knaix-*
           merge-multiple: true
 
-      - name: Checksums and installer
+      # No installer is attached. The public one lives in knaix-docs and is
+      # served from knaix.com/install.sh; shipping a copy here froze it at
+      # release time and let the two drift apart.
+      - name: Checksums
         run: |
           set -euo pipefail
-          cp install.sh dist/install.sh
           cd dist
           sha256sum knaix-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
