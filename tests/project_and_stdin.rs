@@ -308,3 +308,112 @@ fn a_path_is_still_a_path() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("real.md"), "{stdout}");
 }
+
+/// Deciding which files qualify reads the directory and the filters and nothing
+/// else, so a preview must not need a node. It used to resolve one first and
+/// fail against an unreachable node to answer a question no node is part of.
+#[test]
+fn dry_run_needs_no_node() {
+    let home = scratch("dry-home");
+    let repo = scratch("dry-repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/guide.md"), "# Guide\n").unwrap();
+    fs::write(repo.join("docs/other.txt"), "text\n").unwrap();
+    fs::create_dir_all(repo.join("node_modules")).unwrap();
+    fs::write(repo.join("node_modules/junk.md"), "junk\n").unwrap();
+
+    // No credentials at all, and an API that cannot be reached.
+    let (code, stdout, stderr) = run(knaix(&home, &repo)
+        .env("KNAIX_API_URL", "http://127.0.0.1:9")
+        .args(["upload", ".", "--dry-run"]));
+
+    assert_eq!(code, 0, "a preview should not need a node: {stderr}");
+    assert!(stdout.contains("guide.md"), "{stdout}");
+    assert!(
+        !stdout.contains("junk.md"),
+        "node_modules should not be walked: {stdout}"
+    );
+}
+
+/// The preview must describe the run that would actually happen, so the globs
+/// it reports under are the ones a real upload would use.
+#[test]
+fn dry_run_honours_the_project_globs() {
+    let home = scratch("dryglob-home");
+    let repo = scratch("dryglob-repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/keep.md"), "# Keep\n").unwrap();
+    fs::write(repo.join("docs/CHANGELOG.md"), "# Changes\n").unwrap();
+    fs::write(
+        repo.join(".knaix.toml"),
+        "[upload]\ninclude = [\"**/*.md\"]\nexclude = [\"**/CHANGELOG.md\"]\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run(knaix(&home, &repo).args(["upload", ".", "--dry-run"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("keep.md"), "{stdout}");
+    assert!(
+        !stdout.contains("CHANGELOG.md") || stdout.contains("Skipping"),
+        "the project's exclude should apply: {stdout}"
+    );
+}
+
+/// Quiet drops commentary. It must not drop the thing the command was run for.
+#[test]
+fn quiet_drops_commentary_but_keeps_the_result() {
+    let home = scratch("quiet-home");
+    let repo = scratch("quiet-repo");
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/guide.md"), "# Guide\n").unwrap();
+
+    // `init` produces a file, so its confirmation is commentary and goes.
+    let (code, loud, _) = run(knaix(&home, &repo).args(["init", "--node-id", "acme"]));
+    assert_eq!(code, 0);
+    assert!(loud.contains("Wrote"), "loud init should confirm: {loud}");
+
+    let (code, quiet, stderr) =
+        run(knaix(&home, &repo).args(["-q", "init", "--node-id", "acme", "--force"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        quiet.trim().is_empty(),
+        "quiet init should say nothing: {quiet:?}"
+    );
+    assert!(
+        fs::read_to_string(repo.join(".knaix.toml"))
+            .unwrap()
+            .contains("acme"),
+        "but it must still do the work"
+    );
+
+    // `--dry-run` produces a report, so the report is the result and stays.
+    let (code, quiet, stderr) = run(knaix(&home, &repo).args(["-q", "upload", ".", "--dry-run"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        quiet.contains("guide.md"),
+        "quiet must keep the result: {quiet}"
+    );
+}
+
+/// A quiet flag that could hide a failure would make every script using it less
+/// safe than one that did not.
+#[test]
+fn quiet_never_hides_an_error() {
+    let home = scratch("quieterr-home");
+    let repo = scratch("quieterr-repo");
+
+    let (code, _, stderr) = run(knaix(&home, &repo).args(["-q", "upload", "no-such-path"]));
+    assert_eq!(code, 5, "a missing path is not found: {stderr}");
+    assert!(
+        stderr.contains("no-such-path"),
+        "the error must still name the path: {stderr}"
+    );
+
+    // And an auth failure still reports under quiet.
+    let (code, _, stderr) = run(knaix(&home, &repo).args(["-q", "chat", "hello"]));
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        !stderr.trim().is_empty(),
+        "quiet must not silence the reason"
+    );
+}

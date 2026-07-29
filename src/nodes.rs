@@ -180,10 +180,16 @@ pub struct KnaixContext {
     pub config: crate::config::Config,
     pub client: reqwest::Client,
     pub output_format: String,
+    /// Suppress commentary, keeping results and errors.
+    pub quiet: bool,
 }
 
 impl KnaixContext {
     pub fn new(output_format: String) -> Self {
+        Self::with_quiet(output_format, false)
+    }
+
+    pub fn with_quiet(output_format: String, quiet: bool) -> Self {
         let config = load_config();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -196,7 +202,47 @@ impl KnaixContext {
             config,
             client,
             output_format,
+            quiet,
         }
+    }
+
+    /// Print progress or commentary: what a person watching wants and a script
+    /// does not.
+    ///
+    /// Only this is silenced. Results still print and errors still reach
+    /// stderr, because a quiet flag that could hide a failure would make every
+    /// script using it less safe than one that did not.
+    pub fn info(&self, line: &str) {
+        if !self.quiet {
+            println!("{line}");
+        }
+    }
+
+    /// Whether to draw progress bars and spinners. They are commentary too, and
+    /// on a pipe they are noise that no reader will ever redraw.
+    pub fn show_progress(&self) -> bool {
+        !self.quiet
+    }
+
+    /// A spinner that draws nothing when quiet.
+    ///
+    /// Hidden rather than skipped so callers keep one code path: a caller that
+    /// has to branch around the spinner eventually branches around something
+    /// else too.
+    pub fn spinner(&self) -> ProgressBar {
+        self.drawn(ProgressBar::new_spinner())
+    }
+
+    /// A progress bar over a known length, hidden when quiet.
+    pub fn progress_bar(&self, len: u64) -> ProgressBar {
+        self.drawn(ProgressBar::new(len))
+    }
+
+    fn drawn(&self, pb: ProgressBar) -> ProgressBar {
+        if self.quiet {
+            pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
+        pb
     }
 
     pub fn get_token(&self) -> Result<&String> {
@@ -464,7 +510,7 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
     let token = ctx.get_token()?;
 
     // Show spinner while fetching nodes
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -653,7 +699,7 @@ pub async fn chat(
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars(
@@ -718,7 +764,7 @@ async fn chat_local(
     history: &[ChatTurn],
     verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars(
@@ -1216,14 +1262,14 @@ pub async fn upload_single_file(
         .context("Could not read file metadata")?
         .len();
 
-    println!(
+    ctx.info(&format!(
         "\n  {} {} ({})",
         "Uploading".cyan(),
         file_name.bold().white(),
         format_file_size(file_size).dimmed()
-    );
+    ));
 
-    let pb = ProgressBar::new(file_size);
+    let pb = ctx.progress_bar(file_size);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -1274,13 +1320,13 @@ pub async fn upload_single_file(
 
             if status.is_success() && data["success"].as_bool().unwrap_or(false) {
                 let chunks = data["data"]["chunkCount"].as_u64().unwrap_or(0);
-                println!(
+                ctx.info(&format!(
                     "  {} {} ingested ({} chunk{}).",
                     "✓".green(),
                     file_name.white(),
                     chunks,
                     if chunks == 1 { "" } else { "s" }
-                );
+                ));
                 Ok(chunks)
             } else {
                 let err = data["error"].as_str().unwrap_or("Unknown error");
@@ -1311,12 +1357,12 @@ async fn upload_local(
     let bytes = tokio::fs::read(path)
         .await
         .context("Could not read the file")?;
-    println!(
+    ctx.info(&format!(
         "\n  {} {} ({})",
         "Ingesting".cyan(),
         file_name.bold().white(),
         format_file_size(bytes.len() as u64).dimmed()
-    );
+    ));
 
     let encoded = BASE64.encode(&bytes);
     let resp = ctx
@@ -1345,7 +1391,7 @@ async fn upload_local(
     }
 
     let chunks = body["chunkCount"].as_u64().unwrap_or(0);
-    println!(
+    ctx.info(&format!(
         "  {} {} ingested ({} chunk{}), embedded by {}.",
         "\u{2713}".green(),
         file_name.white(),
@@ -1355,7 +1401,7 @@ async fn upload_local(
             .as_str()
             .unwrap_or("the node")
             .dimmed()
-    );
+    ));
     Ok(chunks)
 }
 
@@ -1372,22 +1418,31 @@ pub struct UploadSummary {
     pub failed: Vec<(String, String)>,
 }
 
+/// How an upload chooses files. Not whether it sends them: that is decided
+/// before this is built, because planning needs no node and sending does.
 pub struct UploadOptions {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub all: bool,
-    pub dry_run: bool,
 }
 
-pub async fn upload(
-    ctx: &KnaixContext,
-    target: &Target,
-    file_path: &str,
-    opts: &UploadOptions,
-) -> Result<()> {
+/// What an upload would send, worked out without touching the network.
+///
+/// Separated from sending because deciding which files qualify is entirely
+/// local: it reads the directory and the filters and nothing else. Keeping it
+/// joined to the send meant `--dry-run` needed a reachable node to answer a
+/// question no node is involved in.
+pub struct UploadPlan {
+    pub queue: Vec<PathBuf>,
+    pub summary: UploadSummary,
+    /// Set when the caller named one file rather than a directory.
+    pub single_file: Option<String>,
+}
+
+pub fn plan_upload(file_path: &str, opts: &UploadOptions) -> Result<UploadPlan> {
     let base_path = Path::new(file_path);
     if !base_path.exists() {
-        return Err(anyhow!("Path not found: {}", file_path));
+        return Err(anyhow!("Path not found: {}", file_path)).coded(Code::NotFound);
     }
 
     let filter = UploadFilter::new(&opts.include, &opts.exclude, opts.all)?;
@@ -1395,20 +1450,13 @@ pub async fn upload(
     if !base_path.is_dir() {
         // A named file is uploaded because it was named. Filters describe how
         // to search a directory, not permission to ignore an explicit request.
-        let file_name = file_name_of(base_path);
-        if opts.dry_run {
-            println!("  {} {}", "would ingest".dimmed(), file_name);
-            return Ok(());
-        }
-        return upload_single_file(ctx, target, base_path, &file_name)
-            .await
-            .map(|_| ());
+        return Ok(UploadPlan {
+            queue: vec![base_path.to_path_buf()],
+            summary: UploadSummary::default(),
+            single_file: Some(file_name_of(base_path)),
+        });
     }
 
-    println!("{} Scanning {}", "Info:".blue(), file_path.bold());
-
-    // Collect first so the count is known before uploading, which is what
-    // makes "3 of 12" possible and lets --dry-run report without sending.
     let mut queue: Vec<PathBuf> = Vec::new();
     let mut summary = UploadSummary::default();
 
@@ -1446,31 +1494,67 @@ pub async fn upload(
     summary.pruned_dirs.sort();
     summary.pruned_dirs.dedup();
 
-    if opts.dry_run {
-        report_dry_run(&queue, &summary, base_path);
-        return Ok(());
+    Ok(UploadPlan {
+        queue,
+        summary,
+        single_file: None,
+    })
+}
+
+/// Report a plan without sending anything. Needs no node.
+pub fn report_plan(plan: &UploadPlan, file_path: &str) {
+    if let Some(name) = &plan.single_file {
+        println!("  {} {}", "would ingest".dimmed(), name);
+        return;
+    }
+    report_dry_run(&plan.queue, &plan.summary, Path::new(file_path));
+}
+
+/// Send a plan. The plan is made first and separately, so a bad path or a glob
+/// that matches nothing is reported before a node is ever resolved: typing a
+/// path that does not exist should say so, not ask you to log in.
+pub async fn upload(
+    ctx: &KnaixContext,
+    target: &Target,
+    file_path: &str,
+    plan: UploadPlan,
+) -> Result<()> {
+    let base_path = Path::new(file_path);
+
+    let UploadPlan {
+        queue,
+        mut summary,
+        single_file,
+    } = plan;
+
+    if let Some(file_name) = single_file {
+        return upload_single_file(ctx, target, base_path, &file_name)
+            .await
+            .map(|_| ());
     }
 
+    ctx.info(&format!("{} Scanning {}", "Info:".blue(), file_path.bold()));
+
     if queue.is_empty() {
-        println!(
+        ctx.info(&format!(
             "{} Nothing to ingest. {} file(s) were skipped; pass {} to see why, or {} to send everything.",
             "Info:".blue(),
             summary.skipped.len(),
             "--dry-run".cyan(),
             "--all".cyan()
-        );
+        ));
         return Ok(());
     }
 
     let total = queue.len();
     for (i, path) in queue.iter().enumerate() {
         let file_name = file_name_of(path);
-        println!(
+        ctx.info(&format!(
             "  {} {} of {}",
             "[".dimmed(),
             i + 1,
             format!("{}]", total).dimmed()
-        );
+        ));
         // One bad file must not abandon the rest: a partial ingest that stops
         // wherever it happened to fail is worse than a complete one with a
         // named failure, because nothing says how far it got.
@@ -1486,7 +1570,9 @@ pub async fn upload(
         }
     }
 
-    report_summary(&summary);
+    if ctx.show_progress() {
+        report_summary(&summary);
+    }
 
     if summary.failed.is_empty() {
         Ok(())
@@ -1651,7 +1737,7 @@ pub async fn get_metrics_for(ctx: &KnaixContext, target: &Target) -> Result<()> 
 pub async fn get_metrics(ctx: &KnaixContext, node_id: &str) -> Result<()> {
     let token = ctx.get_token()?;
 
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -1757,7 +1843,7 @@ pub async fn get_logs_for(ctx: &KnaixContext, target: &Target, lines: usize) -> 
 pub async fn get_logs(ctx: &KnaixContext, node_id: &str, lines: usize) -> Result<()> {
     let token = ctx.get_token()?;
 
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -1822,7 +1908,7 @@ pub async fn get_logs(ctx: &KnaixContext, node_id: &str, lines: usize) -> Result
 pub async fn up(ctx: &KnaixContext) -> Result<()> {
     let token = ctx.get_token()?;
 
-    let pb = ProgressBar::new_spinner();
+    let pb = ctx.spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")

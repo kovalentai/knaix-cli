@@ -27,6 +27,10 @@ struct Cli {
     #[clap(short = 'o', long = "output", default_value = "text", global = true)]
     pub output: String,
 
+    /// Suppress progress and commentary; results and errors still print
+    #[clap(short = 'q', long, global = true)]
+    pub quiet: bool,
+
     /// Print version information
     #[clap(short = 'v', short_alias = 'V', long)]
     pub version: bool,
@@ -374,7 +378,7 @@ async fn run() -> Result<()> {
         }
     };
 
-    let ctx = KnaixContext::new(cli.output.clone());
+    let ctx = KnaixContext::with_quiet(cli.output.clone(), cli.quiet);
 
     // Read once. A file that cannot be parsed stops the command rather than
     // being skipped, or the command runs under settings the file does not ask
@@ -483,24 +487,35 @@ async fn run() -> Result<()> {
                 include: project_globs(include, project.as_ref().map(|p| &p.upload.include)),
                 exclude: project_globs(exclude, project.as_ref().map(|p| &p.upload.exclude)),
                 all,
-                dry_run,
             };
 
             if stdin_arg::is_stdin(&file_path) {
-                // Staged to a real file so piped content goes through the same
-                // upload path as a named one, rather than a second code path
-                // that would drift from it.
-                let bytes = stdin_arg::read_bytes("the document")?;
-                let staged = stdin_arg::TempFile::write(&name, &bytes)?;
-                if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                    if dry_run {
-                        println!("  {} {}", "would ingest".dimmed(), name);
-                    } else {
-                        nodes::upload_single_file(&ctx, &target, staged.path(), &name).await?;
+                // The name is checked before anything is read, so a bad one
+                // fails on the argument rather than after consuming the pipe.
+                let checked = stdin_arg::checked_name(&name)?.to_string();
+                if dry_run {
+                    println!("  {} {}", "would ingest".dimmed(), checked);
+                } else {
+                    // Staged to a real file so piped content goes through the
+                    // same upload path as a named one, rather than a second
+                    // code path that would drift from it.
+                    let bytes = stdin_arg::read_bytes("the document")?;
+                    let staged = stdin_arg::TempFile::write(&checked, &bytes)?;
+                    if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                        nodes::upload_single_file(&ctx, &target, staged.path(), &checked).await?;
                     }
                 }
-            } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                nodes::upload(&ctx, &target, &file_path, &opts).await?;
+            } else {
+                // Planning is entirely local: which files qualify is decided by
+                // the directory and the filters. Doing it first means --dry-run
+                // needs no node, and a bad path is reported as a bad path
+                // rather than as whatever the node happened to say.
+                let plan = nodes::plan_upload(&file_path, &opts)?;
+                if dry_run {
+                    nodes::report_plan(&plan, &file_path);
+                } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                    nodes::upload(&ctx, &target, &file_path, plan).await?;
+                }
             }
         }
         Commands::Init {
@@ -524,17 +539,19 @@ async fn run() -> Result<()> {
             };
             project::write(&path, &settings, force)?;
 
-            println!(
+            // The file is what init produces. Saying so is for the person
+            // watching, so it goes when they ask for quiet.
+            ctx.info(&format!(
                 "{} Wrote {}",
                 "✓".green(),
                 path.display().to_string().bold()
-            );
+            ));
             match &settings.node {
-                Some(node) => println!("  Commands run here address {}.", node.cyan()),
-                None => println!(
+                Some(node) => ctx.info(&format!("  Commands run here address {}.", node.cyan())),
+                None => ctx.info(&format!(
                     "  No node recorded. Set one with {}, or edit the file.",
                     brand::cmd("init --node-id <NODE>").as_str()
-                ),
+                )),
             }
         }
         Commands::Status => {
