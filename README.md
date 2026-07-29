@@ -112,6 +112,7 @@ cargo install --path .
 | `knaix up`       | Provision a hosted node on your Kovalent account.     |
 | `knaix list`     | List your hosted nodes, or the documents on one node. |
 | `knaix use`      | Set the default node for later commands.              |
+| `knaix init`     | Write a `.knaix.toml` so a repository remembers its node and what to ingest. |
 | `knaix repl`     | Start an interactive chat session with a node.        |
 | `knaix chat`     | Ask a node one question and print the grounded answer.|
 | `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
@@ -128,6 +129,56 @@ cargo install --path .
 **Global Flags:**
 - `-o json`, `--output json`: Emit structured JSON instead of formatted tables.
 - `--version`: Output the current installed binary version.
+
+### Project settings (`.knaix.toml`)
+
+Which node a repository belongs to, and which of its files are worth ingesting,
+are properties of the repository rather than of your machine. `knaix init`
+writes them down so they can be reviewed with everything else:
+
+```bash
+knaix init --node-id acme-prod --include 'docs/**/*.md' --exclude '**/CHANGELOG.md'
+```
+
+```toml
+# How this repository talks to Kovalent.
+# Commands run anywhere under this directory read this file.
+
+# The node these commands address. A --node-id flag still wins.
+node = "acme-prod"
+
+[upload]
+# Which files 'knaix upload .' ingests. Flags replace these, not add to them.
+include = ["docs/**/*.md"]
+exclude = ["**/CHANGELOG.md"]
+```
+
+The file is found by walking up from the working directory, the way `git` finds
+its root, so commands work from a subdirectory. A node is chosen in this order:
+a `--node-id` flag, then `.knaix.toml`, then the default set by `knaix use`.
+Globs replace rather than merge, since narrowing for one command is the reason
+to pass them.
+
+A `.knaix.toml` that cannot be parsed stops the command rather than being
+ignored. Running under different settings than the file asks for, while the file
+looks correct, is the worse failure.
+
+### Reading from a pipe
+
+`-` means standard input, so `knaix` composes with the rest of the shell:
+
+```bash
+git log --since=1.week --oneline | knaix chat -
+```
+
+```bash
+generate-report | knaix upload - --name weekly-report.md
+```
+
+`--name` sets what piped content is filed under, which is what citations will
+show. Only a bare `-` is special; a path that merely starts with one is a path.
+Empty input is refused with exit code 2, because the usual way to reach it is a
+pipeline whose first stage produced nothing.
 
 ## Using a node from your editor
 
