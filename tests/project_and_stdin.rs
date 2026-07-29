@@ -166,6 +166,67 @@ fn a_broken_project_file_stops_the_command() {
     );
 }
 
+/// `init` is how a broken file gets replaced, so it must not be blocked by the
+/// very file it would overwrite. Every other command still refuses.
+#[test]
+fn init_still_runs_when_the_existing_file_is_broken() {
+    let home = scratch("rescue-home");
+    let repo = scratch("rescue-repo");
+    fs::write(repo.join(".knaix.toml"), "node = [broken\n").unwrap();
+
+    // Every other command stops.
+    let (code, _, _) = run(knaix(&home, &repo).args(["chat", "hello"]));
+    assert_eq!(code, 2, "a broken file should stop an ordinary command");
+
+    // init repairs it.
+    let (code, _, stderr) =
+        run(knaix(&home, &repo).args(["init", "--node-id", "rescued", "--force"]));
+    assert_eq!(
+        code, 0,
+        "init must be able to replace a broken file: {stderr}"
+    );
+
+    let written = fs::read_to_string(repo.join(".knaix.toml")).unwrap();
+    assert!(written.contains("rescued"), "{written}");
+
+    // And the repaired file is readable by an ordinary command again.
+    let (code, _, _) = run(knaix(&home, &repo).args(["chat", "hello"]));
+    assert_eq!(code, 3, "no token, so auth rather than a parse failure");
+}
+
+/// A name decides where bytes land, and the cleanup that follows decides what
+/// gets deleted. An absolute name once escaped the staging directory and made
+/// the cleanup remove that path's parent instead.
+#[test]
+fn an_upload_name_that_is_a_path_is_refused() {
+    let home = scratch("badname-home");
+    let repo = scratch("badname-repo");
+    let bystander = scratch("badname-bystander");
+    fs::write(bystander.join("keep.txt"), b"keep me").unwrap();
+
+    let target = bystander.join("escaped.md");
+    let (code, _, stderr) = pipe_in(
+        knaix(&home, &repo).args([
+            "upload",
+            "-",
+            "--name",
+            target.to_str().unwrap(),
+            "--dry-run",
+        ]),
+        b"content",
+    );
+
+    assert_eq!(code, 2, "an absolute name is a usage error: {stderr}");
+    assert!(
+        !target.exists(),
+        "nothing should be written outside staging"
+    );
+    assert!(
+        bystander.join("keep.txt").exists(),
+        "the neighbouring directory must survive"
+    );
+}
+
 #[test]
 fn chat_reads_the_question_from_a_pipe() {
     let home = scratch("pipe-home");

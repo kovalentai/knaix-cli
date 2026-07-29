@@ -379,7 +379,15 @@ async fn run() -> Result<()> {
     // Read once. A file that cannot be parsed stops the command rather than
     // being skipped, or the command runs under settings the file does not ask
     // for while the file looks correct.
-    let project = project::current()?;
+    //
+    // Except for `init`, which is how a broken file gets replaced. Refusing to
+    // run it leaves the one command that would fix the problem unreachable, and
+    // the only way out is to delete the file by hand.
+    let project = if matches!(command, Commands::Init { .. }) {
+        None
+    } else {
+        project::current()?
+    };
 
     match command {
         Commands::Login => {
