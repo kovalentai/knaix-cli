@@ -62,10 +62,20 @@ the box.
 
 ## Installation
 
-### Primary Install (macOS & Linux)
+### Homebrew (macOS & Linux)
+```bash
+brew install kovalentai/tap/knaix
+```
+Brings `brew upgrade knaix`, `brew uninstall knaix`, and shell completions.
+
+### Install script (macOS & Linux)
 ```bash
 curl -sSL https://knaix.com/install.sh | sh
 ```
+That script is the single installer, and it lives in `kovalentai/knaix-docs`
+(`public/install.sh`). It is deliberately not duplicated here: a second copy
+drifted from it once already, and a copy attached to a release would be frozen
+at the version it shipped with.
 
 ### Source Compilation (Requires Rust toolchain)
 ```bash
