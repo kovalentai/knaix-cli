@@ -6,13 +6,15 @@ mod login;
 mod mcp;
 mod model_server;
 mod nodes;
+mod project;
 mod repl;
 mod selftest;
 mod shell;
+mod stdin_arg;
 mod update;
 mod upload_filter;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use nodes::KnaixContext;
@@ -55,13 +57,32 @@ enum Commands {
         node_id: String,
     },
 
+    /// Write a .knaix.toml so this repo remembers its node and what to ingest
+    Init {
+        /// The node commands in this repo should address
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// Only ingest files matching these glob patterns (repeatable)
+        #[clap(long)]
+        include: Vec<String>,
+
+        /// Skip files matching these glob patterns (repeatable)
+        #[clap(long)]
+        exclude: Vec<String>,
+
+        /// Overwrite an existing .knaix.toml
+        #[clap(long)]
+        force: bool,
+    },
+
     /// Ask a node one question and print the grounded answer
     Chat {
         /// The node to ask (falls back to the default)
         #[clap(short = 'n', long = "node-id")]
         node_id: Option<String>,
 
-        /// The question to ask
+        /// The question to ask, or '-' to read it from standard input
         message: String,
 
         /// Answer in one or two sentences (local node only)
@@ -79,8 +100,12 @@ enum Commands {
         #[clap(short = 'n', long = "node-id")]
         node_id: Option<String>,
 
-        /// Path to the file or directory to ingest
+        /// Path to the file or directory to ingest, or '-' for standard input
         file_path: String,
+
+        /// Name to file piped input under (only with '-')
+        #[clap(long, default_value = "stdin.md")]
+        name: String,
 
         /// Only ingest files matching these glob patterns (repeatable)
         #[clap(long)]
@@ -307,6 +332,25 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// Which node a command addresses: an explicit flag, then the project file,
+/// then whatever `resolve_target` falls back to.
+///
+/// The flag wins because it was typed for this one command. The project file
+/// beats the machine's saved default because it is the more specific statement:
+/// the repo says which node its documents belong to.
+fn project_node(flag: Option<String>, project: Option<&project::Project>) -> Option<String> {
+    flag.or_else(|| project.and_then(|p| p.node.clone()))
+}
+
+/// Globs replace rather than merge. Adding to a project's list would leave no
+/// way to narrow it for one command, and narrowing is the reason to pass them.
+fn project_globs(flags: Vec<String>, from_project: Option<&Vec<String>>) -> Vec<String> {
+    if !flags.is_empty() {
+        return flags;
+    }
+    from_project.cloned().unwrap_or_default()
+}
+
 async fn run() -> Result<()> {
     let update_task = tokio::spawn(async {
         update::check_for_update_async().await;
@@ -331,6 +375,19 @@ async fn run() -> Result<()> {
     };
 
     let ctx = KnaixContext::new(cli.output.clone());
+
+    // Read once. A file that cannot be parsed stops the command rather than
+    // being skipped, or the command runs under settings the file does not ask
+    // for while the file looks correct.
+    //
+    // Except for `init`, which is how a broken file gets replaced. Refusing to
+    // run it leaves the one command that would fix the problem unreachable, and
+    // the only way out is to delete the file by hand.
+    let project = if matches!(command, Commands::Init { .. }) {
+        None
+    } else {
+        project::current()?
+    };
 
     match command {
         Commands::Login => {
@@ -382,6 +439,12 @@ async fn run() -> Result<()> {
             } else {
                 nodes::Verbosity::Normal
             };
+            let message = if stdin_arg::is_stdin(&message) {
+                stdin_arg::read_text("the question")?
+            } else {
+                message
+            };
+            let node_id = project_node(node_id, project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 // Verbosity shapes the local node's system prompt; a hosted node
                 // is prompted by the control plane, so say the flag had no effect
@@ -409,19 +472,69 @@ async fn run() -> Result<()> {
         Commands::Upload {
             node_id,
             file_path,
+            name,
             include,
             exclude,
             all,
             dry_run,
         } => {
-            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                let opts = nodes::UploadOptions {
-                    include,
-                    exclude,
-                    all,
-                    dry_run,
-                };
+            let node_id = project_node(node_id, project.as_ref());
+            let opts = nodes::UploadOptions {
+                include: project_globs(include, project.as_ref().map(|p| &p.upload.include)),
+                exclude: project_globs(exclude, project.as_ref().map(|p| &p.upload.exclude)),
+                all,
+                dry_run,
+            };
+
+            if stdin_arg::is_stdin(&file_path) {
+                // Staged to a real file so piped content goes through the same
+                // upload path as a named one, rather than a second code path
+                // that would drift from it.
+                let bytes = stdin_arg::read_bytes("the document")?;
+                let staged = stdin_arg::TempFile::write(&name, &bytes)?;
+                if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                    if dry_run {
+                        println!("  {} {}", "would ingest".dimmed(), name);
+                    } else {
+                        nodes::upload_single_file(&ctx, &target, staged.path(), &name).await?;
+                    }
+                }
+            } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::upload(&ctx, &target, &file_path, &opts).await?;
+            }
+        }
+        Commands::Init {
+            node_id,
+            include,
+            exclude,
+            force,
+        } => {
+            // Written where the command was run, not at a discovered root: the
+            // point is to mark this directory as the project.
+            let path = std::env::current_dir()
+                .context("Could not read the current directory")?
+                .join(project::FILE_NAME);
+
+            // Fall back to the saved default so the common case needs no flag,
+            // and the file records the node rather than leaving it implicit.
+            let node = node_id.or_else(|| ctx.config.default_node_id.clone());
+            let settings = project::Project {
+                node,
+                upload: project::Upload { include, exclude },
+            };
+            project::write(&path, &settings, force)?;
+
+            println!(
+                "{} Wrote {}",
+                "✓".green(),
+                path.display().to_string().bold()
+            );
+            match &settings.node {
+                Some(node) => println!("  Commands run here address {}.", node.cyan()),
+                None => println!(
+                    "  No node recorded. Set one with {}, or edit the file.",
+                    brand::cmd("init --node-id <NODE>").as_str()
+                ),
             }
         }
         Commands::Status => {
@@ -514,7 +627,7 @@ async fn run() -> Result<()> {
             }
         }
         Commands::Metrics { node_id, node } => {
-            let node_id = node.or(node_id);
+            let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::get_metrics_for(&ctx, &target).await?;
             }
@@ -524,13 +637,13 @@ async fn run() -> Result<()> {
             node,
             lines,
         } => {
-            let node_id = node.or(node_id);
+            let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::get_logs_for(&ctx, &target, lines).await?;
             }
         }
         Commands::Repl { node_id, node } => {
-            let node_id = node.or(node_id);
+            let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 repl::run(&ctx, &target).await?;
             }
@@ -561,7 +674,7 @@ async fn run() -> Result<()> {
             quick,
             sweep,
         } => {
-            let node_id = node.or(node_id);
+            let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 selftest::run(&ctx, &target, keep, quick, sweep).await?;
             }
@@ -601,7 +714,7 @@ async fn run() -> Result<()> {
             node,
             file,
         } => {
-            let node_id = node.or(node_id);
+            let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 let key = nodes::memory_key(&target);
                 nodes::view_memory(&ctx, &key, file.as_deref()).await?;
