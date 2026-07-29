@@ -172,6 +172,25 @@ fn the_same_lookup_against_a_dead_api_is_unavailable() {
     assert_eq!(code, 4, "an unreachable API should be Unavailable");
 }
 
+/// Docker missing is the precondition case these codes exist for, and it broke
+/// once already: the helper attached the code, and the caller rebuilt the error
+/// with `anyhow!("...: {e}")`, which dropped it and reported a plain failure.
+/// Rebuilding an error anywhere in this path will fail this test.
+#[test]
+fn a_missing_docker_is_a_precondition_not_a_generic_failure() {
+    let home = scratch_home("nodocker");
+    let empty = scratch_home("emptypath");
+
+    let code = code_of(
+        knaix(&home)
+            // The binary is invoked by absolute path, so emptying PATH hides
+            // docker without hiding knaix.
+            .env("PATH", &empty)
+            .args(["local", "reset", "--yes"]),
+    );
+    assert_eq!(code, 7, "a missing docker should be Precondition");
+}
+
 /// Tagging a failure must not change what the user reads.
 #[test]
 fn the_error_text_still_says_what_went_wrong() {

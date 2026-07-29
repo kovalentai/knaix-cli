@@ -294,8 +294,10 @@ async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::from(exit::Code::Ok.as_u8()),
         Err(e) => {
-            // Same rendering anyhow gave us when it handled this: the message,
-            // then each cause. Only the code returned to the shell is new.
+            // anyhow used to render this via Termination's Debug formatting.
+            // Taking the exit code back means rendering it here, so the causes
+            // are printed in the house style rather than anyhow's numbered
+            // "Caused by:" block.
             eprintln!("{} {}", "Error:".red(), e);
             for cause in e.chain().skip(1) {
                 eprintln!("  {} {}", "caused by:".dimmed(), cause);

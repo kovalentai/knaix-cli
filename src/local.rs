@@ -154,14 +154,14 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
 }
 
 fn docker_available() -> Result<()> {
+    // Context rather than a rebuilt error: rebuilding drops the code the
+    // helper attached, and a missing Docker is the precondition case the exit
+    // codes exist for. A daemon that is installed but not running is the same
+    // precondition, so it is tagged here too.
     docker(&["info", "--format", "{{.ServerVersion}}"])
         .map(|_| ())
-        .map_err(|e| {
-            anyhow!(
-                "Docker is not available: {}. Start Docker and try again.",
-                e
-            )
-        })
+        .context("Docker is not available. Start Docker and try again.")
+        .coded(Code::Precondition)
 }
 
 /// Container state as docker reports it: running, exited, or absent.
@@ -442,7 +442,7 @@ pub async fn up(
     args.push(tag.clone());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker(&arg_refs).map_err(|e| anyhow!("Could not start the local node: {}", e))?;
+    docker(&arg_refs).context("Could not start the local node")?;
 
     let node = LocalNode {
         port: launch.port,
@@ -733,7 +733,7 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
     // A running node holds the name and port; free them first. up() starts a
     // stopped or absent one on its own.
     if running {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
     }
     // The choice is passed explicitly, not left to memory: it silences the
     // "from last time" line, and mock=true when the mock was just chosen
@@ -838,7 +838,7 @@ pub async fn reset(yes: bool) -> Result<()> {
     // The running container holds the volume open; remove it so the store can
     // be deleted, then let up() recreate an empty one.
     if container_state().is_some() {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
     }
     match docker(&["volume", "rm", VOLUME]) {
         Ok(_) => println!("{} Local store deleted.", "✓".green()),
@@ -863,7 +863,7 @@ pub fn down(purge: bool) -> Result<()> {
     if container_state().is_none() {
         println!("{} No local node is running.", "Info:".blue());
     } else {
-        docker(&["rm", "-f", CONTAINER]).map_err(|e| anyhow!("Could not stop the node: {}", e))?;
+        docker(&["rm", "-f", CONTAINER]).context("Could not stop the node")?;
         println!("{} Local node stopped.", "✓".green());
     }
 
@@ -1000,8 +1000,8 @@ pub fn logs(lines: usize) -> Result<()> {
         ));
     }
     let n = lines.to_string();
-    let out = docker(&["logs", "--tail", &n, CONTAINER])
-        .map_err(|e| anyhow!("Could not read the node's logs: {}", e))?;
+    let out =
+        docker(&["logs", "--tail", &n, CONTAINER]).context("Could not read the node's logs")?;
     println!("{}", out);
     Ok(())
 }
