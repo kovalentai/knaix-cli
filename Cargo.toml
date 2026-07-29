@@ -28,7 +28,7 @@ getrandom = "0.2"
 sha2 = "0.10"
 indicatif = "0.18.4"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
-rustyline = "17"
+rustyline = { version = "17", features = ["derive"] }
 termimad = "0.35"
 crossterm = "0.29"
 anyhow = "1.0"

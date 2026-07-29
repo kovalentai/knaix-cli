@@ -288,7 +288,16 @@ pub const WORDMARK: &str = "knaix";
 
 /// The `knaix` wordmark in the brand gradient.
 pub fn wordmark() -> String {
-    gradient(WORDMARK, level())
+    wordmark_at(level())
+}
+
+/// The wordmark at a caller-supplied level.
+///
+/// Split out for the same reason `level_for` is: a caller that needs to render
+/// at a known level, or a test that must not race the process environment, can
+/// say which level it means instead of setting an env var.
+pub fn wordmark_at(lvl: Level) -> String {
+    gradient(WORDMARK, lvl)
 }
 
 /// Sample the ramp once per letter of the wordmark.
@@ -332,13 +341,17 @@ pub fn ramp_256() -> Vec<u8> {
 /// rather than joining the gradient: the gradient marks the product, not the
 /// command.
 pub fn cmd(rest: &str) -> String {
-    let lvl = level();
-    let mark = gradient("knaix", lvl);
+    cmd_at(level(), rest)
+}
+
+/// A command hint at a caller-supplied level. See `wordmark_at`.
+pub fn cmd_at(lvl: Level, rest: &str) -> String {
+    let mark = gradient(WORDMARK, lvl);
     if rest.is_empty() {
         return mark;
     }
     match lvl {
-        Level::None => format!("knaix {rest}"),
+        Level::None => format!("{WORDMARK} {rest}"),
         _ => format!("{mark} {CYAN}{rest}{RESET}"),
     }
 }
