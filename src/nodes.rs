@@ -1,4 +1,5 @@
 use crate::config::load_config;
+use crate::exit::{Code, WithCode};
 use crate::upload_filter::{SkipReason, UploadFilter};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -203,6 +204,7 @@ impl KnaixContext {
             .token
             .as_ref()
             .context("Not logged in. Run 'knaix login' first.")
+            .coded(Code::Auth)
     }
 }
 
@@ -237,12 +239,14 @@ impl Target {
 
 /// Resolve the local node, failing with the command that would start it.
 fn local_target() -> Result<Target> {
-    let node = crate::local::load().ok_or_else(|| {
-        anyhow!(
-            "No local node has been started. Run '{}' first.",
-            "knaix local up"
-        )
-    })?;
+    let node = crate::local::load()
+        .ok_or_else(|| {
+            anyhow!(
+                "No local node has been started. Run '{}' first.",
+                "knaix local up"
+            )
+        })
+        .coded(Code::Precondition)?;
     Ok(Target::Local {
         base: node.base_url(),
         instance_id: node.instance_id,
@@ -293,7 +297,8 @@ async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
         return Err(anyhow!(
             "Failed to fetch nodes: HTTP {}. Are you logged in?",
             resp.status()
-        ));
+        ))
+        .coded(Code::for_status(resp.status().as_u16()));
     }
 
     let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -369,7 +374,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 println!("{table}\n");
             }
         } else {
-            return Err(anyhow!("Failed to fetch documents: HTTP {}", resp.status()));
+            return Err(anyhow!("Failed to fetch documents: HTTP {}", resp.status()))
+                .coded(Code::for_status(resp.status().as_u16()));
         }
         return Ok(());
     }
@@ -448,7 +454,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
             println!("{table}\n");
         }
     } else {
-        return Err(anyhow!("Failed to fetch nodes: HTTP {}", resp.status()));
+        return Err(anyhow!("Failed to fetch nodes: HTTP {}", resp.status()))
+            .coded(Code::for_status(resp.status().as_u16()));
     }
     Ok(())
 }
@@ -482,7 +489,8 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         return Err(anyhow!(
             "Failed to fetch node list (HTTP {}). Are you logged in?",
             resp.status()
-        ));
+        ))
+        .coded(Code::for_status(resp.status().as_u16()));
     }
 
     let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -565,7 +573,8 @@ pub async fn resolve_node_uuid(ctx: &KnaixContext, wanted: &str) -> Result<Strin
         None => Err(anyhow!(
             "No node matches '{}'. Run 'knaix list' to see your nodes.",
             wanted
-        )),
+        ))
+        .coded(Code::NotFound),
     }
 }
 
@@ -677,7 +686,8 @@ pub async fn chat(
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let detail = body["error"].as_str().unwrap_or("no detail");
-        return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail));
+        return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail))
+            .coded(Code::for_status(status.as_u16()));
     }
 
     let (text, citations, model) = read_chat_stream(resp, &pb, stream_to_stdout).await?;
@@ -754,7 +764,8 @@ async fn chat_local(
             "Local node could not answer: HTTP {} - {}",
             status,
             detail
-        ));
+        ))
+        .coded(Code::for_status(status.as_u16()));
     }
 
     let (text, citations, model) = read_local_answer_stream(resp, &pb, print).await?;
@@ -801,7 +812,8 @@ async fn chat_local_blocking(
             "Local node could not answer: HTTP {} - {}",
             status,
             detail
-        ));
+        ))
+        .coded(Code::for_status(status.as_u16()));
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -1273,6 +1285,7 @@ pub async fn upload_single_file(
             } else {
                 let err = data["error"].as_str().unwrap_or("Unknown error");
                 Err(anyhow!("Upload failed: HTTP {} - {}", status, err))
+                    .coded(Code::for_status(status.as_u16()))
             }
         }
         Err(e) => {
@@ -1327,7 +1340,8 @@ async fn upload_local(
             .as_str()
             .or_else(|| body["error"].as_str())
             .unwrap_or("unknown error");
-        return Err(anyhow!("Ingest failed: HTTP {} - {}", status, detail));
+        return Err(anyhow!("Ingest failed: HTTP {} - {}", status, detail))
+            .coded(Code::for_status(status.as_u16()));
     }
 
     let chunks = body["chunkCount"].as_u64().unwrap_or(0);
@@ -1721,6 +1735,7 @@ pub async fn get_metrics(ctx: &KnaixContext, node_id: &str) -> Result<()> {
             } else {
                 pb.finish_and_clear();
                 Err(anyhow!("Failed to fetch metrics: HTTP {}", resp.status()))
+                    .coded(Code::for_status(resp.status().as_u16()))
             }
         }
         Err(e) => {
@@ -1794,6 +1809,7 @@ pub async fn get_logs(ctx: &KnaixContext, node_id: &str, lines: usize) -> Result
                 Ok(())
             } else {
                 Err(anyhow!("Failed to fetch logs: HTTP {}", resp.status()))
+                    .coded(Code::for_status(resp.status().as_u16()))
             }
         }
         Err(e) => {

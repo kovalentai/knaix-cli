@@ -25,6 +25,7 @@
 //!   So the block is printed with the real address and a placeholder key, and
 //!   the output says plainly what else has to be true.
 
+use crate::exit::{Code, WithCode};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use serde::Deserialize;
@@ -109,7 +110,8 @@ async fn remote(ctx: &KnaixContext, uuid: &str) -> Result<()> {
         return Err(anyhow!(
             "Could not read that node's connection details ({}).",
             response.status()
-        ));
+        ))
+        .coded(Code::for_status(response.status().as_u16()));
     }
 
     let connection: ConnectionResponse = response

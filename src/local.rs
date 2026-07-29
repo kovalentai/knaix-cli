@@ -10,6 +10,7 @@
 //! is what makes it worth testing against, and what makes "your data never
 //! leaves the machine" checkable rather than promised.
 
+use crate::exit::{Code, WithCode};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use serde::{Deserialize, Serialize};
@@ -122,7 +123,8 @@ fn docker(args: &[&str]) -> Result<String> {
     let out = Command::new("docker")
         .args(args)
         .output()
-        .context("Could not run docker. Is Docker installed and running?")?;
+        .context("Could not run docker. Is Docker installed and running?")
+        .coded(Code::Precondition)?;
 
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -141,7 +143,8 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
     let status = Command::new("docker")
         .args(args)
         .status()
-        .context("Could not run docker. Is Docker installed and running?")?;
+        .context("Could not run docker. Is Docker installed and running?")
+        .coded(Code::Precondition)?;
 
     if status.success() {
         Ok(())
@@ -818,7 +821,8 @@ pub async fn reset(yes: bool) -> Result<()> {
         if !std::io::stdin().is_terminal() {
             return Err(anyhow!(
                 "Refusing to delete the local store without confirmation. Pass --yes to reset in a script."
-            ));
+            ))
+            .coded(Code::Denied);
         }
         let go = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt("Delete everything ingested into the local node and start fresh?")

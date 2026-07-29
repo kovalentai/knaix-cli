@@ -211,6 +211,42 @@ Knaix supports the following environment overrides for automated scripting:
 
 Values supplied through the environment apply to the running command only. They are never written to `~/.knaix/config.json`, so an ephemeral CI token does not outlive the job it was issued for.
 
+### Exit codes
+
+Every command exits with one of these. They let a script tell a refusal from a
+crash without parsing the error text.
+
+| Code | Name | Means |
+| ---: | --- | --- |
+| 0 | Ok | The command did what was asked. |
+| 1 | Error | Something failed and no more specific code fits. |
+| 2 | Usage | The command line was wrong: unknown flag, missing argument. |
+| 3 | Auth | Not logged in, or the credential was rejected. |
+| 4 | Unavailable | A node or the control plane could not be reached. |
+| 5 | NotFound | The node, document, or thread named does not exist. |
+| 6 | Denied | Refused on purpose: a policy said no, or a confirmation was declined. |
+| 7 | Precondition | The machine is not ready: no local node running, Docker absent. |
+
+The distinction that matters most in a pipeline is 4 against 3 and 6. A 4 is
+worth retrying, because the far end was not there. A 3 or a 6 is not: the far
+end answered, and said no.
+
+```bash
+knaix chat "what changed this week?" || case $? in
+  3) echo "log in first" ;;
+  4) echo "node is down, retrying later" ;;
+  *) echo "gave up" ;;
+esac
+```
+
+Declining an interactive confirmation exits 0, not 6. Nothing failed and nothing
+was done. The refusal codes are for the non-interactive case, where a script
+asked for something it had not authorised: `knaix local reset` without `--yes`
+exits 6 rather than deleting the store.
+
+These numbers are part of the interface. Changing what one means is a breaking
+change, and `tests/exit_codes.rs` asserts each of them against the real binary.
+
 ---
 
 <div align="center">
