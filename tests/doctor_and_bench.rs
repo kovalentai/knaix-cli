@@ -38,6 +38,7 @@ fn write_config(home: &Path, json: &str) {
 struct Run {
     code: i32,
     stdout: String,
+    stderr: String,
 }
 
 fn run(cmd: &mut Command) -> Run {
@@ -45,7 +46,36 @@ fn run(cmd: &mut Command) -> Run {
     Run {
         code: out.status.code().expect("knaix was killed by a signal"),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
     }
+}
+
+/// A `docker` on PATH that behaves as told, so the states a real daemon will
+/// not enter on demand can be tested.
+///
+/// Returns a directory to put at the front of PATH. The binary is invoked by
+/// absolute path, so this hides docker without hiding knaix.
+fn fake_docker(home: &Path, script: &str) -> PathBuf {
+    let bin = home.join("fakebin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("docker");
+    fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// Record a newer release as already found, the way the background check would.
+/// `last_update_check` is far enough ahead that the check does not run again and
+/// overwrite it.
+fn cache_a_newer_version(home: &Path, config: &str) {
+    let mut v: serde_json::Value = serde_json::from_str(config).unwrap();
+    v["latest_known_version"] = serde_json::json!("999.0.0");
+    v["last_update_check"] = serde_json::json!(99_999_999_999u64);
+    write_config(home, &v.to_string());
 }
 
 fn checks(stdout: &str) -> serde_json::Value {
@@ -178,15 +208,105 @@ fn bench_reports_an_unreachable_node_before_it_ingests_anything() {
     )
     .unwrap();
 
-    let out = knaix(&home).arg("bench").output().expect("failed to run");
-    assert_eq!(
-        out.status.code(),
-        Some(4),
-        "an unreachable node should be Unavailable"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let out = run(knaix(&home).arg("bench"));
+    assert_eq!(out.code, 4, "an unreachable node should be Unavailable");
     assert!(
-        stderr.contains("Nothing was ingested"),
-        "the failure should say the node was left alone, got: {stderr}"
+        out.stderr.contains("Nothing was ingested"),
+        "the failure should say the node was left alone, got: {}",
+        out.stderr
+    );
+}
+
+/// Docker is the one dependency that can accept a question and never answer,
+/// and a wedged daemon is precisely a state doctor exists to name. Before the
+/// probe deadline it hung here forever, printing nothing at all -- the report
+/// that would have named the problem taken down by the problem.
+#[cfg(unix)]
+#[test]
+fn doctor_does_not_hang_on_a_wedged_docker_daemon() {
+    let home = scratch_home("wedged");
+    write_config(&home, r#"{"default_node_id":"local"}"#);
+    // Accepts the call and never returns, the way a wedged daemon does.
+    let bin = fake_docker(&home, "sleep 900");
+
+    let started = std::time::Instant::now();
+    let out = run(knaix(&home)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .arg("doctor"));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "doctor should give up on docker, took {elapsed:?}"
+    );
+    assert!(
+        out.stdout.contains("did not answer"),
+        "the report should name the wedged daemon, got: {}",
+        out.stdout
+    );
+    // And it is a warning, not the verdict: the local node not running is what
+    // actually stops a command, and that is the code the run carries.
+    assert_eq!(out.code, 7);
+}
+
+/// The banner goes to stdout after whatever the command printed. On a JSON run
+/// that lands after the document, and every script that parses the output
+/// breaks the day an upgrade is published.
+#[test]
+fn an_available_upgrade_does_not_break_json_output() {
+    let home = scratch_home("bannerjson");
+    cache_a_newer_version(&home, r#"{"default_node_id":"local"}"#);
+
+    // Not the usual helper: this needs the update check left switched on.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
+    cmd.env("HOME", &home)
+        .env("KNAIX_API_URL", "http://127.0.0.1:9")
+        .current_dir(&home)
+        .args(["-o", "json", "doctor"]);
+    let out = run(&mut cmd);
+
+    serde_json::from_str::<serde_json::Value>(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "JSON output did not parse ({e}); stdout was:\n{}",
+            out.stdout
+        )
+    });
+    // Parsing is the contract. The install command legitimately appears inside
+    // the document as the `cli` check's remedy, so the banner is identified by
+    // its own wording rather than by the URL the two share.
+    assert!(
+        !out.stdout
+            .contains("A new version of Knaix CLI is available"),
+        "the upgrade banner must not be appended to a JSON document"
+    );
+}
+
+/// doctor reports the version as one of its checks, so the trailing banner is
+/// the same news twice in one screen.
+#[test]
+fn doctor_does_not_repeat_the_upgrade_notice() {
+    let home = scratch_home("bannertext");
+    cache_a_newer_version(&home, r#"{"default_node_id":"local"}"#);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
+    cmd.env("HOME", &home)
+        .env("KNAIX_API_URL", "http://127.0.0.1:9")
+        .current_dir(&home)
+        .arg("doctor");
+    let out = run(&mut cmd);
+
+    assert!(
+        out.stdout.contains("999.0.0"),
+        "doctor should still report the available upgrade, got: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout
+            .contains("A new version of Knaix CLI is available"),
+        "the banner repeats what the cli check already said, got: {}",
+        out.stdout
     );
 }

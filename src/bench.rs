@@ -145,6 +145,7 @@ pub async fn run(
     runs: usize,
     no_ingest: bool,
     keep: bool,
+    sweep: bool,
 ) -> Result<()> {
     if runs == 0 || runs > MAX_RUNS {
         return Err(anyhow!(
@@ -155,6 +156,31 @@ pub async fn run(
 
     let node = target.label();
     let human = ctx.output_format != "json" && !ctx.quiet;
+
+    // A run interrupted before cleanup leaves its document behind, where it
+    // becomes part of the corpus and can be retrieved and cited in real
+    // answers. Report that before measuring anything, and offer to clear it.
+    let leftovers = crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX).await?;
+    if sweep {
+        let removed = sweep_previous(ctx, target, &leftovers).await;
+        if human {
+            println!(
+                "{} Removed {} benchmark document(s) left by an earlier run.",
+                "Info:".blue(),
+                removed
+            );
+        }
+        if no_ingest || !leftovers.is_empty() {
+            return Ok(());
+        }
+    } else if !leftovers.is_empty() && human {
+        println!(
+            "{} {} benchmark document(s) from an earlier run are on this node. They are\n      part of the corpus and can be cited in answers; clear them with {}.",
+            "Warning:".yellow(),
+            leftovers.len(),
+            crate::brand::cmd("bench --sweep")
+        );
+    }
 
     if human {
         println!(
@@ -179,19 +205,34 @@ pub async fn run(
         }
     };
 
-    let mut document_id: Option<String> = None;
+    let mut ingested = Ingested::Nothing;
     let ingest_ms = if no_ingest {
         None
     } else {
         pb.set_message("Ingesting the benchmark document...");
-        match measure_ingest(ctx, target).await {
-            Ok((ms, id)) => {
-                document_id = id;
-                Some(ms)
+        let started = Instant::now();
+        let name = document_name();
+        // The outcome is recorded before the error is propagated: a request
+        // that failed may still have been applied, and the document that
+        // leaves behind has to be reported either way.
+        match ingest_text(ctx, target, &name, DOC_BODY).await {
+            Ok(Some(id)) => {
+                ingested = Ingested::Known(id);
+                Some(started.elapsed().as_millis())
+            }
+            Ok(None) => {
+                // The node stored it and did not name the row, so there is no
+                // id to delete by. Silence here is what orphaned documents.
+                ingested = Ingested::Unnamed(name);
+                Some(started.elapsed().as_millis())
             }
             Err(e) => {
                 pb.finish_and_clear();
-                return Err(e);
+                // The node may have applied the write before failing the
+                // response, so this is "possibly there", not "not there".
+                ingested = Ingested::Uncertain(name);
+                cleanup(ctx, target, &ingested, keep, human).await;
+                return Err(e).context("The benchmark document could not be ingested");
             }
         }
     };
@@ -200,13 +241,13 @@ pub async fn run(
         Ok(asked) => asked,
         Err(e) => {
             pb.finish_and_clear();
-            cleanup(ctx, target, document_id.as_deref(), keep, human).await;
+            cleanup(ctx, target, &ingested, keep, human).await;
             return Err(e);
         }
     };
     pb.finish_and_clear();
 
-    cleanup(ctx, target, document_id.as_deref(), keep, human).await;
+    cleanup(ctx, target, &ingested, keep, human).await;
 
     let report = BenchReport {
         node,
@@ -301,18 +342,22 @@ async fn measure_reach(ctx: &KnaixContext, target: &Target, runs: usize) -> Resu
     Ok(samples)
 }
 
-/// Time one document all the way through parse, chunk, embed and write.
+/// What the ingest phase left on the node, which is not the same question as
+/// whether it succeeded.
 ///
-/// One document rather than several: the phase is already the slowest one on a
-/// node embedding locally, and repeating it would multiply the wait for a
-/// number whose variance is not what anyone is here to see.
-async fn measure_ingest(ctx: &KnaixContext, target: &Target) -> Result<(u128, Option<String>)> {
-    let name = format!("{DOC_PREFIX}{}.md", run_id());
-    let started = Instant::now();
-    let id = ingest_text(ctx, target, &name, DOC_BODY)
-        .await
-        .context("The benchmark document could not be ingested")?;
-    Ok((started.elapsed().as_millis(), id))
+/// The node can accept a document and not name the row, and it can apply a
+/// write and then fail the response. Both leave a document behind, and neither
+/// leaves an id to delete it by. Modelling only "id or nothing" is what let a
+/// successful-looking run walk away from a document it had created.
+enum Ingested {
+    /// Nothing was sent, or nothing reached the node.
+    Nothing,
+    /// On the node, under an id that can be deleted.
+    Known(String),
+    /// On the node, accepted without an id. Nothing to delete it by.
+    Unnamed(String),
+    /// The request failed, but the node may have applied it first.
+    Uncertain(String),
 }
 
 struct Asked {
@@ -376,35 +421,90 @@ fn run_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn document_name() -> String {
+    format!("{DOC_PREFIX}{}.md", run_id())
+}
+
+/// Delete documents an earlier run left behind, reporting how many went.
+async fn sweep_previous(ctx: &KnaixContext, target: &Target, stale: &[String]) -> usize {
+    let mut removed = 0;
+    for id in stale {
+        if delete_document(ctx, target, id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The sentence to print when a document is on the node and cannot be removed
+/// by id. Hosted nodes can find it again by name; a local node cannot, because
+/// it keeps chunks and no document registry.
+fn orphan_remedy(target: &Target) -> String {
+    if target.is_local() {
+        format!(
+            "It is named '{}*'. A local node has no document registry to find it in, so clearing it means {}.",
+            DOC_PREFIX,
+            crate::brand::cmd("local reset")
+        )
+    } else {
+        format!(
+            "It is named '{}*'. Remove it with {}.",
+            DOC_PREFIX,
+            crate::brand::cmd("bench --sweep")
+        )
+    }
+}
+
 /// Remove what this run created. Reports rather than throws: the measurement is
 /// already taken, and a user must never be left unaware that a generated
 /// document is still on their node.
+///
+/// Every arm that leaves something behind says so. The document is a synthetic
+/// handbook, so one left on a node joins the corpus and can be retrieved and
+/// cited in real answers -- which makes silence here the expensive option.
 async fn cleanup(
     ctx: &KnaixContext,
     target: &Target,
-    document_id: Option<&str>,
+    ingested: &Ingested,
     keep: bool,
     human: bool,
 ) {
-    let Some(id) = document_id else {
-        return;
-    };
-    if keep {
-        if human {
-            println!(
-                "{} Keeping the benchmark document on the node (--keep). It is named '{}*'.",
-                "Info:".blue(),
-                DOC_PREFIX
-            );
+    match ingested {
+        Ingested::Nothing => {}
+
+        Ingested::Known(id) => {
+            if keep {
+                if human {
+                    println!(
+                        "{} Keeping the benchmark document on the node (--keep). {}",
+                        "Info:".blue(),
+                        orphan_remedy(target)
+                    );
+                }
+                return;
+            }
+            if delete_document(ctx, target, id).await.is_err() {
+                eprintln!(
+                    "{} Could not remove the benchmark document from the node. {}",
+                    "Warning:".yellow(),
+                    orphan_remedy(target)
+                );
+            }
         }
-        return;
-    }
-    if delete_document(ctx, target, id).await.is_err() {
-        eprintln!(
-            "{} Could not remove the benchmark document from the node. It is named '{}*'.",
+
+        Ingested::Unnamed(name) => eprintln!(
+            "{} The node stored {} without returning an id, so it could not be removed. {}",
             "Warning:".yellow(),
-            DOC_PREFIX
-        );
+            name,
+            orphan_remedy(target)
+        ),
+
+        Ingested::Uncertain(name) => eprintln!(
+            "{} The ingest failed, but the node may have stored {} before it did. {}",
+            "Warning:".yellow(),
+            name,
+            orphan_remedy(target)
+        ),
     }
 }
 
@@ -500,5 +600,41 @@ mod tests {
     #[test]
     fn run_ids_are_unique_per_run() {
         assert_ne!(run_id(), run_id());
+    }
+
+    /// Every state that leaves a document on the node has to be distinguishable
+    /// from the state that does not. Collapsing these into "id or nothing" is
+    /// what let a run walk away from a document it had created, and the
+    /// document is a synthetic handbook that then answers real questions.
+    #[test]
+    fn every_outcome_that_leaves_a_document_is_its_own_state() {
+        let leaves_something = |i: &Ingested| !matches!(i, Ingested::Nothing);
+
+        assert!(!leaves_something(&Ingested::Nothing));
+        assert!(leaves_something(&Ingested::Known("doc-1".into())));
+        // The two that used to be indistinguishable from Nothing.
+        assert!(leaves_something(&Ingested::Unnamed("a.md".into())));
+        assert!(leaves_something(&Ingested::Uncertain("a.md".into())));
+    }
+
+    /// A hosted node can be searched by filename, so the remedy is the sweep.
+    /// A local node keeps chunks and no registry, so pointing someone at a
+    /// sweep that cannot find anything would be worse than saying so.
+    #[test]
+    fn the_remedy_matches_what_the_target_can_actually_do() {
+        let hosted = Target::Remote {
+            uuid: "u".to_string(),
+        };
+        let local = Target::Local {
+            base: "http://127.0.0.1:8090".to_string(),
+            instance_id: "i".to_string(),
+        };
+
+        assert!(orphan_remedy(&hosted).contains("bench --sweep"));
+        assert!(orphan_remedy(&local).contains("local reset"));
+        assert!(!orphan_remedy(&local).contains("--sweep"));
+        // Both name the prefix, which is how it is found by eye either way.
+        assert!(orphan_remedy(&hosted).contains(DOC_PREFIX));
+        assert!(orphan_remedy(&local).contains(DOC_PREFIX));
     }
 }

@@ -213,6 +213,10 @@ enum Commands {
         /// Leave the generated document on the node instead of removing it
         #[clap(long)]
         keep: bool,
+
+        /// Remove benchmark documents left behind by an earlier interrupted run
+        #[clap(long)]
+        sweep: bool,
     },
 
     /// Check that a node retrieves and cites correctly, using a bundled corpus
@@ -430,6 +434,10 @@ async fn run() -> Result<()> {
     } else {
         project::current()?
     };
+
+    // `doctor` reports the version as one of its own checks, so the banner
+    // below would be the same news a second time.
+    let reports_its_own_version = matches!(command, Commands::Doctor { .. });
 
     match command {
         Commands::Login => {
@@ -744,10 +752,11 @@ async fn run() -> Result<()> {
             runs,
             no_ingest,
             keep,
+            sweep,
         } => {
             let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                bench::run(&ctx, &target, runs, no_ingest, keep).await?;
+                bench::run(&ctx, &target, runs, no_ingest, keep, sweep).await?;
             }
         }
         Commands::Selftest {
@@ -806,7 +815,15 @@ async fn run() -> Result<()> {
     }
 
     let _ = tokio::time::timeout(std::time::Duration::from_millis(50), update_task).await;
-    update::print_update_banner();
+
+    // The banner is commentary, and it goes to stdout after whatever the
+    // command printed. On a JSON run that lands after the document and makes it
+    // unparseable, which turns an available upgrade into a broken pipeline for
+    // anyone who scripted the command. Quiet suppresses it for the same reason
+    // it suppresses every other aside.
+    if ctx.output_format != "json" && !ctx.quiet && !reports_its_own_version {
+        update::print_update_banner();
+    }
 
     Ok(())
 }

@@ -5,11 +5,17 @@
 //! answer yourself. This runs every check, reports all of them, and says what
 //! to do about each one it did not like.
 //!
-//! The exit code follows one rule: doctor fails when the node your commands
-//! would address cannot answer. Everything else is a warning. A machine with no
-//! Docker is fine if the default node is hosted, and an unreachable control
-//! plane is fine if the default node is local -- reporting either as a failure
-//! would make the command useless to half its users.
+//! The exit code follows one rule: doctor fails when something on the path to
+//! your node is broken, and warns about anything that is not on it. The path is
+//! everything a command traverses to reach the node it addresses -- the project
+//! file and the API URL that decide where it goes, the control plane and the
+//! session that authorize it, and the node itself. What is off that path is a
+//! warning: a machine with no Docker is fine if the default node is hosted, and
+//! an unreachable control plane is fine if the default node is local. Reporting
+//! either as a failure would make the command useless to half its users.
+//!
+//! The first failure supplies the code, and the checks run in path order, so a
+//! script reads the earliest broken thing rather than a later symptom of it.
 
 use crate::exit::{Code, WithCode};
 use crate::nodes::{KnaixContext, Target};
@@ -152,10 +158,13 @@ pub async fn run(ctx: &KnaixContext, node_flag: Option<String>) -> Result<()> {
     let reached_control_plane = control_plane.health == Health::Ok;
     checks.push(control_plane);
 
-    checks.push(check_auth(ctx, &intent, reached_control_plane).await);
+    // The node list the session check fetches is the same list the target check
+    // needs to resolve a name, so it is fetched once and handed along.
+    let (auth_check, nodes) = check_auth(ctx, &intent, reached_control_plane).await;
+    checks.push(auth_check);
     checks.push(check_docker(&intent));
     checks.push(check_local_node(ctx, &intent).await);
-    checks.push(check_target(ctx, &intent, reached_control_plane).await);
+    checks.push(check_target(ctx, &intent, reached_control_plane, nodes.as_deref()).await);
 
     // The first failure supplies the code, and the checks run in the order a
     // request travels, so a script sees the earliest thing in the path that is
@@ -288,11 +297,20 @@ async fn check_control_plane(ctx: &KnaixContext, intent: &Intent) -> Check {
     }
 }
 
-async fn check_auth(ctx: &KnaixContext, intent: &Intent, reached: bool) -> Check {
+/// Whether the stored session is honoured, and the node list proving it.
+///
+/// The list is returned rather than counted and dropped: it is the same list
+/// the target check needs to resolve a name, and fetching it twice per run
+/// asked the control plane a question it had already answered.
+async fn check_auth(
+    ctx: &KnaixContext,
+    intent: &Intent,
+    reached: bool,
+) -> (Check, Option<Vec<crate::nodes::Node>>) {
     let login = Some(crate::brand::cmd("login"));
 
     if ctx.config.token.is_none() {
-        return if intent.addresses_a_hosted_node() {
+        let check = if intent.addresses_a_hosted_node() {
             Check::fail("auth", Code::Auth, "no session on this machine", login)
         } else {
             Check::warn(
@@ -301,59 +319,63 @@ async fn check_auth(ctx: &KnaixContext, intent: &Intent, reached: bool) -> Check
                 None,
             )
         };
+        return (check, None);
     }
 
     // A stored token proves nothing until the control plane honours it, and
     // asking is the only way to know. Nothing to ask when it is unreachable.
     if !reached {
-        return Check::warn(
-            "auth",
-            "a session is stored, but the control plane could not be asked to honour it",
+        return (
+            Check::warn(
+                "auth",
+                "a session is stored, but the control plane could not be asked to honour it",
+                None,
+            ),
             None,
         );
     }
 
-    let url = format!("{}/api/instances", ctx.config.api_url);
-    let resp = ctx
-        .client
-        .get(&url)
-        .header(
-            AUTHORIZATION,
-            format!("Bearer {}", ctx.config.token.as_deref().unwrap_or("")),
-        )
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            let nodes = body["data"].as_array().map(|a| a.len()).unwrap_or(0);
+    match crate::nodes::fetch_nodes(ctx).await {
+        Ok(nodes) => {
             let who = ctx.config.username.as_deref().unwrap_or("session");
-            Check::ok("auth", format!("{who}, {nodes} node(s)"))
+            let check = Check::ok("auth", format!("{who}, {} node(s)", nodes.len()));
+            (check, Some(nodes))
         }
-        Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
-            Check::fail("auth", Code::Auth, "the stored session was rejected", login)
-        }
-        Ok(r) => Check::warn(
-            "auth",
-            format!("HTTP {} asking for your nodes", r.status()),
+        // The fetch tags a rejected credential, so the code it carries is what
+        // separates "you are not who you say" from "the request did not work".
+        Err(e) if crate::exit::code_of(&e) == Code::Auth => (
+            Check::fail("auth", Code::Auth, "the stored session was rejected", login),
             None,
         ),
-        Err(e) => Check::warn("auth", format!("could not verify the session: {e}"), None),
+        Err(e) => (
+            Check::warn("auth", format!("could not verify the session: {e}"), None),
+            None,
+        ),
     }
 }
 
 fn check_docker(intent: &Intent) -> Check {
-    match crate::local::docker_version() {
-        Some(v) => Check::ok("docker", format!("server {v}")),
+    use crate::local::Probe;
+    match crate::local::docker_version(crate::local::PROBE_WAIT) {
+        Probe::Answered(v) => Check::ok("docker", format!("server {v}")),
+        // Docker took the question and never answered. Naming that is the
+        // point: it is a state the other commands hang in rather than report.
+        Probe::Unresponsive => Check::warn(
+            "docker",
+            format!(
+                "did not answer within {}s; the daemon may be wedged",
+                crate::local::PROBE_WAIT.as_secs()
+            ),
+            Some("restart Docker".to_string()),
+        ),
         // Only the local node needs it, so this is never a failure on its own:
         // the target check below is what reports an unusable local setup.
-        None if matches!(intent, Intent::Local) => Check::warn(
+        Probe::Absent if matches!(intent, Intent::Local) => Check::warn(
             "docker",
             "not available, and the default node is the local one",
             Some("start Docker Desktop, or install Docker".to_string()),
         ),
-        None => Check::warn(
+        Probe::Absent => Check::warn(
             "docker",
             "not available (only 'knaix local' needs it)",
             None,
@@ -362,13 +384,16 @@ fn check_docker(intent: &Intent) -> Check {
 }
 
 async fn check_local_node(ctx: &KnaixContext, intent: &Intent) -> Check {
-    let local = crate::local::summarize();
+    // Bounded, for the same reason the docker check is: asking about the
+    // container goes through the same daemon that may be the thing wrong.
+    let local = crate::local::summarize_within(crate::local::PROBE_WAIT);
     let is_default = matches!(intent, Intent::Local);
     let start = Some(crate::brand::cmd("local up"));
 
     if local.state != "running" {
         let detail = match local.state.as_str() {
             "none" => "none on this machine".to_string(),
+            "unknown" => "docker did not say whether a container is running".to_string(),
             other => format!("container is {other}"),
         };
         // Not running is only a failure when it is the node commands address,
@@ -419,9 +444,18 @@ async fn local_health(ctx: &KnaixContext, base: &str) -> Option<serde_json::Valu
     resp.json().await.ok()
 }
 
-/// The one check whose result decides the exit code: can the node this machine's
-/// commands address actually be reached?
-async fn check_target(ctx: &KnaixContext, intent: &Intent, reached: bool) -> Check {
+/// The last thing on the path: can the node this machine's commands address
+/// actually be reached?
+///
+/// `nodes` is the list the session check already fetched, present only when the
+/// session was verified. Absent means there was nothing to fetch it with, and
+/// the checks above have already said why.
+async fn check_target(
+    ctx: &KnaixContext,
+    intent: &Intent,
+    reached: bool,
+    nodes: Option<&[crate::nodes::Node]>,
+) -> Check {
     match intent {
         Intent::Unset => Check::fail(
             "target node",
@@ -438,13 +472,16 @@ async fn check_target(ctx: &KnaixContext, intent: &Intent, reached: bool) -> Che
             // The state file outlives the container, so a node that was started
             // and then stopped still resolves. Reporting that as "not answering"
             // would send someone looking at ports for a node that is not running.
-            if crate::local::summarize().state != "running" {
-                return Check::fail(
-                    "target node",
-                    Code::Precondition,
-                    "local is the default node, but no local node is running",
-                    start,
-                );
+            let state = crate::local::summarize_within(crate::local::PROBE_WAIT).state;
+            if state != "running" {
+                // "unknown" means docker never answered, so whether a node is
+                // running is the one thing this check could not establish.
+                let detail = if state == "unknown" {
+                    "local is the default node, but docker did not say whether it is running"
+                } else {
+                    "local is the default node, but no local node is running"
+                };
+                return Check::fail("target node", Code::Precondition, detail, start);
             }
             match crate::nodes::resolve_target(ctx, Some(crate::local::LOCAL_NODE_ID.to_string()))
                 .await
@@ -477,19 +514,30 @@ async fn check_target(ctx: &KnaixContext, intent: &Intent, reached: bool) -> Che
                     None,
                 );
             }
-            match crate::nodes::resolve_node_id(ctx, Some(named.clone())).await {
-                Ok(Some(uuid)) => hosted_health(ctx, &uuid).await,
-                Ok(None) => Check::fail(
+            // Resolved against the list the session check already fetched.
+            let Some(nodes) = nodes else {
+                return Check::fail(
+                    "target node",
+                    Code::Auth,
+                    format!("{named}, but the session could not be used to look it up"),
+                    Some(crate::brand::cmd("login")),
+                );
+            };
+            match crate::nodes::find_node(nodes, named) {
+                Some(node) => match crate::nodes::node_uuid(node) {
+                    Ok(uuid) => hosted_health(ctx, &uuid).await,
+                    Err(e) => Check::fail(
+                        "target node",
+                        crate::exit::code_of(&e),
+                        format!("{named}: {e}"),
+                        None,
+                    ),
+                },
+                None => Check::fail(
                     "target node",
                     Code::NotFound,
                     format!("no node on this account matches {named}"),
                     Some(crate::brand::cmd("list")),
-                ),
-                Err(e) => Check::fail(
-                    "target node",
-                    crate::exit::code_of(&e),
-                    format!("{named}: {e}"),
-                    None,
                 ),
             }
         }

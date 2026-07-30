@@ -531,9 +531,23 @@ async fn sweep_previous(ctx: &KnaixContext, target: &Target) -> Result<usize> {
 }
 
 async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<Vec<String>> {
-    // The node keeps chunks, not a document registry, so there is nothing to
-    // enumerate locally. A local run cleans up by the ids it collected instead,
-    // and has no way to find another run's leftovers.
+    list_documents_with_prefix(ctx, target, DOC_PREFIX).await
+}
+
+/// Document ids on a node whose filename starts with `prefix`.
+///
+/// Shared with `knaix bench`: both commands generate documents under a prefix
+/// of their own and both need to find the ones an interrupted run left behind.
+///
+/// Hosted only, and the empty result for a local node is a limitation rather
+/// than a finding: the node keeps chunks and no document registry, so there is
+/// nothing to enumerate. A local run has to clean up by the ids it collected as
+/// it went, and cannot discover another run's leftovers.
+pub(crate) async fn list_documents_with_prefix(
+    ctx: &KnaixContext,
+    target: &Target,
+    prefix: &str,
+) -> Result<Vec<String>> {
     if target.is_local() {
         return Ok(Vec::new());
     }
@@ -565,7 +579,7 @@ async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<
         .filter(|d| {
             d["source"]["name"]
                 .as_str()
-                .map(|n| n.starts_with(DOC_PREFIX))
+                .map(|n| n.starts_with(prefix))
                 .unwrap_or(false)
         })
         .filter_map(|d| d["id"].as_str().map(|s| s.to_string()))

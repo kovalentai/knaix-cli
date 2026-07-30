@@ -333,8 +333,18 @@ fn node_matches(node: &Node, wanted: &str) -> bool {
         || node.name == wanted
 }
 
+/// Find a named node in a list already in hand.
+///
+/// For callers that have fetched the node list for their own reasons and would
+/// otherwise fetch it again to resolve one name against it. Shares
+/// `node_matches` with the fetching resolvers, so what counts as a match cannot
+/// drift between the two paths.
+pub(crate) fn find_node<'a>(nodes: &'a [Node], wanted: &str) -> Option<&'a Node> {
+    nodes.iter().find(|n| node_matches(n, wanted))
+}
+
 /// Fetch the caller's nodes once, for resolution and listing alike.
-async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
+pub(crate) async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
     let token = ctx.get_token()?;
     let url = format!("{}/api/instances", ctx.config.api_url);
 
@@ -608,7 +618,7 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
 }
 
 /// The UUID a node's data routes are keyed by, or an error naming the node.
-fn node_uuid(node: &Node) -> Result<String> {
+pub(crate) fn node_uuid(node: &Node) -> Result<String> {
     node.id.clone().ok_or_else(|| {
         anyhow!(
             "Node {} has no instance UUID; the control plane is too old for this CLI.",

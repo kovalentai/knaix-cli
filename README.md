@@ -278,16 +278,23 @@ It checks the CLI version, `.knaix.toml`, the API URL, the control plane, your
 session, Docker, the local node, and finally whether the node your commands
 address can actually answer.
 
-One rule decides the exit code: **doctor fails when the node your commands
-would address cannot answer.** Everything else is a warning. A machine with no
-Docker is fine if your default node is hosted, and an unreachable control plane
-is fine if your default node is `local`, so neither is reported as a failure to
-someone it does not affect. A run that only warns exits 0 and is safe to gate a
-CI step on.
+One rule decides the exit code: **doctor fails when something on the path to
+your node is broken, and warns about anything that is not on it.** The path is
+everything a command traverses to reach the node it addresses -- the project
+file and the API URL that decide where it goes, the control plane and the
+session that authorize it, and the node itself. What is off that path is a
+warning: a machine with no Docker is fine if your default node is hosted, and an
+unreachable control plane is fine if your default node is `local`, so neither is
+reported as a failure to someone it does not affect. A run that only warns exits
+0 and is safe to gate a CI step on.
 
-`doctor` is also the one command that survives a `.knaix.toml` it cannot parse.
-Every other command reads that file before it runs, so a broken one breaks all
-of them; `doctor` reports it as a finding instead.
+The first failure supplies the code, and the checks run in path order, so a
+script reads the earliest broken thing rather than a later symptom of it.
+
+`doctor` is also one of only two commands that survive a `.knaix.toml` they
+cannot parse -- the other is `knaix init`, which is how a broken one gets
+replaced. Every other command reads that file before it runs, so a broken one
+breaks all of them; `doctor` reports it as a finding instead.
 
 ## How fast is it: `knaix bench`
 
@@ -298,6 +305,7 @@ it takes.
 knaix bench                  # 5 runs per phase against the default node
 knaix bench --runs 20        # more samples for a tighter p95
 knaix bench --no-ingest      # measure answering only, against what is already there
+knaix bench --sweep          # remove documents an interrupted run left behind
 knaix bench -o json          # every timing, plus the raw samples
 ```
 
@@ -306,7 +314,7 @@ end-to-end number hides which one moved:
 
 | Phase | What it measures |
 | :--- | :--- |
-| Reach | A bare round trip to the node's health endpoint: the floor everything else sits on. |
+| Reach | A round trip to the node's health check: the floor everything else sits on. Against a hosted node this goes through the control plane, which probes the node itself, so the number includes that hop. |
 | Ingest | One generated document parsed, chunked, embedded and written: the write side of the vector store. |
 | Answer | A question, split into time to first token and total. |
 
@@ -315,11 +323,25 @@ assembly all happen before the first token arrives, so a high first-token time
 with a small gap to the total means the knowledge base is slow, and the reverse
 means the model is.
 
-Like `selftest`, the document it ingests is deleted before the command returns,
-and `--keep` leaves it if you want to look at it. A node answering with the
-deterministic mock is labelled as such: retrieval and ingest are still real, but
-those answer timings measure the mock and must never be compared with a real
-model's.
+A node answering with the deterministic mock is labelled as such: retrieval and
+ingest are still real, but those answer timings measure the mock and must never
+be compared with a real model's.
+
+### What `bench` leaves behind
+
+The document it ingests is a synthetic handbook, and while it is on the node it
+is part of the corpus: retrievable, and citable in real answers. So the command
+is careful about it, and so should you be.
+
+A normal run deletes it before returning, and `--keep` leaves it deliberately.
+Two cases cannot delete it, and both say so loudly rather than exiting quietly:
+a node that stores the document without returning an id, and an ingest that
+fails after the node has already written it.
+
+On a hosted node, `knaix bench --sweep` finds anything named `knaix-bench-*` and
+removes it; a run that finds leftovers warns before it measures. A local node
+keeps chunks and no document registry, so there is nothing to search: clearing a
+stray document there means `knaix local reset`.
 
 ## Shell completion
 
