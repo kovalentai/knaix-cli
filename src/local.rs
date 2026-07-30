@@ -52,6 +52,25 @@ fn port_mapping(port: u16) -> String {
     format!("{}:{}:8080", LOOPBACK_HOST, port)
 }
 
+/// Whether a running container is the node the state file describes.
+///
+/// Saved state alone does not establish it. `down` keeps the file so the corpus
+/// and the identity survive a stop, which means a container that later takes the
+/// name inherits a claim it never earned -- and the only thing done with that
+/// claim is deleting it. The image `up` recorded is what settles it.
+fn image_matches(recorded: &str, running: &str) -> bool {
+    !recorded.trim().is_empty() && recorded.trim() == running.trim()
+}
+
+/// Ask docker what the running container was started from.
+fn running_image_matches(recorded: &str) -> bool {
+    match docker(&["inspect", "--format", "{{.Config.Image}}", CONTAINER]) {
+        Ok(running) => image_matches(recorded, &running),
+        // No answer is not a licence to delete.
+        Err(_) => false,
+    }
+}
+
 /// Whether `docker port` reports this container published to loopback only.
 ///
 /// Docker prints one line per binding, `<host ip>:<port>`, and publishes to
@@ -416,18 +435,30 @@ pub async fn up(
 ) -> Result<()> {
     docker_available()?;
 
+    // What is running under our name, if it is ours at all. `down` keeps the
+    // state file so a stop does not orphan the corpus, which means the name and
+    // the state together are not enough -- a container started afterwards would
+    // inherit a claim it never earned, and what the claim authorises here is a
+    // delete. The image `up` recorded settles it.
+    let running = container_state().as_deref() == Some("running");
+    let ours = if running {
+        load().filter(|n| running_image_matches(&n.image))
+    } else {
+        None
+    };
+    if running && ours.is_none() {
+        return Err(anyhow!(
+            "A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.",
+            CONTAINER
+        ));
+    }
+
     // A node started by an older CLI is published on every interface with its
     // authentication disabled, so leaving it up is the exposure the loopback
     // binding exists to close. Re-creating it keeps the corpus -- that lives in
     // a named volume, and the identity is carried across below -- so close it
     // here rather than printing advice and hoping it is read.
-    // Only a node this CLI started is ours to re-create. A container that
-    // merely shares the name belongs to someone else, and the branch below
-    // refuses to touch it by design -- deleting it here to close an exposure it
-    // may not even have would be the worse trade.
-    let running = container_state().as_deref() == Some("running");
-    let ours = running && load().is_some();
-    let exposed = ours
+    let exposed = ours.is_some()
         && !published_on_loopback_only(&docker(&["port", CONTAINER, "8080"]).unwrap_or_default());
     if exposed {
         println!(
@@ -438,10 +469,7 @@ pub async fn up(
         let _ = docker(&["rm", "-f", CONTAINER]);
     }
 
-    if running && !exposed {
-        let node = load().ok_or_else(|| {
-            anyhow!("A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.", CONTAINER)
-        })?;
+    if let (Some(node), false) = (&ours, exposed) {
         // The container reads its model configuration once, at startup. Flags
         // passed to a node that is already up are read here and dropped, so an
         // explicit request to change what answers has to say it did not take
@@ -1636,6 +1664,27 @@ mod tests {
                 "should be loopback: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_container_running_another_image_is_not_ours_to_delete() {
+        // `down` keeps the state file, so saved state on its own is a claim a
+        // later container inherits without earning it. The only thing done with
+        // that claim is `docker rm -f`, so it has to be the image that settles
+        // ownership rather than the name.
+        let ours = "ghcr.io/kovalentai/node-runtime:latest";
+        assert!(image_matches(ours, ours));
+        assert!(image_matches(
+            ours,
+            "  ghcr.io/kovalentai/node-runtime:latest\n"
+        ));
+        assert!(!image_matches(ours, "alpine:latest"));
+        // A developer's own build is still theirs, and still not the released
+        // tag, so the recorded image is the only thing worth comparing against.
+        assert!(!image_matches(ours, "node-runtime:dev"));
+        // State that records no image authorises nothing.
+        assert!(!image_matches("", "alpine:latest"));
+        assert!(!image_matches("  ", ""));
     }
 
     #[test]
