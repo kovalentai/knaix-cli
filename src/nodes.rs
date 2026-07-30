@@ -368,6 +368,29 @@ pub(crate) async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
     Ok(serde_json::from_value(wrapper["data"].clone()).unwrap_or_default())
 }
 
+/// A duration a person can read at a glance.
+///
+/// Milliseconds below a second, seconds above one. Four or five digits of
+/// milliseconds makes the reader divide before they can react to the number,
+/// which is the opposite of what a timing readout is for.
+pub fn format_duration_ms(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+/// The model name as a person should read it.
+///
+/// The local node namespaces what it reports as `local:<model>`, which is its
+/// own bookkeeping and not something the user chose or would recognise. The
+/// raw value is what the node said, so it stays in `--json`; only the display
+/// drops the prefix.
+pub fn display_model(model: &str) -> &str {
+    model.strip_prefix("local:").unwrap_or(model)
+}
+
 pub fn format_file_size(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
@@ -2259,6 +2282,30 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four or five digits of milliseconds is a number the reader has to divide
+    /// before they can react to it, which is the opposite of what a timing
+    /// readout is for.
+    #[test]
+    fn long_durations_are_read_in_seconds() {
+        assert_eq!(format_duration_ms(0), "0 ms");
+        assert_eq!(format_duration_ms(737), "737 ms");
+        assert_eq!(format_duration_ms(999), "999 ms");
+        assert_eq!(format_duration_ms(1000), "1.0 s");
+        assert_eq!(format_duration_ms(13796), "13.8 s");
+    }
+
+    /// `local:` is the node's own bookkeeping. It is not something the user
+    /// chose, and it is not in the name they would type at Ollama.
+    #[test]
+    fn the_nodes_model_prefix_is_not_shown_to_the_user() {
+        assert_eq!(display_model("local:gemma4:latest"), "gemma4:latest");
+        // A hosted model name is left exactly as the node reported it.
+        assert_eq!(display_model("claude-sonnet-4"), "claude-sonnet-4");
+        // Only a leading prefix, so a model that merely contains the word is
+        // untouched.
+        assert_eq!(display_model("acme/local:v2"), "acme/local:v2");
+    }
 
     #[test]
     fn the_local_answer_body_carries_the_system_prompt_and_history() {

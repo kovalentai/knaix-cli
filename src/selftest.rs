@@ -801,8 +801,8 @@ fn print_report(report: &SelfTestReport) {
     lat.set_header(vec!["Stage", "p50", "p95"]);
     lat.add_row(vec![
         "Answer (end to end)".to_string(),
-        format!("{} ms", report.latency_ms.answer_p50),
-        format!("{} ms", report.latency_ms.answer_p95),
+        crate::nodes::format_duration_ms(report.latency_ms.answer_p50),
+        crate::nodes::format_duration_ms(report.latency_ms.answer_p95),
     ]);
     println!("{lat}");
 

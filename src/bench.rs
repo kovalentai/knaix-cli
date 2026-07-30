@@ -8,8 +8,9 @@
 //! Three numbers, because they fail for different reasons and a single
 //! end-to-end figure hides which one moved:
 //!
-//! - **reach**: a bare round trip to the node's health endpoint. The floor
-//!   everything else sits on, and the part that is purely network.
+//! - **reach**: a round trip to the node's health check. The floor everything
+//!   else sits on. Against a hosted node this goes through the control plane,
+//!   which probes the node itself, so that hop is inside the number.
 //! - **ingest**: one generated document, parsed, chunked, embedded and written.
 //!   This is the write side of the vector store, and the number that grows when
 //!   embedding is slow or being done somewhere far away.
@@ -17,10 +18,12 @@
 //!   reranking and prompt assembly all happen before that first token, so the
 //!   split is what separates a slow knowledge base from a slow model.
 //!
-//! Like `selftest`, everything it uploads is removed before it returns.
+//! The document it uploads is part of the corpus while it is there, so a normal
+//! run removes it before returning. Two outcomes cannot, and both say so rather
+//! than exiting quietly; see `Ingested`.
 
 use crate::exit::{Code, WithCode};
-use crate::nodes::{KnaixContext, Target, Verbosity};
+use crate::nodes::{format_duration_ms, KnaixContext, Target, Verbosity};
 use crate::selftest::{delete_document, ingest_text, percentile};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
@@ -187,9 +190,10 @@ pub async fn run(
             "\n{}",
             format!("Benchmark on node {node}").bold().underline()
         );
-        println!(
-            "  {runs} run(s) per phase. One generated document is ingested and removed again.\n"
-        );
+        // Not "and removed again": two outcomes cannot remove it, and the
+        // command says so when they happen. Promising it here would be the
+        // same over-claim in the one place the user is actually standing.
+        println!("  {runs} run(s) per phase. One generated document is ingested, then removed.\n");
     }
 
     let pb = spinner(human);
@@ -517,10 +521,10 @@ fn print_report(report: &BenchReport) {
     let row = |name: &str, t: &Timing| {
         vec![
             name.to_string(),
-            format!("{}ms", t.p50),
-            format!("{}ms", t.p95),
-            format!("{}ms", t.min),
-            format!("{}ms", t.max),
+            format_duration_ms(t.p50),
+            format_duration_ms(t.p95),
+            format_duration_ms(t.min),
+            format_duration_ms(t.max),
         ]
     };
 
@@ -529,7 +533,7 @@ fn print_report(report: &BenchReport) {
         // One sample, so percentile columns would be four copies of one number.
         table.add_row(vec![
             "Ingest".to_string(),
-            format!("{ms}ms"),
+            format_duration_ms(ms),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
@@ -544,7 +548,11 @@ fn print_report(report: &BenchReport) {
     println!(
         "\n  {} {}",
         "Answered by:".dimmed(),
-        report.model.as_deref().unwrap_or("unreported")
+        report
+            .model
+            .as_deref()
+            .map(crate::nodes::display_model)
+            .unwrap_or("unreported")
     );
     if !report.answer_timing_meaningful {
         println!(
@@ -558,10 +566,10 @@ fn print_report(report: &BenchReport) {
         // knowledge base and the model, and it is not obvious from the rows.
         let generation = report.answer_total_ms.p50.saturating_sub(t.p50);
         println!(
-            "  {} {}ms to the first token (retrieval, reranking, prompt), then {}ms generating.",
+            "  {} {} to the first token (retrieval, reranking, prompt), then {} generating.",
             "Split:".dimmed(),
-            t.p50,
-            generation
+            format_duration_ms(t.p50),
+            format_duration_ms(generation)
         );
     }
     println!();

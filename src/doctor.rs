@@ -297,7 +297,7 @@ async fn check_control_plane(ctx: &KnaixContext, intent: &Intent) -> Check {
     }
 }
 
-/// Whether the stored session is honoured, and the node list proving it.
+/// Whether the stored session is accepted, and the node list proving it.
 ///
 /// The list is returned rather than counted and dropped: it is the same list
 /// the target check needs to resolve a name, and fetching it twice per run
@@ -322,13 +322,13 @@ async fn check_auth(
         return (check, None);
     }
 
-    // A stored token proves nothing until the control plane honours it, and
+    // A stored token proves nothing until the control plane accepts it, and
     // asking is the only way to know. Nothing to ask when it is unreachable.
     if !reached {
         return (
             Check::warn(
                 "auth",
-                "a session is stored, but the control plane could not be asked to honour it",
+                "a session is stored, but the control plane could not be reached to check it",
                 None,
             ),
             None,
@@ -411,8 +411,15 @@ async fn check_local_node(ctx: &KnaixContext, intent: &Intent) -> Check {
 
     match local_health(ctx, &url).await {
         Some(body) if body["ready"].as_bool().unwrap_or(false) => {
-            let answers = match crate::local::load().and_then(|n| n.model_url) {
-                Some(server) => format!("answering with a model at {server}"),
+            // Naming the model, the way `local status` does. Which model is
+            // answering is the fact someone checking their setup most wants
+            // confirmed, and reporting only its address withholds it.
+            let node = crate::local::load();
+            let answers = match node.as_ref().and_then(|n| n.model_url.as_deref()) {
+                Some(server) => match node.as_ref().and_then(|n| n.model.as_deref()) {
+                    Some(model) => format!("answering with {model} at {server}"),
+                    None => format!("answering with a model at {server}"),
+                },
                 None => "answering with the deterministic mock".to_string(),
             };
             Check::ok("local node", format!("ready on {url}, {answers}"))
@@ -593,7 +600,7 @@ fn print_report(checks: &[Check]) {
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
-    table.set_header(vec!["", "Check", "Detail"]);
+    table.set_header(vec!["Result", "Check", "Detail"]);
     for check in checks {
         table.add_row(vec![
             check.health.label(),
@@ -623,9 +630,14 @@ fn print_report(checks: &[Check]) {
     if checks.iter().any(|c| matches!(c.health, Health::Fail(_))) {
         println!();
     } else {
+        // Naming the two commands makes the claim checkable. "Everything a
+        // command needs" leaves the reader to guess which commands, right
+        // after they may have watched a check warn.
         println!(
-            "\n{} Everything a command needs is in place.\n",
-            "✓".green()
+            "\n{} Everything {} and {} need is in place.\n",
+            "✓".green(),
+            crate::brand::cmd("chat"),
+            crate::brand::cmd("upload")
         );
     }
 }
