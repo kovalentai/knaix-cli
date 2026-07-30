@@ -140,7 +140,11 @@ struct Report {
     checks: Vec<Check>,
 }
 
-pub async fn run(ctx: &KnaixContext, node_flag: Option<String>) -> Result<()> {
+/// Run every check and hand back the findings, without printing anything.
+///
+/// Separate from `run` so `knaix report` can put the same diagnosis in a bundle
+/// rather than growing a second one that would drift from this.
+pub async fn collect(ctx: &KnaixContext, node_flag: Option<String>) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // Read the project file here rather than taking main's copy: a file that
@@ -166,13 +170,24 @@ pub async fn run(ctx: &KnaixContext, node_flag: Option<String>) -> Result<()> {
     checks.push(check_local_node(ctx, &intent).await);
     checks.push(check_target(ctx, &intent, reached_control_plane, nodes.as_deref()).await);
 
+    checks
+}
+
+/// The code a set of checks exits with: the first failure, in path order.
+pub fn verdict(checks: &[Check]) -> Option<Code> {
+    checks.iter().find_map(|c| match c.health {
+        Health::Fail(code) => Some(code),
+        _ => None,
+    })
+}
+
+pub async fn run(ctx: &KnaixContext, node_flag: Option<String>) -> Result<()> {
+    let checks = collect(ctx, node_flag).await;
+
     // The first failure supplies the code, and the checks run in the order a
     // request travels, so a script sees the earliest thing in the path that is
     // broken rather than a later symptom of it.
-    let failure = checks.iter().find_map(|c| match c.health {
-        Health::Fail(code) => Some(code),
-        _ => None,
-    });
+    let failure = verdict(&checks);
 
     if ctx.output_format == "json" {
         let report = Report {

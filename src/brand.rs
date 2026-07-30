@@ -225,6 +225,17 @@ pub fn level_for(env: &TermEnv) -> Level {
 ///
 /// Deliberately checks stdout rather than stderr: the wordmark appears in
 /// output a user reads, and `knaix ... | grep` must get clean bytes.
+/// The colour level as a word, for a diagnostic report. A terminal that
+/// reported no colour and one that reported 24-bit are different bugs.
+pub fn level_name() -> &'static str {
+    match level() {
+        Level::None => "none",
+        Level::Ansi16 => "ansi16",
+        Level::Ansi256 => "ansi256",
+        Level::TrueColor => "truecolor",
+    }
+}
+
 pub fn level() -> Level {
     let knaix_color = std::env::var("KNAIX_COLOR").ok();
     let no_color = std::env::var("NO_COLOR").ok();

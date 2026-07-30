@@ -120,6 +120,7 @@ cargo install --path .
 | `knaix mcp`      | Print the MCP client config that points Claude Code, Claude Desktop or Cursor at a node. |
 | `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
 | `knaix doctor`   | Check everything a command needs, and say what to do about what is wrong. |
+| `knaix report`   | Write a diagnostic bundle you can read, then attach to an issue. |
 | `knaix bench`    | Measure how fast a node reaches, ingests, and answers.  |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
@@ -295,6 +296,48 @@ script reads the earliest broken thing rather than a later symptom of it.
 cannot parse -- the other is `knaix init`, which is how a broken one gets
 replaced. Every other command reads that file before it runs, so a broken one
 breaks all of them; `doctor` reports it as a finding instead.
+
+## Reporting a bug: `knaix report`
+
+`doctor` tells you what is wrong. `report` packages it up so someone else can
+help.
+
+```bash
+knaix report                 # write the bundle, and say what it left out
+knaix report --open          # also open a new issue, environment filled in
+knaix report --forget        # drop the recorded failures instead
+knaix report -o json         # the bundle to stdout
+```
+
+It collects your version and how you installed it, your OS, shell and terminal,
+the full `doctor` diagnosis, which settings are present, recent failures, and
+recent local node log lines.
+
+**Nothing is sent anywhere.** The bundle is a file on your disk. You read it, and
+you decide whether to attach it. This is deliberate and it is not going to
+change: a command that posted your environment to us on the day something broke
+would sit badly next to a product whose whole claim is that we cannot read your
+data.
+
+What it removes, every time:
+
+| Kept | Removed |
+| :--- | :--- |
+| That a token is present, and its length | The token |
+| A stable hash of your username and node names | The names themselves |
+| `api.kovalentai.com`, when that is what you use | A control plane address that is not ours |
+| A model server's scheme and port | Its host, unless it is loopback |
+| A log line's timestamp, level, method and route | Everything else on the line |
+| The shape of the command that failed | Its arguments |
+
+The list is not a promise you have to take on trust: the bundle carries a
+`redactions` section naming every field it changed and why, and the command
+prints the same list when it finishes.
+
+Failures are recorded as they happen, already redacted, in
+`~/.knaix/diagnostics.jsonl`. It keeps the last 20 and forgets the rest.
+`knaix report --forget` empties it. A panic is recorded there too, so a crash
+that scrolled off your terminal is still reportable.
 
 ## How fast is it: `knaix bench`
 
