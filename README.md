@@ -1,4 +1,4 @@
-# Knaix CLI (v0.4.2)
+# Knaix CLI (v0.4.6)
 
 The command-line client for Kovalent AI, written in Rust. Ingest documents into a private AI node and ask questions of them, either on your own machine with no account or on a hosted node over a zero-trust mesh.
 

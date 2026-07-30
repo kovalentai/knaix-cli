@@ -2,6 +2,35 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.6] - 2026-07-30
+
+The release that makes `knaix` usable by something other than a person typing it: documented exit codes, a project file, stdin, `--quiet`, and two commands for when you need to know why it broke or how fast it is.
+
+### Added
+
+- **`knaix doctor`.** Every other command stops at the first thing it finds wrong, so working out why nothing runs meant several commands and some guessing. This runs every check and reports all of them, with the command that fixes each one it did not like: the CLI version, `.knaix.toml`, the API URL, the control plane, your session, Docker, the local node, and whether the node your commands address can actually answer. One rule decides the exit code, and it is the rule that makes the command safe to put in CI: doctor fails when something on the path to your node is broken, and warns about anything that is not on it. A machine with no Docker is fine if your default node is hosted, and an unreachable control plane is fine if your default node is `local`, so neither is reported as a failure to someone it does not affect. A run that only warns exits 0. It is also one of two commands that survive a `.knaix.toml` they cannot parse, the other being `knaix init`, so the file that breaks every other command is reported as a finding rather than taking the diagnosis down with it.
+- **`knaix bench`.** Where `selftest` answers whether a node answers correctly, this answers how long it takes. Three phases, because they slow down for different reasons and one end-to-end number hides which one moved: reach, a round trip to the node's health check; ingest, one generated document parsed, chunked, embedded and written; and answer, split into time to first token and total. That split is the useful one. Retrieval, reranking and prompt assembly all happen before the first token arrives, so a high first-token time with a small gap to the total means the knowledge base is slow, and the reverse means the model is. The document it uploads is part of the corpus while it is there, so a normal run removes it, `--sweep` clears what an interrupted run left on a hosted node, and the two outcomes that cannot remove it say so rather than exiting quietly.
+- **Documented exit codes.** A script calling `knaix` could not tell "the node said no" from "the node was not there": every failure exited 1, so the only way to distinguish them was to parse English error text, which changes without warning. Eight codes now, published in the README and fixed as interface: 0 ok, 1 error, 2 usage, 3 auth, 4 unavailable, 5 not found, 6 denied, 7 precondition. The distinction worth having is 4 against 3 and 6. A 4 is worth retrying because nothing answered; a 3 or a 6 is not, because something answered and refused.
+- **`.knaix.toml`, written by `knaix init`.** Which node a repository belongs to, and which of its files are worth ingesting, are properties of the repo rather than of your machine, so they belong in the repo and under review with everything else. The file is found by walking up from the working directory, the way git finds its root, because commands are run from subdirectories. A node is chosen by flag, then the file, then the saved default: the flag wins because it was typed for this one command, and the file beats the machine's default because it is the more specific statement.
+- **Reading arguments from a pipe.** `knaix chat -` takes the question from standard input and `knaix upload -` takes the document, with `--name` deciding what piped content is cited as. Turns the CLI into a pipeline component rather than only an interactive tool.
+- **`--quiet`.** Suppresses progress and commentary, keeps results, and never hides an error, so a script can use it without making itself less safe than one that did not.
+- **A Homebrew formula on each release.** `brew install kovalentai/tap/knaix` now works alongside the curl installer. The renderer refuses to emit a formula it cannot back: it requires the release feed to already name the target, downloads all four binaries, and recomputes each SHA-256 from the bytes rather than trusting the sidecar.
+
+### Changed
+
+- **The REPL prompt is painted in the brand gradient**, along with the wordmark inside the line as you type it, matching what the zsh integration already does at the shell prompt. The prompt was the one place a REPL user looks at most and the one place the gradient never reached, because colouring the string handed to `readline()` was assumed to break line editing. It does not for the version pinned here, and the `Highlighter` route keeps the string rustyline measures and the string it prints from having to agree by coincidence.
+- **`knaix upload --dry-run` needs no node and no account.** Which files an upload would send is decided by the directory and the filters and nothing else, so planning is its own step now. The preview cannot drift from what would actually happen, and a preview no longer fails against a node it never needed.
+- **Durations read in seconds above a second.** `bench` and `selftest` share one format, so `13796ms` reads `13.8 s` and stops making you divide before you can react to the number.
+
+### Fixed
+
+- **`knaix upload no-such-path` says the path was not found.** It used to resolve a node before checking the path, so a typo was reported as "Not logged in".
+- **An available upgrade no longer breaks `--json`.** The update banner was written to stdout after the command's document, so `knaix -o json list | jq` failed outright on any machine that had seen a newer release. It is suppressed for `--json` and `--quiet`.
+
+### Removed
+
+- **An installer that could never run.** The copy of `install.sh` in this repository resolved versions from the GitHub releases API and pulled tarballs from release assets, both of which 404 unauthenticated against a private repo, so it worked for nobody. Nothing pointed at it. The single installer is the one served from knaix.com.
+
 ## [0.4.5] - 2026-07-28
 
 ### Added
