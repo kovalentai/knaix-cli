@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.7] - 2026-07-30
+
+### Added
+
+- **`knaix report`.** Writes a diagnostic file you can read, then attach to an issue. The bug template used to ask a reporter to look up their version and their OS, and then ask them not to paste tokens or private hostnames. The first half is work the CLI can do. The second half is a request for care aimed at the person least able to give it, because the output that shows the problem is usually the output with their node's address in it. So the CLI writes the file: the version and how it was installed, the OS, shell and terminal, every check `knaix doctor` runs, recent failures, and recent local node logs.
+
+  What goes in is decided by a list of things known to be safe rather than by looking for things that seem private, which is the difference between a redactor that holds and one that holds until the first input nobody pictured. The token is never included, only its length. Usernames and node names appear as short hashes, stable across runs so two reports from one person still correlate. Log lines are cut back to their timestamp, level, method and route, matched against the routes we actually serve rather than against anything route-shaped. The command then prints what it left out and why, so the redaction can be checked rather than trusted, and the file is yours to read before you send it.
+
+  **The report is never uploaded.** Building one runs the same checks as `doctor`, so it does contact your node and control plane to ask how they are, but what it finds is only ever written to the file. `--open` starts a new issue with your version and OS filled in; you attach the file yourself.
+
+- **Failures and crashes are recorded, so a report run afterwards has something to show.** A CLI that only tells you what went wrong while the terminal is still open is no help the next morning. Failures now append to a rolling file of the last twenty, and there is a panic hook, so a crash is recoverable instead of printing Rust's default and vanishing. Entries are redacted as they are written, not when a report is built, so nothing sensitive is on disk even if you never run `knaix report`. `knaix report --forget` deletes them.
+
 ## [0.4.6] - 2026-07-30
 
 The release that makes `knaix` usable by something other than a person typing it: documented exit codes, a project file, stdin, `--quiet`, and two commands for when you need to know why it broke or how fast it is.
