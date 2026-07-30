@@ -15,7 +15,8 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The node's own name for itself, and the reserved node id that routes a
 /// command here instead of at a control plane.
@@ -150,6 +151,107 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("docker {} exited with {}", args[0], status))
+    }
+}
+
+/// What asking docker a question produced.
+#[derive(Debug, PartialEq)]
+pub enum Probe {
+    /// Docker answered.
+    Answered(String),
+    /// Docker is not installed, or the daemon refused.
+    Absent,
+    /// Docker accepted the question and did not answer inside the deadline.
+    Unresponsive,
+}
+
+/// How long to wait on docker before calling it unresponsive.
+///
+/// A healthy daemon answers `info` in tens of milliseconds. This is generous
+/// enough to survive a loaded machine and short enough that a wedged daemon
+/// does not hold up the command asking about it.
+pub const PROBE_WAIT: Duration = Duration::from_secs(3);
+
+/// Run a docker command, giving up if it does not finish in time.
+///
+/// `Command::output()` waits forever, which is fine where the docker call *is*
+/// the work: `local up` has nothing useful to do without it. It is not fine for
+/// a diagnosis, where docker is one question of several and a daemon that has
+/// wedged is itself a finding. A wedged daemon is exactly the state a user is
+/// in when they reach for `knaix doctor`, so the command that reports it must
+/// not be the command that hangs on it.
+pub fn docker_probe(args: &[&str], wait: Duration) -> Probe {
+    let child = Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    // Failing to spawn means no docker binary at all, which is a real answer.
+    let Ok(mut child) = child else {
+        return Probe::Absent;
+    };
+
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    // Docker ran and said no: installed, daemon not listening.
+                    return Probe::Absent;
+                }
+                let mut out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+                }
+                let out = out.trim().to_string();
+                return if out.is_empty() {
+                    Probe::Absent
+                } else {
+                    Probe::Answered(out)
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Reap it, or the child outlives the command that asked.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Probe::Unresponsive;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return Probe::Absent,
+        }
+    }
+}
+
+/// The docker daemon's version, within the probe deadline.
+///
+/// `docker info` rather than `docker --version`, because the binary being on
+/// PATH says nothing about whether a daemon is there to answer.
+pub fn docker_version(wait: Duration) -> Probe {
+    docker_probe(&["info", "--format", "{{.ServerVersion}}"], wait)
+}
+
+/// The local node's container state, within the probe deadline.
+///
+/// `summarize` is the unbounded version, which is right for `knaix status`
+/// where the state is the whole answer.
+pub fn summarize_within(wait: Duration) -> LocalSummary {
+    let state = match docker_probe(
+        &["inspect", "--format", "{{.State.Status}}", CONTAINER],
+        wait,
+    ) {
+        Probe::Answered(s) => s,
+        Probe::Absent => "none".to_string(),
+        // Not "none": docker never said, and reporting no container would be
+        // an answer this did not get.
+        Probe::Unresponsive => "unknown".to_string(),
+    };
+    LocalSummary {
+        state,
+        url: load().map(|n| n.base_url()),
     }
 }
 

@@ -62,6 +62,13 @@ pub struct ChatAnswer {
     /// mock reports it here, which is the difference between "this model chose
     /// its citations" and "the pipeline cited whatever ranked first".
     pub model: Option<String>,
+    /// Milliseconds from sending the question to the first token arriving.
+    ///
+    /// Everything before that first token is retrieval, reranking, and prompt
+    /// assembly; everything after it is generation. Splitting the two is the
+    /// only way to tell a slow knowledge base from a slow model, which is what
+    /// `knaix bench` reports. Absent when the answer did not stream.
+    pub first_token_ms: Option<u128>,
 }
 
 /// One prior turn of a conversation, sent to the local node so a follow-up
@@ -326,8 +333,18 @@ fn node_matches(node: &Node, wanted: &str) -> bool {
         || node.name == wanted
 }
 
+/// Find a named node in a list already in hand.
+///
+/// For callers that have fetched the node list for their own reasons and would
+/// otherwise fetch it again to resolve one name against it. Shares
+/// `node_matches` with the fetching resolvers, so what counts as a match cannot
+/// drift between the two paths.
+pub(crate) fn find_node<'a>(nodes: &'a [Node], wanted: &str) -> Option<&'a Node> {
+    nodes.iter().find(|n| node_matches(n, wanted))
+}
+
 /// Fetch the caller's nodes once, for resolution and listing alike.
-async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
+pub(crate) async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
     let token = ctx.get_token()?;
     let url = format!("{}/api/instances", ctx.config.api_url);
 
@@ -349,6 +366,29 @@ async fn fetch_nodes(ctx: &KnaixContext) -> Result<Vec<Node>> {
 
     let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
     Ok(serde_json::from_value(wrapper["data"].clone()).unwrap_or_default())
+}
+
+/// A duration a person can read at a glance.
+///
+/// Milliseconds below a second, seconds above one. Four or five digits of
+/// milliseconds makes the reader divide before they can react to the number,
+/// which is the opposite of what a timing readout is for.
+pub fn format_duration_ms(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+/// The model name as a person should read it.
+///
+/// The local node namespaces what it reports as `local:<model>`, which is its
+/// own bookkeeping and not something the user chose or would recognise. The
+/// raw value is what the node said, so it stays in `--json`; only the display
+/// drops the prefix.
+pub fn display_model(model: &str) -> &str {
+    model.strip_prefix("local:").unwrap_or(model)
 }
 
 pub fn format_file_size(bytes: u64) -> String {
@@ -601,7 +641,7 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
 }
 
 /// The UUID a node's data routes are keyed by, or an error naming the node.
-fn node_uuid(node: &Node) -> Result<String> {
+pub(crate) fn node_uuid(node: &Node) -> Result<String> {
     node.id.clone().ok_or_else(|| {
         anyhow!(
             "Node {} has no instance UUID; the control plane is too old for this CLI.",
@@ -714,6 +754,9 @@ pub async fn chat(
     let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
     let payload = serde_json::json!({ "message": message, "stream": true });
 
+    // Timed from before the request leaves, so time-to-first-token covers the
+    // whole wait a person actually sits through, not just the node's share.
+    let asked_at = std::time::Instant::now();
     let resp = ctx
         .client
         .post(&url)
@@ -736,7 +779,8 @@ pub async fn chat(
             .coded(Code::for_status(status.as_u16()));
     }
 
-    let (text, citations, model) = read_chat_stream(resp, &pb, stream_to_stdout).await?;
+    let (text, citations, model, first_token_ms) =
+        read_chat_stream(resp, &pb, stream_to_stdout, asked_at).await?;
 
     if stream_to_stdout {
         print_citations(&citations);
@@ -746,6 +790,7 @@ pub async fn chat(
         text,
         citations,
         model,
+        first_token_ms,
     }))
 }
 
@@ -778,6 +823,9 @@ async fn chat_local(
 
     let body = build_local_answer_body(instance_id, message, history, verbosity);
 
+    // Timed from before the request leaves, so time-to-first-token covers the
+    // whole wait a person actually sits through, not just the node's share.
+    let asked_at = std::time::Instant::now();
     let resp = ctx
         .client
         .post(format!("{}/api/query/answer/stream", base))
@@ -814,12 +862,14 @@ async fn chat_local(
         .coded(Code::for_status(status.as_u16()));
     }
 
-    let (text, citations, model) = read_local_answer_stream(resp, &pb, print).await?;
+    let (text, citations, model, first_token_ms) =
+        read_local_answer_stream(resp, &pb, print, asked_at).await?;
 
     Ok(Some(ChatAnswer {
         text,
         citations,
         model,
+        first_token_ms,
     }))
 }
 
@@ -876,6 +926,10 @@ async fn chat_local_blocking(
         text,
         citations,
         model,
+        // Nothing streamed, so there was no first token to time. Reporting the
+        // whole wait here would read as an instant answer that then took
+        // seconds to finish, which is the opposite of what happened.
+        first_token_ms: None,
     }))
 }
 
@@ -892,7 +946,8 @@ async fn read_local_answer_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
     print: bool,
-) -> Result<(String, Vec<Citation>, Option<String>)> {
+    asked_at: std::time::Instant,
+) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
@@ -900,6 +955,7 @@ async fn read_local_answer_stream(
     let mut model: Option<String> = None;
     let mut event = String::new();
     let mut first_token = true;
+    let mut first_token_ms: Option<u128> = None;
     let mut stream_error: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
@@ -950,6 +1006,9 @@ async fn read_local_answer_stream(
                             print!("{}", token);
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                         }
+                        if first_token {
+                            first_token_ms = Some(asked_at.elapsed().as_millis());
+                        }
                         first_token = false;
                         answer.push_str(token);
                     }
@@ -974,7 +1033,7 @@ async fn read_local_answer_stream(
     if print {
         print_citations(&citations);
     }
-    Ok((answer, citations, model))
+    Ok((answer, citations, model, first_token_ms))
 }
 
 /// Map the node's citation shape onto the CLI's.
@@ -1042,7 +1101,8 @@ async fn read_chat_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
     stream_to_stdout: bool,
-) -> Result<(String, Vec<Citation>, Option<String>)> {
+    asked_at: std::time::Instant,
+) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
@@ -1053,6 +1113,7 @@ async fn read_chat_stream(
     let mut cited_indexes: Vec<u32> = Vec::new();
     let mut event = String::new();
     let mut first_token = true;
+    let mut first_token_ms: Option<u128> = None;
     let mut stream_error: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
@@ -1112,6 +1173,9 @@ async fn read_chat_stream(
                             print!("{}", token);
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                         }
+                        if first_token {
+                            first_token_ms = Some(asked_at.elapsed().as_millis());
+                        }
                         first_token = false;
                         answer.push_str(token);
                     }
@@ -1144,7 +1208,7 @@ async fn read_chat_stream(
         citation.cited = Some(referenced);
     }
 
-    Ok((answer, citations, model))
+    Ok((answer, citations, model, first_token_ms))
 }
 
 /// True when the deterministic mock wrote the answer.
@@ -2218,6 +2282,30 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four or five digits of milliseconds is a number the reader has to divide
+    /// before they can react to it, which is the opposite of what a timing
+    /// readout is for.
+    #[test]
+    fn long_durations_are_read_in_seconds() {
+        assert_eq!(format_duration_ms(0), "0 ms");
+        assert_eq!(format_duration_ms(737), "737 ms");
+        assert_eq!(format_duration_ms(999), "999 ms");
+        assert_eq!(format_duration_ms(1000), "1.0 s");
+        assert_eq!(format_duration_ms(13796), "13.8 s");
+    }
+
+    /// `local:` is the node's own bookkeeping. It is not something the user
+    /// chose, and it is not in the name they would type at Ollama.
+    #[test]
+    fn the_nodes_model_prefix_is_not_shown_to_the_user() {
+        assert_eq!(display_model("local:gemma4:latest"), "gemma4:latest");
+        // A hosted model name is left exactly as the node reported it.
+        assert_eq!(display_model("claude-sonnet-4"), "claude-sonnet-4");
+        // Only a leading prefix, so a model that merely contains the word is
+        // untouched.
+        assert_eq!(display_model("acme/local:v2"), "acme/local:v2");
+    }
 
     #[test]
     fn the_local_answer_body_carries_the_system_prompt_and_history() {

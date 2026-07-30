@@ -66,50 +66,90 @@ async fn fetch_latest_version() -> Option<String> {
     None
 }
 
-pub fn print_update_banner() {
+/// Whether `b` is a later release than `a`, comparing dotted parts left to
+/// right. A part that will not parse counts as 0, so a version the release feed
+/// invents cannot be read as newer than one it did not.
+fn is_newer(current: &str, candidate: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.')
+            .map(|s| s.parse::<u32>().unwrap_or(0))
+            .collect()
+    };
+
+    let current = parse(current);
+    let candidate = parse(candidate);
+
+    for i in 0..std::cmp::max(current.len(), candidate.len()) {
+        let c = current.get(i).unwrap_or(&0);
+        let l = candidate.get(i).unwrap_or(&0);
+        if l > c {
+            return true;
+        } else if l < c {
+            return false;
+        }
+    }
+    false
+}
+
+/// The newer release the last check found, if there is one.
+///
+/// Reads what the background check already cached rather than asking the
+/// release feed again: this is on the path of `knaix doctor`, and a diagnosis
+/// that hangs on a network call is a diagnosis nobody waits for.
+pub fn newer_version_available() -> Option<String> {
     if update_check_disabled() {
+        return None;
+    }
+    let latest = config::load_stored_config().latest_known_version?;
+    is_newer(env!("CARGO_PKG_VERSION"), &latest).then_some(latest)
+}
+
+pub fn print_update_banner() {
+    let Some(latest) = newer_version_available() else {
         return;
+    };
+
+    let current = env!("CARGO_PKG_VERSION");
+    let border = "─".repeat(50);
+    println!("\n{}", border.dimmed());
+    println!(
+        "{} {} (current: {})",
+        "Info: A new version of Knaix CLI is available:".blue(),
+        latest.green().bold(),
+        current.dimmed()
+    );
+    println!(
+        "Run: {}",
+        "curl -sSL https://knaix.com/install.sh | sh".cyan()
+    );
+    println!("{}\n", border.dimmed());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer;
+
+    #[test]
+    fn a_later_release_is_newer() {
+        assert!(is_newer("0.4.5", "0.4.6"));
+        assert!(is_newer("0.4.5", "0.5.0"));
+        assert!(is_newer("0.9.9", "1.0.0"));
     }
 
-    let config = config::load_stored_config();
-    if let Some(latest) = config.latest_known_version {
-        let current = env!("CARGO_PKG_VERSION");
+    #[test]
+    fn the_same_or_older_is_not() {
+        assert!(!is_newer("0.4.5", "0.4.5"));
+        assert!(!is_newer("0.4.5", "0.4.4"));
+        // A build ahead of the feed, which happens to anyone running from
+        // source. Telling them to downgrade would be worse than saying nothing.
+        assert!(!is_newer("0.5.0", "0.4.9"));
+    }
 
-        let parse = |v: &str| -> Vec<u32> {
-            v.split('.')
-                .map(|s| s.parse::<u32>().unwrap_or(0))
-                .collect()
-        };
-
-        let current_parts = parse(current);
-        let latest_parts = parse(&latest);
-        let mut is_newer = false;
-
-        for i in 0..std::cmp::max(current_parts.len(), latest_parts.len()) {
-            let c = current_parts.get(i).unwrap_or(&0);
-            let l = latest_parts.get(i).unwrap_or(&0);
-            if l > c {
-                is_newer = true;
-                break;
-            } else if l < c {
-                break;
-            }
-        }
-
-        if is_newer {
-            let border = "─".repeat(50);
-            println!("\n{}", border.dimmed());
-            println!(
-                "{} {} (current: {})",
-                "Info: A new version of Knaix CLI is available:".blue(),
-                latest.green().bold(),
-                current.dimmed()
-            );
-            println!(
-                "Run: {}",
-                "curl -sSL https://knaix.com/install.sh | sh".cyan()
-            );
-            println!("{}\n", border.dimmed());
-        }
+    /// The major number decides even when the minor is smaller, which the
+    /// digit-by-digit string comparison this replaced got wrong.
+    #[test]
+    fn a_leading_part_outranks_the_rest() {
+        assert!(is_newer("0.10.0", "1.2.0"));
+        assert!(!is_newer("1.2.0", "0.10.0"));
     }
 }
