@@ -39,6 +39,45 @@ fn image() -> String {
 /// maps on Linux, where it does not exist by default.
 const HOST_GATEWAY: &str = "host.docker.internal";
 
+/// Host interface the node is published on.
+///
+/// Naming it is the whole point. A mapping written `8080:8080` binds every
+/// interface, which on a laptop means the coffee-shop Wi-Fi, and the node runs
+/// with its authentication disabled on the premise that only this machine can
+/// reach it. The premise has to be enforced here or it is not true.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The `-p` argument that publishes the node to this machine and nowhere else.
+fn port_mapping(port: u16) -> String {
+    format!("{}:{}:8080", LOOPBACK_HOST, port)
+}
+
+/// Whether `docker port` reports a binding reachable from off this machine.
+///
+/// Docker prints one line per binding, `<host ip>:<port>`, and publishes to
+/// both address families where it can, so a single container can be loopback on
+/// one line and wide open on the next. Any line that is not a loopback address
+/// is reachable from the network segment, which is the condition being tested.
+fn published_beyond_loopback(port_output: &str) -> bool {
+    port_output.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+        // Trailing `:<port>`, with the host part left whole: IPv6 keeps its
+        // colons and its brackets.
+        let host = match line.rsplit_once(':') {
+            Some((host, _)) => host.trim(),
+            None => return false,
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        // The whole 127.0.0.0/8 block is loopback, not just the address this
+        // CLI publishes on, so a container someone started by hand on 127.0.1.1
+        // is not dragged through a needless re-create.
+        !(host.starts_with("127.") || host == "::1")
+    })
+}
+
 /// Rewrite a loopback model URL so the node can actually reach it.
 ///
 /// The node runs in a container, so `127.0.0.1` is the container itself, not
@@ -367,7 +406,24 @@ pub async fn up(
 ) -> Result<()> {
     docker_available()?;
 
-    if container_state().as_deref() == Some("running") {
+    // A node started by an older CLI is published on every interface with its
+    // authentication disabled, so leaving it up is the exposure the loopback
+    // binding exists to close. Re-creating it keeps the corpus -- that lives in
+    // a named volume, and the identity is carried across below -- so close it
+    // here rather than printing advice and hoping it is read.
+    let running = container_state().as_deref() == Some("running");
+    let exposed = running
+        && published_beyond_loopback(&docker(&["port", CONTAINER, "8080"]).unwrap_or_default());
+    if exposed {
+        println!(
+            "{} This node was published on every network interface, so anyone on your\n  network could read and change its knowledge base without a credential.\n  Restarting it on {} now. Your documents are kept.",
+            "Warning:".yellow(),
+            LOOPBACK_HOST.cyan()
+        );
+        let _ = docker(&["rm", "-f", CONTAINER]);
+    }
+
+    if running && !exposed {
         let node = load().ok_or_else(|| {
             anyhow!("A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.", CONTAINER)
         })?;
@@ -470,7 +526,7 @@ pub async fn up(
         None => (new_instance_id(), None, None),
     };
 
-    let port_map = format!("{}:8080", launch.port);
+    let port_map = port_mapping(launch.port);
     let volume_map = format!("{}:/data", VOLUME);
     let bound = format!("KB_INSTANCE_ID={}", instance_id);
     let mut args: Vec<String> = vec![
@@ -494,9 +550,12 @@ pub async fn up(
         "DATA_DIR=/data",
         "-e",
         &bound,
-        // Loopback only, and no mesh peers: nothing else can reach this node,
-        // so the guards that protect a provisioned node have nothing to
-        // protect against here.
+        // Safe only because `port_mapping` publishes to loopback: nothing off
+        // this machine can open the socket, and there are no mesh peers. Both
+        // of these turn the node's orchestrator routes -- the corpus, and the
+        // credential set it accepts -- into an unauthenticated surface for
+        // anyone who can reach the port, so they and the binding have to be
+        // changed together or not at all.
         "-e",
         "A2A_AUTH_DISABLED=true",
         "-e",
@@ -1508,6 +1567,70 @@ mod tests {
         let (out, rewritten) = reachable_from_container("not a url");
         assert!(!rewritten);
         assert_eq!(out, "not a url");
+    }
+
+    #[test]
+    fn the_node_is_published_to_this_machine_only() {
+        // The node runs with A2A_AUTH_DISABLED and A2A_ALLOW_PRIVATE_NETWORK,
+        // so the host interface in this mapping is the only thing standing
+        // between a LAN peer and an unauthenticated corpus. A bare "8080:8080"
+        // binds 0.0.0.0.
+        for port in [8080u16, 9123] {
+            let map = port_mapping(port);
+            assert_eq!(map, format!("127.0.0.1:{port}:8080"));
+            assert!(
+                map.starts_with("127.0.0.1:"),
+                "must name a loopback host interface: {map}"
+            );
+            assert_eq!(map.split(':').count(), 3, "host:host_port:container_port");
+        }
+    }
+
+    #[test]
+    fn a_wide_open_published_port_is_recognised() {
+        // What `docker port knaix-local 8080` prints for a mapping with no host
+        // interface. Both families, either alone, and the v6 wildcard.
+        for out in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "0.0.0.0:8080\n[::]:8080",
+            "192.168.1.50:8080",
+            // One good line does not redeem the other: the container is still
+            // reachable from the segment.
+            "127.0.0.1:8080\n0.0.0.0:8080",
+        ] {
+            assert!(published_beyond_loopback(out), "should be flagged: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_published_port_is_left_alone() {
+        // Flagging these would re-create a correctly bound node on every `up`.
+        for out in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "127.0.0.1:8080\n[::1]:8080",
+            "127.0.1.1:9123",
+            // Docker prints nothing when the container is gone or unpublished;
+            // absence is not evidence of exposure.
+            "",
+            "\n",
+        ] {
+            assert!(
+                !published_beyond_loopback(out),
+                "should not be flagged: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_up_publishes_is_never_seen_as_exposed() {
+        // Ties the two halves together: the mapping the CLI writes must not be
+        // one the upgrade check would tear down, or `up` re-creates forever.
+        let port = 8080;
+        let published = port_mapping(port);
+        let host_binding = published.rsplit_once(':').unwrap().0;
+        assert!(!published_beyond_loopback(host_binding));
     }
 
     #[test]
