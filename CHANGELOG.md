@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.8] - 2026-07-30
+
+A security release. **If you have run `knaix local up` on a network you do not control, upgrade.**
+
+### Fixed
+
+- **The local node was published on every network interface.** `knaix local up` disabled the node's authentication on the premise that only this machine could reach it, and then published it on `0.0.0.0`, where anyone on the same network segment could. The premise was right and the port mapping never enforced it. On a shared network, an unauthenticated caller could read, change and delete the knowledge base, read chat history, spend the model, and replace the set of API keys the node accepts, which turns a disclosure into an escalation.
+
+  The node is now published on `127.0.0.1`. A node still running from an older version is re-created on loopback the next time you run `knaix local up`; the store is a named volume and the node keeps its identity, so documents already ingested stay reachable. Nodes reached over a tailnet or provisioned through the control plane were never affected, because they authenticate rather than rely on where the caller is.
+
+- **`knaix local up` no longer touches a container it did not start.** It has always refused a running `knaix-local` that was not its own, but the check rested on the state file, which a plain `knaix local down` deliberately keeps. A container that took the name afterwards inherited the claim. Ownership is now settled by the image, so a container that is not the node is refused rather than adopted or removed, and `up` no longer reports a node running at an address where nothing of yours is listening.
+
 ## [0.4.7] - 2026-07-30
 
 ### Added
