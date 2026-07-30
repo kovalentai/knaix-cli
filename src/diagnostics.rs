@@ -71,23 +71,61 @@ fn append(entry: Entry) {
     };
     let path = path();
 
-    let mut kept: Vec<String> = std::fs::read_to_string(&path)
-        .map(|s| s.lines().map(|l| l.to_string()).collect())
-        .unwrap_or_default();
-    kept.push(line);
-    let start = kept.len().saturating_sub(RING);
-    let body = kept[start..].join("\n");
+    // One line, opened for append, written in a single call. Reading the file
+    // and writing it back was losing entries: twelve commands failing at once
+    // produced three records, because each process read before the others
+    // wrote. It also truncated first, so a process dying mid-write took the
+    // whole history with it. O_APPEND has neither problem, and the kernel puts
+    // each line at the end without the writers having to agree.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
 
-    // Written whole rather than appended, because the trim has to happen in the
-    // same operation. The file is at most RING short lines.
-    if let Ok(mut f) = std::fs::File::create(&path) {
-        let _ = writeln!(f, "{body}");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    if let Ok(mut f) = options.open(&path) {
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+
+    trim(&path);
+}
+
+/// Cut the file back to the ring size, if it has grown past it.
+///
+/// Separate from the append so the append stays a single atomic write. Racing
+/// trims can only lose entries a later run would have dropped anyway, which is
+/// the one kind of loss this file is allowed to have.
+fn trim(path: &std::path::Path) {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= RING {
+        return;
+    }
+
+    // Through a temp file and a rename, so a reader never sees a half-written
+    // ring. The same move config.rs makes for the saved session.
+    let tmp = path.with_extension("jsonl.tmp");
+    let kept = lines[lines.len() - RING..].join("\n");
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    if let Ok(mut f) = options.open(&tmp) {
+        if writeln!(f, "{kept}").is_ok() && f.sync_all().is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+            return;
         }
     }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 /// Record a command that failed.
@@ -129,8 +167,17 @@ pub fn record_failure(err: &anyhow::Error, code: u8) {
 /// Record a panic. Installed as the hook so a crash is recoverable.
 pub fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
     let mut manifest = Manifest::default();
-    let scrubber = Scrubber::for_this_machine();
     let args: Vec<String> = std::env::args().collect();
+
+    // The arguments go in the scrubber here for the same reason they do when a
+    // command fails, and more urgently: a panic message is written by us in the
+    // middle of something going wrong, so it is the message most likely to
+    // interpolate a path or a name we were holding. Without this, a panic while
+    // reading a file recorded that file's name verbatim.
+    let mut scrubber = Scrubber::for_this_machine();
+    for arg in args.iter().skip(1).filter(|a| !a.starts_with('-')) {
+        scrubber.add(Some(arg), "<removed>".to_string());
+    }
 
     // The location is ours, so it is kept whole: it names our source file, not
     // anything of the user's. The message is not, so it is reduced.

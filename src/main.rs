@@ -405,11 +405,18 @@ async fn main() -> std::process::ExitCode {
             diagnostics::record_failure(&e, code.as_u8());
 
             // Only where a diagnosis would help. A usage error already names
-            // the problem, and pointing at another command would be noise.
-            if matches!(
-                code,
-                exit::Code::Unavailable | exit::Code::Auth | exit::Code::Precondition
-            ) {
+            // the problem, and pointing at another command would be noise. And
+            // never to someone who just ran the diagnosis: doctor and report
+            // both end in the checks this would be suggesting they run.
+            let already_diagnosed = std::env::args()
+                .nth(1)
+                .is_some_and(|a| a == "doctor" || a == "report");
+            if !already_diagnosed
+                && matches!(
+                    code,
+                    exit::Code::Unavailable | exit::Code::Auth | exit::Code::Precondition
+                )
+            {
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",
                     brand::cmd("doctor")
@@ -820,8 +827,16 @@ async fn run() -> Result<()> {
             forget,
         } => {
             if forget {
+                // Counted before clearing, so the confirmation says what
+                // actually happened. Reporting a clearance when the file was
+                // already empty is a small lie about the user's own disk.
+                let had = diagnostics::recent().len();
                 diagnostics::clear().context("Could not clear the recorded failures")?;
-                ctx.info(&format!("{} Recorded failures cleared.", "✓".green()));
+                ctx.info(&match had {
+                    0 => format!("{} Nothing was recorded, so nothing to clear.", "✓".green()),
+                    1 => format!("{} 1 recorded failure cleared.", "✓".green()),
+                    n => format!("{} {n} recorded failures cleared.", "✓".green()),
+                });
             } else {
                 // No project fallback, for the same reason as doctor: report
                 // reads the file itself so a broken one is a finding.

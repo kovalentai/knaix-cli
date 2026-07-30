@@ -30,6 +30,23 @@ const PUBLIC_API_URL: &str = "https://api.kovalentai.com";
 /// obligation to look different from ours.
 const NODE_ROUTE_PREFIXES: &[&str] = &["/api", "/health", "/v1", "/mcp", "/metrics"];
 
+/// The shortest value worth substituting out of free text.
+///
+/// Below this, a substitution is far more likely to hit ordinary prose or one
+/// of our own strings than to hide anything. Structured fields still hash short
+/// values; this governs free text only.
+const MIN_SCRUB_LEN: usize = 5;
+
+/// Words that are never treated as identifiers, whatever they are set to.
+///
+/// A node or account can legitimately be called `local`, `admin` or `node`, and
+/// each of those also appears in sentences the CLI writes about itself. The
+/// structured fields still hash them.
+const COMMON_WORDS: &[&str] = &[
+    "local", "admin", "node", "nodes", "user", "users", "test", "prod", "stage", "main", "root",
+    "https", "http", "json", "text", "true", "false", "none", "error", "knaix", "docker", "model",
+];
+
 /// One thing the bundle left out or replaced, and why.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Removal {
@@ -185,12 +202,23 @@ impl Scrubber {
         s
     }
 
-    /// Register a value to replace. Short values are skipped: substituting a
-    /// two-character string would shred unrelated prose, and nothing that short
-    /// identifies anyone.
+    /// Register a value to replace.
+    ///
+    /// Short values are skipped, and the threshold is higher than it looks like
+    /// it needs to be. Substring replacement has no idea what a word is, so a
+    /// username of `api` rewrote our own `api.kovalentai.com` into
+    /// `id:14c2....kovalentai.com`, and a username of `the` turned "answering
+    /// with the deterministic mock" into prose with a hash in the middle of it.
+    /// Neither leaked anything, and both would waste the time of whoever read
+    /// the report, which is the only thing a report is for.
+    ///
+    /// Values below the threshold are not left exposed: the config section
+    /// hashes the username and the node name regardless. What is given up is
+    /// scrubbing them out of free text, and a name of three or four characters
+    /// identifies almost nobody anyway.
     pub fn add(&mut self, value: Option<&str>, replacement: String) {
         let Some(v) = value else { return };
-        if v.len() < 3 {
+        if v.len() < MIN_SCRUB_LEN || COMMON_WORDS.contains(&v.to_ascii_lowercase().as_str()) {
             return;
         }
         self.subs.push((v.to_string(), replacement));
@@ -480,6 +508,41 @@ mod tests {
             &mut m,
         );
         assert_eq!(out, vec!["knaix", "doctor", "-o", "json"]);
+    }
+
+    /// Substring replacement has no idea what a word is. A three-letter name
+    /// rewrote our own domain and shredded ordinary sentences, so short values
+    /// are left to the structured fields, which hash them regardless.
+    #[test]
+    fn a_short_name_does_not_shred_our_own_prose() {
+        let mut s = Scrubber::default();
+        s.add(Some("api"), hashed("api"));
+        s.add(Some("the"), hashed("the"));
+        s.add(Some("local"), hashed("local"));
+        let mut m = Manifest::default();
+
+        let out = s.scrub(
+            "https://api.kovalentai.com, answering with the deterministic mock",
+            "check detail",
+            &mut m,
+        );
+        assert_eq!(
+            out, "https://api.kovalentai.com, answering with the deterministic mock",
+            "a short value rewrote text it had no business touching"
+        );
+    }
+
+    /// The threshold is a trade, so the other half has to hold: a name long
+    /// enough to identify somebody still goes.
+    #[test]
+    fn a_real_name_is_still_replaced() {
+        let mut s = Scrubber::default();
+        s.add(Some("acme-prod"), hashed("acme-prod"));
+        let mut m = Manifest::default();
+
+        let out = s.scrub("target node: acme-prod, healthy", "check detail", &mut m);
+        assert!(!out.contains("acme"), "a node name survived: {out}");
+        assert!(out.starts_with("target node: id:"));
     }
 
     /// A bundle repeating the same removal forty times buries the one that

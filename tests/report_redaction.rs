@@ -157,11 +157,19 @@ fn a_bare_machine_still_produces_a_report() {
     );
 }
 
-/// The command's central promise. A diagnostic that phones home would contradict
-/// the thing the product is for, so the absence of any request is a property
-/// worth a test rather than a comment.
+/// A report has to survive the situation it exists for.
+///
+/// The reason somebody runs this is usually that something is unreachable, so
+/// the command must produce a full bundle with no control plane answering,
+/// rather than failing in the same way as whatever they were doing.
+///
+/// This deliberately does not claim the command makes no request. It does make
+/// them: building a report runs the same checks `doctor` runs, and those reach
+/// the control plane and the node. What is never sent is the bundle. An earlier
+/// name for this test asserted the broader claim and did not test it, which is
+/// how the same overstatement reached the printed output and the docs.
 #[test]
-fn report_makes_no_request_to_the_control_plane() {
+fn a_report_is_still_written_when_nothing_is_reachable() {
     let home = scratch_home("nonet");
     furnish(&home);
 
@@ -183,4 +191,56 @@ fn report_makes_no_request_to_the_control_plane() {
     );
     serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
         .expect("bundle is not JSON when the network is unreachable");
+}
+
+/// A report describes the machine it was taken on, so it gets the same
+/// protection the saved session gets. It was world-readable while the ring file
+/// beside it was 0600, which is the kind of inconsistency nobody notices until
+/// the report is on a shared box.
+#[cfg(unix)]
+#[test]
+fn the_bundle_is_not_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = scratch_home("perms");
+    furnish(&home);
+    let out = home.join("r.json");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_knaix"))
+        .env("HOME", &home)
+        .env("KNAIX_NO_UPDATE_CHECK", "1")
+        .current_dir(&home)
+        .args(["report", "--out", out.to_str().unwrap()])
+        .status()
+        .expect("failed to run knaix report");
+    assert!(status.success(), "report should have written the file");
+
+    let mode = fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the report is readable by others: {mode:o}");
+}
+
+/// A path typed by hand is where a typo lands on a file somebody wanted.
+/// `knaix init` already refuses rather than overwrite; this matches it.
+#[test]
+fn an_existing_file_is_not_overwritten() {
+    let home = scratch_home("clobber");
+    furnish(&home);
+
+    let target = home.join("precious.json");
+    fs::write(&target, "IMPORTANT USER DATA").unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_knaix"))
+        .env("HOME", &home)
+        .env("KNAIX_NO_UPDATE_CHECK", "1")
+        .current_dir(&home)
+        .args(["report", "--out", target.to_str().unwrap()])
+        .status()
+        .expect("failed to run knaix report");
+
+    assert!(!status.success(), "report overwrote a file that existed");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "IMPORTANT USER DATA",
+        "the file was clobbered"
+    );
 }

@@ -9,17 +9,22 @@
 //! So this writes the bundle instead, redacted as it is built rather than
 //! checked afterwards. See `redact` for why that is an allowlist.
 //!
-//! **It never uploads anything.** That is the design, not an unimplemented
+//! **It never uploads the report.** That is the design, not an unimplemented
 //! feature. We sell a control plane that architecturally cannot read tenant
 //! data; a command that packages up someone's environment and posts it to us on
 //! the day they are having a bad time would contradict that in the one moment
 //! they are paying closest attention. The bundle is a file. The user reads it,
 //! and decides.
+//!
+//! That is a claim about the bundle, not about the process. Building a report
+//! runs the same checks `doctor` runs, so it does reach the control plane and
+//! the node to ask how they are. Both sentences have to stay true, and the
+//! wording here is deliberately the narrower one.
 
 use crate::exit::{Code, WithCode};
 use crate::nodes::KnaixContext;
 use crate::redact::{self, Manifest, Removal};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use serde::Serialize;
 
@@ -247,6 +252,29 @@ pub async fn build(ctx: &KnaixContext, node_flag: Option<String>) -> Bundle {
     }
 }
 
+/// Write a file only the user can read.
+///
+/// A report describes their machine, so it gets the same 0600 the saved session
+/// gets. Created with the mode set rather than chmod'd afterwards: the gap
+/// between `create` and `set_permissions` is a window where the file exists at
+/// whatever the umask allows, and on a shared machine that is the whole
+/// exposure.
+fn write_private(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
+}
+
 pub async fn run(
     ctx: &KnaixContext,
     node_flag: Option<String>,
@@ -264,7 +292,19 @@ pub async fn run(
     }
 
     let path = out.unwrap_or_else(|| format!("knaix-report-{}.json", bundle.generated_at));
-    std::fs::write(&path, &json)
+
+    // Refuse rather than overwrite. `knaix init` already takes this line with
+    // .knaix.toml, and a report is written with a path the user typed, which is
+    // exactly where a typo lands on a file they wanted.
+    if std::path::Path::new(&path).exists() {
+        return Err(anyhow!(
+            "{} already exists. Move it, or pass --out with a different path.",
+            path
+        ))
+        .coded(Code::Precondition);
+    }
+
+    write_private(&path, &json)
         .with_context(|| format!("Could not write the report to {path}"))
         .coded(Code::Error)?;
 
@@ -357,10 +397,17 @@ fn print_summary(bundle: &Bundle, path: &str) {
         "\n  {} Your token is never included. Read the file before you share it.",
         "Note:".blue()
     );
+    // Precise about which claim is being made. The report is never uploaded,
+    // which is the promise. Saying "no request to Kovalent" overstated it:
+    // building the report runs the same checks as doctor, and those do reach
+    // the control plane. A privacy claim that is a little bit false is worse
+    // than no claim, because it is the one thing a reader will test.
     println!(
-        "  {} Nothing was sent anywhere. This command makes no request to Kovalent.\n",
-        "Note:".blue()
+        "  {} The report is never uploaded. Building it runs the same checks as {},",
+        "Note:".blue(),
+        crate::brand::cmd("doctor")
     );
+    println!("        so it does contact your node and control plane to ask how they are.\n");
 }
 
 #[cfg(test)]
