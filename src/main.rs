@@ -1,6 +1,7 @@
 mod bench;
 mod brand;
 mod config;
+mod diagnostics;
 mod doctor;
 mod exit;
 mod local;
@@ -9,7 +10,9 @@ mod mcp;
 mod model_server;
 mod nodes;
 mod project;
+mod redact;
 mod repl;
+mod report;
 mod selftest;
 mod shell;
 mod stdin_arg;
@@ -193,6 +196,28 @@ enum Commands {
         node: Option<String>,
     },
 
+    /// Write a diagnostic report you can read, then attach to an issue
+    Report {
+        /// The node to diagnose (falls back to the default)
+        node_id: Option<String>,
+
+        /// The node to diagnose, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
+
+        /// Where to write it (default: knaix-report-<time>.json here)
+        #[clap(long, value_name = "PATH")]
+        out: Option<String>,
+
+        /// Also open a new issue with the environment filled in
+        #[clap(long)]
+        open: bool,
+
+        /// Forget the recorded failures instead of writing a report
+        #[clap(long, conflicts_with_all = ["open", "out"])]
+        forget: bool,
+    },
+
     /// Measure how fast a node reaches, ingests, and answers
     Bench {
         /// The node to measure (falls back to the default)
@@ -358,6 +383,12 @@ enum LocalAction {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // A panic is always our bug, and until now it printed Rust's default and
+    // was gone the moment the terminal scrolled. Recording it first means
+    // `knaix report` can carry it, which is the difference between a crash
+    // somebody can act on and one they can only describe.
+    install_panic_hook();
+
     match run().await {
         Ok(()) => std::process::ExitCode::from(exit::Code::Ok.as_u8()),
         Err(e) => {
@@ -369,9 +400,48 @@ async fn main() -> std::process::ExitCode {
             for cause in e.chain().skip(1) {
                 eprintln!("  {} {}", "caused by:".dimmed(), cause);
             }
-            std::process::ExitCode::from(exit::code_of(&e).as_u8())
+
+            let code = exit::code_of(&e);
+            diagnostics::record_failure(&e, code.as_u8());
+
+            // Only where a diagnosis would help. A usage error already names
+            // the problem, and pointing at another command would be noise. And
+            // never to someone who just ran the diagnosis: doctor and report
+            // both end in the checks this would be suggesting they run.
+            let already_diagnosed = std::env::args()
+                .nth(1)
+                .is_some_and(|a| a == "doctor" || a == "report");
+            if !already_diagnosed
+                && matches!(
+                    code,
+                    exit::Code::Unavailable | exit::Code::Auth | exit::Code::Precondition
+                )
+            {
+                eprintln!(
+                    "\n  {} checks everything a command needs and says what to fix.",
+                    brand::cmd("doctor")
+                );
+            }
+
+            std::process::ExitCode::from(code.as_u8())
         }
     }
+}
+
+/// Record a panic before the default hook prints it.
+///
+/// The default hook still runs, so the user sees exactly what they saw before.
+/// This only adds the part that survives the terminal.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        diagnostics::record_panic(info);
+        eprintln!(
+            "\n  {} packages this up so it can be reported.",
+            brand::cmd("report")
+        );
+        previous(info);
+    }));
 }
 
 /// Which node a command addresses: an explicit flag, then the project file,
@@ -429,7 +499,10 @@ async fn run() -> Result<()> {
     // And `doctor`, which reads the file itself so that a parse failure is
     // reported as one finding among many rather than stopping the diagnosis
     // that would have named it.
-    let project = if matches!(command, Commands::Init { .. } | Commands::Doctor { .. }) {
+    let project = if matches!(
+        command,
+        Commands::Init { .. } | Commands::Doctor { .. } | Commands::Report { .. }
+    ) {
         None
     } else {
         project::current()?
@@ -745,6 +818,30 @@ async fn run() -> Result<()> {
             // No project fallback here: doctor reads the file itself, so that a
             // file which will not parse is a finding rather than a crash.
             doctor::run(&ctx, node.or(node_id)).await?;
+        }
+        Commands::Report {
+            node_id,
+            node,
+            out,
+            open,
+            forget,
+        } => {
+            if forget {
+                // Counted before clearing, so the confirmation says what
+                // actually happened. Reporting a clearance when the file was
+                // already empty is a small lie about the user's own disk.
+                let had = diagnostics::recent().len();
+                diagnostics::clear().context("Could not clear the recorded failures")?;
+                ctx.info(&match had {
+                    0 => format!("{} Nothing was recorded, so nothing to clear.", "✓".green()),
+                    1 => format!("{} 1 recorded failure cleared.", "✓".green()),
+                    n => format!("{} {n} recorded failures cleared.", "✓".green()),
+                });
+            } else {
+                // No project fallback, for the same reason as doctor: report
+                // reads the file itself so a broken one is a finding.
+                report::run(&ctx, node.or(node_id), out, open).await?;
+            }
         }
         Commands::Bench {
             node_id,

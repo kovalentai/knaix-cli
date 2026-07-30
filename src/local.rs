@@ -1381,6 +1381,17 @@ fn parse_size(s: &str) -> Option<u64> {
 }
 
 /// Recent container log lines (stdout), oldest first.
+/// Recent container log lines, for a diagnostic report.
+///
+/// Bounded like the other probes: a wedged daemon must not hang the command
+/// that is trying to describe the wedged daemon.
+pub fn recent_container_logs(n: usize) -> Vec<String> {
+    match docker_probe(&["logs", "--tail", &n.to_string(), CONTAINER], PROBE_WAIT) {
+        Probe::Answered(out) => out.lines().map(|l| l.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn recent_log_lines(n: usize) -> Vec<String> {
     docker(&["logs", "--tail", &n.to_string(), CONTAINER])
         .map(|out| out.lines().map(|l| l.to_string()).collect())
