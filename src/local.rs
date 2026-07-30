@@ -39,6 +39,74 @@ fn image() -> String {
 /// maps on Linux, where it does not exist by default.
 const HOST_GATEWAY: &str = "host.docker.internal";
 
+/// Host interface the node is published on.
+///
+/// Naming it is the whole point. A mapping written `8080:8080` binds every
+/// interface, which on a laptop means the coffee-shop Wi-Fi, and the node runs
+/// with its authentication disabled on the premise that only this machine can
+/// reach it. The premise has to be enforced here or it is not true.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The `-p` argument that publishes the node to this machine and nowhere else.
+fn port_mapping(port: u16) -> String {
+    format!("{}:{}:8080", LOOPBACK_HOST, port)
+}
+
+/// Whether a running container is the node the state file describes.
+///
+/// Saved state alone does not establish it. `down` keeps the file so the corpus
+/// and the identity survive a stop, which means a container that later takes the
+/// name inherits a claim it never earned -- and the only thing done with that
+/// claim is deleting it. The image `up` recorded is what settles it.
+fn image_matches(recorded: &str, running: &str) -> bool {
+    !recorded.trim().is_empty() && recorded.trim() == running.trim()
+}
+
+/// Ask docker what the running container was started from.
+fn running_image_matches(recorded: &str) -> bool {
+    match docker(&["inspect", "--format", "{{.Config.Image}}", CONTAINER]) {
+        Ok(running) => image_matches(recorded, &running),
+        // No answer is not a licence to delete.
+        Err(_) => false,
+    }
+}
+
+/// Whether `docker port` reports this container published to loopback only.
+///
+/// Docker prints one line per binding, `<host ip>:<port>`, and publishes to
+/// both address families where it can, so a single container can be loopback on
+/// one line and wide open on the next.
+///
+/// Positive rather than negative on purpose. The answer decides whether a node
+/// running with its authentication disabled is left up, and docker exits
+/// non-zero when it cannot answer -- an unpublished port, a daemon that died
+/// since the check above. Reading "no answer" as "safe" would skip the re-create
+/// in exactly the case nothing is known, so anything short of docker naming a
+/// loopback address counts as not proven and costs a restart.
+fn published_on_loopback_only(port_output: &str) -> bool {
+    let mut saw_binding = false;
+    for line in port_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        saw_binding = true;
+        // Trailing `:<port>`, with the host part left whole: IPv6 keeps its
+        // colons and its brackets.
+        let host = match line.rsplit_once(':') {
+            Some((host, _)) => host.trim(),
+            None => return false,
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        // The whole 127.0.0.0/8 block is loopback, not just the address this
+        // CLI publishes on.
+        if !(host.starts_with("127.") || host == "::1") {
+            return false;
+        }
+    }
+    saw_binding
+}
+
 /// Rewrite a loopback model URL so the node can actually reach it.
 ///
 /// The node runs in a container, so `127.0.0.1` is the container itself, not
@@ -367,10 +435,41 @@ pub async fn up(
 ) -> Result<()> {
     docker_available()?;
 
-    if container_state().as_deref() == Some("running") {
-        let node = load().ok_or_else(|| {
-            anyhow!("A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.", CONTAINER)
-        })?;
+    // What is running under our name, if it is ours at all. `down` keeps the
+    // state file so a stop does not orphan the corpus, which means the name and
+    // the state together are not enough -- a container started afterwards would
+    // inherit a claim it never earned, and what the claim authorises here is a
+    // delete. The image `up` recorded settles it.
+    let running = container_state().as_deref() == Some("running");
+    let ours = if running {
+        load().filter(|n| running_image_matches(&n.image))
+    } else {
+        None
+    };
+    if running && ours.is_none() {
+        return Err(anyhow!(
+            "A '{}' container is already running but was not started by this CLI. Remove it with 'knaix local down' first.",
+            CONTAINER
+        ));
+    }
+
+    // A node started by an older CLI is published on every interface with its
+    // authentication disabled, so leaving it up is the exposure the loopback
+    // binding exists to close. Re-creating it keeps the corpus -- that lives in
+    // a named volume, and the identity is carried across below -- so close it
+    // here rather than printing advice and hoping it is read.
+    let exposed = ours.is_some()
+        && !published_on_loopback_only(&docker(&["port", CONTAINER, "8080"]).unwrap_or_default());
+    if exposed {
+        println!(
+            "{} This node was published on every network interface, so anyone on your\n  network could read and change its knowledge base without a credential.\n  Restarting it on {} now. Your documents are kept.",
+            "Warning:".yellow(),
+            LOOPBACK_HOST.cyan()
+        );
+        let _ = docker(&["rm", "-f", CONTAINER]);
+    }
+
+    if let (Some(node), false) = (&ours, exposed) {
         // The container reads its model configuration once, at startup. Flags
         // passed to a node that is already up are read here and dropped, so an
         // explicit request to change what answers has to say it did not take
@@ -470,7 +569,7 @@ pub async fn up(
         None => (new_instance_id(), None, None),
     };
 
-    let port_map = format!("{}:8080", launch.port);
+    let port_map = port_mapping(launch.port);
     let volume_map = format!("{}:/data", VOLUME);
     let bound = format!("KB_INSTANCE_ID={}", instance_id);
     let mut args: Vec<String> = vec![
@@ -494,9 +593,12 @@ pub async fn up(
         "DATA_DIR=/data",
         "-e",
         &bound,
-        // Loopback only, and no mesh peers: nothing else can reach this node,
-        // so the guards that protect a provisioned node have nothing to
-        // protect against here.
+        // Safe only because `port_mapping` publishes to loopback: nothing off
+        // this machine can open the socket, and there are no mesh peers. Both
+        // of these turn the node's orchestrator routes -- the corpus, and the
+        // credential set it accepts -- into an unauthenticated surface for
+        // anyone who can reach the port, so they and the binding have to be
+        // changed together or not at all.
         "-e",
         "A2A_AUTH_DISABLED=true",
         "-e",
@@ -1508,6 +1610,104 @@ mod tests {
         let (out, rewritten) = reachable_from_container("not a url");
         assert!(!rewritten);
         assert_eq!(out, "not a url");
+    }
+
+    #[test]
+    fn the_node_is_published_to_this_machine_only() {
+        // The node runs with A2A_AUTH_DISABLED and A2A_ALLOW_PRIVATE_NETWORK,
+        // so the host interface in this mapping is the only thing standing
+        // between a LAN peer and an unauthenticated corpus. A bare "8080:8080"
+        // binds 0.0.0.0.
+        for port in [8080u16, 9123] {
+            let map = port_mapping(port);
+            assert_eq!(map, format!("127.0.0.1:{port}:8080"));
+            assert!(
+                map.starts_with("127.0.0.1:"),
+                "must name a loopback host interface: {map}"
+            );
+            assert_eq!(map.split(':').count(), 3, "host:host_port:container_port");
+        }
+    }
+
+    #[test]
+    fn a_wide_open_published_port_is_not_taken_for_loopback() {
+        // What `docker port knaix-local 8080` prints for a mapping with no host
+        // interface. Both families, either alone, and the v6 wildcard.
+        for out in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "0.0.0.0:8080\n[::]:8080",
+            "192.168.1.50:8080",
+            // One good line does not redeem the other: the container is still
+            // reachable from the segment.
+            "127.0.0.1:8080\n0.0.0.0:8080",
+        ] {
+            assert!(
+                !published_on_loopback_only(out),
+                "should not read as loopback: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_published_port_is_left_alone() {
+        // Reading these as exposed would re-create a correctly bound node on
+        // every `up`.
+        for out in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "127.0.0.1:8080\n[::1]:8080",
+            "127.0.1.1:9123",
+        ] {
+            assert!(
+                published_on_loopback_only(out),
+                "should be loopback: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_running_another_image_is_not_ours_to_delete() {
+        // `down` keeps the state file, so saved state on its own is a claim a
+        // later container inherits without earning it. The only thing done with
+        // that claim is `docker rm -f`, so it has to be the image that settles
+        // ownership rather than the name.
+        let ours = "ghcr.io/kovalentai/node-runtime:latest";
+        assert!(image_matches(ours, ours));
+        assert!(image_matches(
+            ours,
+            "  ghcr.io/kovalentai/node-runtime:latest\n"
+        ));
+        assert!(!image_matches(ours, "alpine:latest"));
+        // A developer's own build is still theirs, and still not the released
+        // tag, so the recorded image is the only thing worth comparing against.
+        assert!(!image_matches(ours, "node-runtime:dev"));
+        // State that records no image authorises nothing.
+        assert!(!image_matches("", "alpine:latest"));
+        assert!(!image_matches("  ", ""));
+    }
+
+    #[test]
+    fn an_answer_docker_could_not_give_is_never_read_as_safe() {
+        // `docker port` exits non-zero when the port is not published or the
+        // daemon has gone, and the caller turns that into an empty string. The
+        // node whose binding cannot be established is the one that must not be
+        // left running with its authentication off.
+        for out in ["", "\n", "   ", "\n\n"] {
+            assert!(
+                !published_on_loopback_only(out),
+                "silence must not read as loopback: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_up_publishes_reads_back_as_loopback() {
+        // Ties the two halves together: the mapping the CLI writes must be one
+        // the upgrade check accepts, or `up` re-creates the node forever.
+        let published = port_mapping(8080);
+        let host_binding = published.rsplit_once(':').unwrap().0;
+        assert!(published_on_loopback_only(host_binding));
     }
 
     #[test]
