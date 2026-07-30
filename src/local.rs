@@ -153,6 +153,16 @@ fn docker_streaming(args: &[&str]) -> Result<()> {
     }
 }
 
+/// The docker daemon's version, or nothing if docker is absent or not running.
+///
+/// `docker info` rather than `docker --version`, because the binary being on
+/// PATH says nothing about whether a daemon is there to answer.
+pub fn docker_version() -> Option<String> {
+    docker(&["info", "--format", "{{.ServerVersion}}"])
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 fn docker_available() -> Result<()> {
     // Context rather than a rebuilt error: rebuilding drops the code the
     // helper attached, and a missing Docker is the precondition case the exit

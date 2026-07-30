@@ -157,7 +157,7 @@ pub struct LatencySummary {
 }
 
 /// Percentile by nearest-rank over an already-sorted slice.
-fn percentile(sorted: &[u128], p: f64) -> u128 {
+pub(crate) fn percentile(sorted: &[u128], p: f64) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
@@ -320,44 +320,45 @@ fn document_name(run_id: &str, source_key: &str) -> String {
     format!("{}{}-{}.md", DOC_PREFIX, run_id, source_key)
 }
 
-async fn ingest_corpus(
+/// Ingest one document of generated text, hosted or local, and return the id the
+/// node filed it under.
+///
+/// Shared with `knaix bench`, which needs the same "put a known document on a
+/// node and take it away again" move. The id can be absent: a node that accepted
+/// the document without reporting one leaves nothing to delete later, and saying
+/// so is more honest than inventing an id that will fail to delete.
+pub(crate) async fn ingest_text(
     ctx: &KnaixContext,
     target: &Target,
-    run_id: &str,
-    document_ids: &mut Vec<String>,
-) -> Result<()> {
+    filename: &str,
+    body: &str,
+) -> Result<Option<String>> {
     if let Target::Local { base, instance_id } = target {
         // The node parses, chunks and embeds it itself; there is no control
         // plane in the path and no credential to present.
-        for doc in corpus() {
-            let name = document_name(run_id, doc.source_key);
-            let resp = ctx
-                .client
-                .post(format!("{}/api/kb/ingest", base))
-                .json(&serde_json::json!({
-                    "instance_id": instance_id,
-                    "text": doc.body,
-                    "filename": name,
-                }))
-                .send()
-                .await
-                .context("Failed to reach the local node")?;
+        let resp = ctx
+            .client
+            .post(format!("{}/api/kb/ingest", base))
+            .json(&serde_json::json!({
+                "instance_id": instance_id,
+                "text": body,
+                "filename": filename,
+            }))
+            .send()
+            .await
+            .context("Failed to reach the local node")?;
 
-            let status = resp.status();
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(anyhow!(
-                    "Self-test could not ingest {}: HTTP {} - {}",
-                    name,
-                    status,
-                    body["message"].as_str().unwrap_or("unknown error")
-                ));
-            }
-            if let Some(id) = body["documentId"].as_str() {
-                document_ids.push(id.to_string());
-            }
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Could not ingest {}: HTTP {} - {}",
+                filename,
+                status,
+                payload["message"].as_str().unwrap_or("unknown error")
+            ));
         }
-        return Ok(());
+        return Ok(payload["documentId"].as_str().map(|s| s.to_string()));
     }
 
     let node_uuid = target.label();
@@ -367,34 +368,45 @@ async fn ingest_corpus(
         ctx.config.api_url, node_uuid
     );
 
+    let part = multipart::Part::text(body.to_string())
+        .file_name(filename.to_string())
+        .mime_str("text/markdown")?;
+    let form = multipart::Form::new().part("file", part);
+
+    let resp = ctx
+        .client
+        .post(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .await
+        .context("Failed to upload a generated document")?;
+
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() || !payload["success"].as_bool().unwrap_or(false) {
+        return Err(anyhow!(
+            "Could not ingest {}: HTTP {} - {}",
+            filename,
+            status,
+            payload["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+    Ok(payload["data"]["documentId"]
+        .as_str()
+        .map(|s| s.to_string()))
+}
+
+async fn ingest_corpus(
+    ctx: &KnaixContext,
+    target: &Target,
+    run_id: &str,
+    document_ids: &mut Vec<String>,
+) -> Result<()> {
     for doc in corpus() {
         let name = document_name(run_id, doc.source_key);
-        let part = multipart::Part::text(doc.body)
-            .file_name(name.clone())
-            .mime_str("text/markdown")?;
-        let form = multipart::Form::new().part("file", part);
-
-        let resp = ctx
-            .client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to upload the self-test corpus")?;
-
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        if !status.is_success() || !body["success"].as_bool().unwrap_or(false) {
-            return Err(anyhow!(
-                "Self-test could not ingest {}: HTTP {} - {}",
-                name,
-                status,
-                body["error"].as_str().unwrap_or("unknown error")
-            ));
-        }
-        if let Some(id) = body["data"]["documentId"].as_str() {
-            document_ids.push(id.to_string());
+        if let Some(id) = ingest_text(ctx, target, &name, doc.body).await? {
+            document_ids.push(id);
         }
     }
     Ok(())
@@ -560,7 +572,13 @@ async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<
         .collect())
 }
 
-async fn delete_document(ctx: &KnaixContext, target: &Target, document_id: &str) -> Result<()> {
+/// Remove a document by id, hosted or local. Shared with `knaix bench`, which
+/// has the same obligation to leave a node with the corpus it started with.
+pub(crate) async fn delete_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    document_id: &str,
+) -> Result<()> {
     if let Target::Local { base, instance_id } = target {
         let resp = ctx
             .client

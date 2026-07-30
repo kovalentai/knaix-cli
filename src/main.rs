@@ -1,5 +1,7 @@
+mod bench;
 mod brand;
 mod config;
+mod doctor;
 mod exit;
 mod local;
 mod login;
@@ -179,6 +181,38 @@ enum Commands {
     Local {
         #[clap(subcommand)]
         action: LocalAction,
+    },
+
+    /// Check everything a command needs, and say what to do about what is wrong
+    Doctor {
+        /// The node to diagnose (falls back to the default)
+        node_id: Option<String>,
+
+        /// The node to diagnose, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
+    },
+
+    /// Measure how fast a node reaches, ingests, and answers
+    Bench {
+        /// The node to measure (falls back to the default)
+        node_id: Option<String>,
+
+        /// The node to measure, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
+        node: Option<String>,
+
+        /// How many times to run each phase
+        #[clap(long, default_value_t = bench::DEFAULT_RUNS)]
+        runs: usize,
+
+        /// Measure answering only, against what the node already holds
+        #[clap(long)]
+        no_ingest: bool,
+
+        /// Leave the generated document on the node instead of removing it
+        #[clap(long)]
+        keep: bool,
     },
 
     /// Check that a node retrieves and cites correctly, using a bundled corpus
@@ -387,7 +421,11 @@ async fn run() -> Result<()> {
     // Except for `init`, which is how a broken file gets replaced. Refusing to
     // run it leaves the one command that would fix the problem unreachable, and
     // the only way out is to delete the file by hand.
-    let project = if matches!(command, Commands::Init { .. }) {
+    //
+    // And `doctor`, which reads the file itself so that a parse failure is
+    // reported as one finding among many rather than stopping the diagnosis
+    // that would have named it.
+    let project = if matches!(command, Commands::Init { .. } | Commands::Doctor { .. }) {
         None
     } else {
         project::current()?
@@ -694,6 +732,23 @@ async fn run() -> Result<()> {
         },
         Commands::Up => {
             nodes::up(&ctx).await?;
+        }
+        Commands::Doctor { node_id, node } => {
+            // No project fallback here: doctor reads the file itself, so that a
+            // file which will not parse is a finding rather than a crash.
+            doctor::run(&ctx, node.or(node_id)).await?;
+        }
+        Commands::Bench {
+            node_id,
+            node,
+            runs,
+            no_ingest,
+            keep,
+        } => {
+            let node_id = project_node(node.or(node_id), project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                bench::run(&ctx, &target, runs, no_ingest, keep).await?;
+            }
         }
         Commands::Selftest {
             node_id,

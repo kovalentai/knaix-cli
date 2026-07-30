@@ -119,6 +119,8 @@ cargo install --path .
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
 | `knaix mcp`      | Print the MCP client config that points Claude Code, Claude Desktop or Cursor at a node. |
 | `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
+| `knaix doctor`   | Check everything a command needs, and say what to do about what is wrong. |
+| `knaix bench`    | Measure how fast a node reaches, ingests, and answers.  |
 | `knaix selftest` | Check that a node retrieves and cites correctly, against a bundled corpus. |
 | `knaix completions` | Print a shell completion script (bash, zsh, fish, powershell, elvish). |
 | `knaix status`   | Show who is logged in, the default node, and the local node's state. |
@@ -258,6 +260,66 @@ containing a slash is matched literally against the path.
 
 One unreadable file no longer abandons the run: the rest still upload and the
 failures are named at the end, with a non-zero exit.
+
+## When something is wrong: `knaix doctor`
+
+Every other command stops at the first thing it finds broken, which means
+diagnosing a setup takes several commands and some guessing. `doctor` runs every
+check, reports all of them, and prints the command that fixes each one it did
+not like.
+
+```bash
+knaix doctor                 # the node your commands would address
+knaix doctor -n acme-prod    # a particular node
+knaix doctor -o json         # every check, for a script or a CI step
+```
+
+It checks the CLI version, `.knaix.toml`, the API URL, the control plane, your
+session, Docker, the local node, and finally whether the node your commands
+address can actually answer.
+
+One rule decides the exit code: **doctor fails when the node your commands
+would address cannot answer.** Everything else is a warning. A machine with no
+Docker is fine if your default node is hosted, and an unreachable control plane
+is fine if your default node is `local`, so neither is reported as a failure to
+someone it does not affect. A run that only warns exits 0 and is safe to gate a
+CI step on.
+
+`doctor` is also the one command that survives a `.knaix.toml` it cannot parse.
+Every other command reads that file before it runs, so a broken one breaks all
+of them; `doctor` reports it as a finding instead.
+
+## How fast is it: `knaix bench`
+
+`selftest` answers whether a node answers *correctly*. `bench` answers how long
+it takes.
+
+```bash
+knaix bench                  # 5 runs per phase against the default node
+knaix bench --runs 20        # more samples for a tighter p95
+knaix bench --no-ingest      # measure answering only, against what is already there
+knaix bench -o json          # every timing, plus the raw samples
+```
+
+Three phases, because they slow down for different reasons and a single
+end-to-end number hides which one moved:
+
+| Phase | What it measures |
+| :--- | :--- |
+| Reach | A bare round trip to the node's health endpoint: the floor everything else sits on. |
+| Ingest | One generated document parsed, chunked, embedded and written: the write side of the vector store. |
+| Answer | A question, split into time to first token and total. |
+
+The split in the answer phase is the useful one. Retrieval, reranking and prompt
+assembly all happen before the first token arrives, so a high first-token time
+with a small gap to the total means the knowledge base is slow, and the reverse
+means the model is.
+
+Like `selftest`, the document it ingests is deleted before the command returns,
+and `--keep` leaves it if you want to look at it. A node answering with the
+deterministic mock is labelled as such: retrieval and ingest are still real, but
+those answer timings measure the mock and must never be compared with a real
+model's.
 
 ## Shell completion
 
