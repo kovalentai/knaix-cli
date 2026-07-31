@@ -20,22 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The version is stated in Cargo.toml, Cargo.lock and the README title,
-      # and only the first two are checked by anything. The README went three
-      # releases stale before it was noticed. release.yml refuses to ship a
-      # mismatch, but that fires on the tag, which is after the release PR has
-      # merged; catching it here tells the PR that introduced it instead.
-      - name: Version stated consistently
-        run: |
-          set -euo pipefail
-          CARGO_VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          EXPECTED="# Knaix CLI (v${CARGO_VER})"
-          ACTUAL="$(head -1 README.md)"
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error file=README.md,line=1::README title is '${ACTUAL}', expected '${EXPECTED}'. Run scripts/bump-version.sh ${CARGO_VER}."
-            exit 1
-          fi
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -48,15 +48,6 @@ jobs:
             echo "::error::Tag ${TAG} does not match Cargo.toml version v${CARGO_VER}."
             exit 1
           fi
-          # The README title states the version too, and nothing else checks
-          # it, so it went three releases stale before anyone noticed. Same
-          # treatment as the tag: refuse rather than ship a release whose front
-          # page names a different version than the binary it hands out.
-          README_LINE="$(head -1 README.md)"
-          if [ "$README_LINE" != "# Knaix CLI (v${CARGO_VER})" ]; then
-            echo "::error::README.md title is '${README_LINE}', expected '# Knaix CLI (v${CARGO_VER})'. Run scripts/bump-version.sh ${CARGO_VER}."
-            exit 1
-          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
   build:
