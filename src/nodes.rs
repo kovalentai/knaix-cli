@@ -2560,7 +2560,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_note_that_is_a_symlink_out_of_the_directory_is_refused() {
+        // Cleared first, not just afterwards. A failing assertion skips the
+        // cleanup below, and `symlink` refuses a path that already exists, so a
+        // run that leaves this behind would fail every later run on the same
+        // pid for a reason that has nothing to do with the code under test.
         let root = std::env::temp_dir().join(format!("knaix-memlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("memory");
         std::fs::create_dir_all(&dir).unwrap();
         let outside = root.join("secret.txt");
