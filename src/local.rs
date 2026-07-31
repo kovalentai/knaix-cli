@@ -335,8 +335,51 @@ fn docker_available() -> Result<()> {
 }
 
 /// Container state as docker reports it: running, exited, or absent.
-fn container_state() -> Option<String> {
+pub fn container_state() -> Option<String> {
     docker(&["inspect", "--format", "{{.State.Status}}", CONTAINER]).ok()
+}
+
+/// CPU and memory percentages for the node's container.
+///
+/// `docker stats` takes a second even with `--no-stream`, because it samples
+/// twice to get a rate, so callers should treat this as the slow reading it is
+/// and not put it on a per-second tick.
+pub fn container_usage() -> Option<(f64, f64)> {
+    let out = docker(&[
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.CPUPerc}} {{.MemPerc}}",
+        CONTAINER,
+    ])
+    .ok()?;
+    parse_usage(&out)
+}
+
+/// Parse the pair docker prints, which carries percent signs and can report a
+/// dash when a metric is unavailable on the platform.
+fn parse_usage(out: &str) -> Option<(f64, f64)> {
+    let line = out.lines().next()?;
+    let (cpu, mem) = line.split_once(char::is_whitespace)?;
+    let percent = |raw: &str| raw.trim().trim_end_matches('%').parse::<f64>().ok();
+    Some((percent(cpu)?, percent(mem).unwrap_or(0.0)))
+}
+
+/// The node's recent log lines, as data rather than printed.
+#[allow(dead_code)]
+pub fn log_lines(lines: usize) -> Result<Vec<String>> {
+    docker_available()?;
+    if container_state().is_none() {
+        return Err(anyhow!(
+            "No local node exists. Start one with 'knaix local up'."
+        ));
+    }
+    let n = lines.to_string();
+    // Docker splits the node's output across both streams, so a pane reading
+    // only stdout would miss exactly the lines someone is watching for.
+    let out =
+        docker(&["logs", "--tail", &n, CONTAINER]).context("Could not read the node's logs")?;
+    Ok(out.lines().map(str::to_string).collect())
 }
 
 fn image_present(tag: &str) -> bool {

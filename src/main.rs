@@ -16,6 +16,7 @@ mod report;
 mod selftest;
 mod shell;
 mod stdin_arg;
+mod top;
 mod update;
 mod upload_filter;
 
@@ -164,6 +165,21 @@ enum Commands {
 
         /// Number of lines to retrieve (default: 50)
         #[clap(short, long, default_value = "50")]
+        lines: usize,
+    },
+
+    /// Watch every node live: status, load, peers, and the selected node's logs
+    Top {
+        /// Start with this node selected
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// Seconds between refreshes
+        #[clap(long, default_value = "3")]
+        interval: u64,
+
+        /// Log lines to keep in the pane
+        #[clap(short, long, default_value = "200")]
         lines: usize,
     },
 
@@ -788,6 +804,22 @@ async fn run() -> Result<()> {
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
                 nodes::get_logs_for(&ctx, &target, lines).await?;
             }
+        }
+        Commands::Top {
+            node_id,
+            interval,
+            lines,
+        } => {
+            let node_id = project_node(node_id, project.as_ref());
+            top::run(
+                &ctx,
+                top::Options {
+                    node_id,
+                    interval: std::time::Duration::from_secs(interval),
+                    log_lines: lines,
+                },
+            )
+            .await?;
         }
         Commands::Repl { node_id, node } => {
             let node_id = project_node(node.or(node_id), project.as_ref());
