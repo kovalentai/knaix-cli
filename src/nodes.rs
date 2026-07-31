@@ -404,6 +404,18 @@ pub fn format_file_size(bytes: u64) -> String {
 }
 
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
+    // Answered before the token is read, because neither a session nor the
+    // control plane has anything to do with it. Reaching for them first is what
+    // made this report a DNS failure on a machine that was working fine.
+    if node_id == Some(crate::local::LOCAL_NODE_ID) {
+        return Err(anyhow!(
+            "The local node keeps chunks and no document registry, so its documents cannot be listed.\n  {} retrieves from them and cites what it used; {} empties the store.",
+            crate::brand::cmd("chat -n local"),
+            crate::brand::cmd("local reset")
+        ))
+        .coded(Code::Error);
+    }
+
     let token = ctx.get_token()?;
 
     if let Some(nid) = node_id {
@@ -2205,6 +2217,17 @@ pub fn memory_key(target: &Target) -> String {
     target.label()
 }
 
+/// Where `--file` reads from, given the node's memory directory.
+///
+/// `join` replaces the directory outright when handed an absolute path, so an
+/// unchecked name here reads any file the user can read rather than one of
+/// their notes. The listing prints bare file names, and this accepts exactly
+/// what that prints.
+fn memory_file_path(memory_dir: &std::path::Path, file_name: &str) -> Result<std::path::PathBuf> {
+    let checked = crate::stdin_arg::checked_name("--file", file_name)?;
+    Ok(memory_dir.join(checked))
+}
+
 pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::path::Path::new(".").to_path_buf());
     let memory_dir = home_dir.join(".knaix").join("memory").join(node_id);
@@ -2220,7 +2243,7 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
     }
 
     if let Some(file_name) = file {
-        let file_path = memory_dir.join(file_name);
+        let file_path = memory_file_path(&memory_dir, file_name)?;
 
         if !file_path.exists() {
             return Err(anyhow!(
@@ -2472,6 +2495,39 @@ mod tests {
         let r = Target::Remote { uuid: "u-1".into() };
         assert!(!r.is_local());
         assert_eq!(r.label(), "u-1");
+    }
+
+    /// `--file` names one note, so a path never reaches the filesystem. An
+    /// absolute one is the case that matters: `join` would drop the memory
+    /// directory and read whatever was named.
+    #[test]
+    fn a_memory_file_that_is_a_path_is_refused() {
+        let dir = std::path::Path::new("/home/u/.knaix/memory/local");
+        for bad in [
+            "/etc/passwd",
+            "../../../../../etc/passwd",
+            "../escape.md",
+            "docs/notes.md",
+            "..",
+            ".",
+            "",
+        ] {
+            let e = memory_file_path(dir, bad).unwrap_err();
+            assert_eq!(
+                crate::exit::code_of(&e),
+                Code::Usage,
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_memory_file_that_is_a_name_resolves_inside_the_directory() {
+        let dir = std::path::Path::new("/home/u/.knaix/memory/local");
+        assert_eq!(
+            memory_file_path(dir, "_knaix_durable_memory.md").unwrap(),
+            dir.join("_knaix_durable_memory.md")
+        );
     }
 }
 

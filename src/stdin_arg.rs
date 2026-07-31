@@ -60,7 +60,10 @@ pub fn read_bytes(what: &str) -> Result<Vec<u8>> {
 /// Rejected rather than quietly trimmed to its last component. A caller who
 /// wrote a path meant a path, and silently filing their document somewhere else
 /// under a different name is not an improvement on saying no.
-pub fn checked_name(name: &str) -> Result<&str> {
+///
+/// `flag` names the option being checked, so the refusal points at what the
+/// caller actually typed. Shared by every flag that takes a bare file name.
+pub fn checked_name<'a>(flag: &str, name: &'a str) -> Result<&'a str> {
     use std::path::Component;
 
     let trimmed = name.trim();
@@ -75,7 +78,7 @@ pub fn checked_name(name: &str) -> Result<&str> {
 
     if !ok {
         return Err(anyhow::anyhow!(
-            "--name takes a file name, not a path: {name:?}"
+            "{flag} takes a file name, not a path: {name:?}"
         ))
         .coded(Code::Usage);
     }
@@ -95,14 +98,19 @@ pub struct TempFile {
 
 impl TempFile {
     pub fn write(name: &str, bytes: &[u8]) -> Result<Self> {
-        let name = checked_name(name)?;
+        let name = checked_name("--name", name)?;
+        // The counter is what makes the name unique. The clock is not enough on
+        // its own: two calls in one process can read the same instant, and the
+        // second then writes into the first's directory and deletes it on drop.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "knaix-stdin-{}-{}",
+            "knaix-stdin-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).context("Could not create a temporary directory")?;
         let path = dir.join(name);
@@ -170,7 +178,7 @@ mod tests {
             "   ",
             r"C:\Windows\notes.md",
         ] {
-            let e = checked_name(bad).unwrap_err();
+            let e = checked_name("--name", bad).unwrap_err();
             assert_eq!(
                 crate::exit::code_of(&e),
                 Code::Usage,
@@ -186,9 +194,12 @@ mod tests {
     #[test]
     fn an_ordinary_name_is_accepted() {
         for good in ["stdin.md", "weekly-report.md", "notes.txt", " spaced.md "] {
-            assert!(checked_name(good).is_ok(), "{good:?} should be accepted");
+            assert!(
+                checked_name("--name", good).is_ok(),
+                "{good:?} should be accepted"
+            );
         }
-        assert_eq!(checked_name(" spaced.md ").unwrap(), "spaced.md");
+        assert_eq!(checked_name("--name", " spaced.md ").unwrap(), "spaced.md");
     }
 
     /// The cleanup must remove only the directory it created, whatever the
