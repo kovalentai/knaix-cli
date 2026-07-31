@@ -1,4 +1,5 @@
 use crate::config::{load_config, load_stored_config, save_config};
+use crate::exit::{Code, WithCode};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Extension, Query},
@@ -16,6 +17,9 @@ use tokio::sync::Notify;
 /// prompt and a password manager; short enough that a forgotten terminal does
 /// not sit on a listening socket all day.
 const LOGIN_TIMEOUT_SECS: u64 = 300;
+
+/// How long to spend asking whether signing in can work at all.
+const PREFLIGHT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
@@ -375,7 +379,39 @@ async fn handle_callback(
     )
 }
 
+/// Whether the control plane that would issue the session can be reached.
+///
+/// The browser half of the flow cannot report this: it redirects to a callback
+/// that never arrives, and the wait then expires blaming the user for not
+/// finishing a sign-in that had nowhere to complete. Asking first turns five
+/// minutes and a stray browser tab into the same immediate, accurate error
+/// every other command gives.
+///
+/// Reachability, deliberately, and not health. Any reply at all proves there is
+/// something there to sign in against, so a WAF answering 403 on this path, a
+/// moved endpoint answering 404, or a degraded service answering 503 must not
+/// stop a sign-in that would have worked. Only a transport failure -- no DNS,
+/// refused connection, no answer inside the deadline -- means there is nowhere
+/// to go.
+async fn control_plane_answers(api_url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS))
+        .build()
+    else {
+        // No client to ask with is not evidence the service is down.
+        return true;
+    };
+    client.get(format!("{api_url}/health")).send().await.is_ok()
+}
+
 pub async fn login() -> Result<()> {
+    let api_url = load_config().api_url;
+    if !control_plane_answers(&api_url).await {
+        return Err(anyhow!("Could not reach the Kovalent API at {api_url}"))
+            .context("Signing in needs the control plane, and it did not answer")
+            .coded(Code::Unavailable);
+    }
+
     // Bind the callback server to an OS-assigned loopback port. A random port
     // (rather than a fixed 4242) means other local processes cannot predict the
     // callback URL to race or forge it.

@@ -11,6 +11,7 @@
 //! uploads is deleted before it returns. A node under test finishes with the
 //! corpus it started with.
 
+use crate::exit::{Code, WithCode};
 use crate::nodes::{Citation, KnaixContext, Target};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
@@ -28,11 +29,65 @@ const DOC_PREFIX: &str = "knaix-selftest-";
 /// question, so this is how far down the ranking still counts as finding it.
 const TOP_K: usize = 5;
 
-/// Pass bar, mirroring the platform's own eval floors. A run below any of these
-/// is the finding; do not lower them to make a red run green.
-const FLOOR_HIT_RATE: f64 = 0.95;
-const FLOOR_MRR: f64 = 0.90;
-const FLOOR_CITATION_ACCURACY: f64 = 0.95;
+/// The bar a node is held to. Do not lower one to make a red run green: the
+/// point of a floor is that falling under it is the finding.
+///
+/// Only one of these three moves with the model. `supporting_rank`, which feeds
+/// both hit rate and MRR, is taken over every passage the node returned,
+/// without regard to which ones the answer cited -- that is the output of the
+/// node's own embedder and reranker, and it is the same whichever model the
+/// user brought. Measured directly: the deterministic mock and a real model
+/// return an identical passage list, in an identical order, for the same
+/// question against the same store. Only the cited flags differ.
+///
+/// So retrieval floors are shared, and only the citation floor is relaxed for a
+/// node answering from a model the user runs themselves. Relaxing the retrieval
+/// floors would hide a reranker that orders badly, which is the one thing MRR
+/// exists to report.
+struct Floors {
+    /// Named in the report, so which bar was applied is never a guess.
+    class: &'static str,
+    hit_rate: f64,
+    mrr: f64,
+    citation_accuracy: f64,
+}
+
+/// The platform's own eval floors, for the models it runs itself.
+const FLOORS_HOSTED: Floors = Floors {
+    class: "hosted",
+    hit_rate: 0.95,
+    mrr: 0.90,
+    citation_accuracy: 0.95,
+};
+
+/// A node answering from a model the user brought and runs themselves.
+///
+/// Retrieval floors match the hosted ones, because retrieval does not depend on
+/// which model answers. Only the citation floor moves.
+///
+/// PROVISIONAL, and only the citation number. Calibrated against one model
+/// (gemma4 on Apple silicon cited the supporting passage 89.8% of the time over
+/// the full 52), which is enough to show a small model cites more loosely than
+/// a frontier one and not enough to say where the line belongs. Widen the
+/// sample before treating it as settled.
+const FLOORS_LOCAL: Floors = Floors {
+    class: "local",
+    hit_rate: 0.95,
+    mrr: 0.90,
+    citation_accuracy: 0.85,
+};
+
+impl Floors {
+    /// Which bar applies. A local node answers from whatever model the user
+    /// pointed it at; a hosted one answers from the platform's.
+    fn for_target(target: &Target) -> &'static Floors {
+        if target.is_local() {
+            &FLOORS_LOCAL
+        } else {
+            &FLOORS_HOSTED
+        }
+    }
+}
 
 /// One corpus document, embedded in the binary so a self-test needs no network
 /// beyond the node it is testing.
@@ -131,16 +186,41 @@ pub struct QuestionOutcome {
     pub cited_supporting: Option<bool>,
     pub answer: String,
     pub answer_ms: u128,
+    /// Why the node produced no answer, when it produced none.
+    ///
+    /// One slow generation used to end the whole run and throw away every
+    /// question already asked. A model the user brought is allowed to be slow,
+    /// so the question is recorded as unanswered and the run carries on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 pub struct SelfTestReport {
     pub node: String,
     pub model: Option<String>,
-    /// False when the node answered with the deterministic mock, where citation
-    /// accuracy only restates rank-1 retrieval and says nothing about a model.
+    /// Whether the citation number can be read as a measurement of a model.
+    ///
+    /// False when the deterministic mock answered, where it only restates
+    /// rank-1 retrieval, and false when nothing answered at all, where no model
+    /// chose anything. Both report no model, so this must not be read as "the
+    /// mock ran".
     pub citation_accuracy_meaningful: bool,
     pub questions: usize,
+    /// Which floors were applied, so a result is never read against the wrong
+    /// bar.
+    pub floor_class: String,
+    /// Whether this run scores the node at all.
+    ///
+    /// False for `--quick`, which asks 12 of 52 and takes the first two per
+    /// document rather than sampling. At that size the interval around a ~90%
+    /// rate is wider than the gap between passing and failing, so a verdict
+    /// from it would be a coin toss wearing a floor's clothes.
+    pub scored: bool,
+    /// Questions the node never answered. Counted in every rate below, because
+    /// a node that cannot answer has not retrieved anything either, and scoring
+    /// only what survived would let a node time out its way to a pass.
+    pub unanswered: usize,
     pub hit_rate_at_k: f64,
     pub mrr: f64,
     pub citation_accuracy: f64,
@@ -271,24 +351,42 @@ pub async fn run(
 
     cleanup(ctx, target, &document_ids, keep, human).await;
 
-    let report = summarize(node_uuid, outcomes, model);
+    let floors = Floors::for_target(target);
+    let report = summarize(node_uuid, outcomes, model, floors, !quick);
     if human {
-        print_report(&report);
+        print_report(&report, floors);
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
 
+    // A run that did not score the node cannot fail it either. The node still
+    // has to have answered: that is a fact about the machine, not a judgement
+    // about quality, and it is the one thing a quick run does establish.
+    if !report.scored && report.unanswered == 0 {
+        return Ok(());
+    }
+
     if report.passed {
         Ok(())
+    } else if report.unanswered > 0 {
+        // The floors are beside the point when the node did not answer: it is
+        // not that retrieval was weak, it is that there was nothing to score.
+        Err(anyhow!(
+            "Self-test incomplete: the node did not answer {} of {} questions. The scores above cover only what it answered.",
+            report.unanswered,
+            report.questions
+        ))
+        .coded(Code::Unavailable)
     } else {
         Err(anyhow!(
-            "Self-test below the pass bar: hit-rate {:.0}% (floor {:.0}%), MRR {:.2} (floor {:.2}), citation accuracy {:.0}% (floor {:.0}%)",
+            "Self-test below the {} pass bar: hit-rate {:.0}% (floor {:.0}%), MRR {:.2} (floor {:.2}), citation accuracy {:.0}% (floor {:.0}%)",
+            floors.class,
             report.hit_rate_at_k * 100.0,
-            FLOOR_HIT_RATE * 100.0,
+            floors.hit_rate * 100.0,
             report.mrr,
-            FLOOR_MRR,
+            floors.mrr,
             report.citation_accuracy * 100.0,
-            FLOOR_CITATION_ACCURACY * 100.0
+            floors.citation_accuracy * 100.0
         ))
     }
 }
@@ -428,7 +526,25 @@ async fn run_questions(
         }
 
         let started = Instant::now();
-        let answer = ask(ctx, target, &q.query).await?;
+        let answer = match ask(ctx, target, &q.query).await {
+            Ok(a) => a,
+            // One question the node could not answer is a result, not the end
+            // of the run. Recording it keeps the other fifty-one measurements
+            // and names the cause, which a bare abort threw away.
+            Err(e) => {
+                outcomes.push(QuestionOutcome {
+                    id: q.id.to_string(),
+                    domain: q.domain.to_string(),
+                    query: q.query.to_string(),
+                    supporting_rank: None,
+                    cited_supporting: None,
+                    answer: String::new(),
+                    answer_ms: started.elapsed().as_millis(),
+                    error: Some(root_cause(&e)),
+                });
+                continue;
+            }
+        };
         let answer_ms = started.elapsed().as_millis();
         if model.is_none() {
             model = answer.model.clone();
@@ -478,10 +594,19 @@ async fn run_questions(
             cited_supporting,
             answer: answer.text,
             answer_ms,
+            error: None,
         });
     }
 
     Ok((outcomes, model))
+}
+
+/// The innermost thing that went wrong, which is the part worth printing.
+///
+/// The chain above it restates the request; the end of it says the node timed
+/// out, or refused, or was not there.
+fn root_cause(e: &anyhow::Error) -> String {
+    e.chain().last().map(|c| c.to_string()).unwrap_or_default()
 }
 
 /// Ask one question, surfacing a rate limit as the thing it is.
@@ -682,6 +807,8 @@ fn summarize(
     node_uuid: &str,
     outcomes: Vec<QuestionOutcome>,
     model: Option<String>,
+    floors: &Floors,
+    scored: bool,
 ) -> SelfTestReport {
     let total = outcomes.len();
     let hits = outcomes
@@ -703,7 +830,16 @@ fn summarize(
         judged.iter().filter(|c| **c).count() as f64 / judged.len() as f64
     };
 
-    let mut answer: Vec<u128> = outcomes.iter().map(|o| o.answer_ms).collect();
+    let unanswered = outcomes.iter().filter(|o| o.error.is_some()).count();
+
+    // Latency describes answers, so a question that produced none contributes
+    // no timing. Including the wait before a timeout would report the timeout
+    // as the node's p95 and make a slow node look like a fast one that failed.
+    let mut answer: Vec<u128> = outcomes
+        .iter()
+        .filter(|o| o.error.is_none())
+        .map(|o| o.answer_ms)
+        .collect();
     answer.sort_unstable();
 
     let hit_rate_at_k = if total == 0 {
@@ -711,19 +847,31 @@ fn summarize(
     } else {
         hits as f64 / total as f64
     };
+    // `+ 0.0` is not redundant. Summing no f64 yields -0.0, because that is
+    // floating-point addition's identity, and a run where nothing was retrieved
+    // then reports its MRR as "-0.000".
     let mrr = if total == 0 {
         0.0
     } else {
-        mrr_sum / total as f64
+        mrr_sum / total as f64 + 0.0
     };
 
-    let citation_accuracy_meaningful = !is_mock_model(model.as_deref());
+    // Two ways the number cannot be read, and they are not the same thing. The
+    // mock picks the top passage every time, so its accuracy restates rank-1
+    // retrieval. A run where nothing answered reports no model at all, which
+    // looks identical here and is not: that model never got to choose. Both
+    // make the number unreadable, so neither may claim it is meaningful.
+    let answered_any = unanswered < total;
+    let citation_accuracy_meaningful = answered_any && !is_mock_model(model.as_deref());
 
     SelfTestReport {
         node: node_uuid.to_string(),
         model,
         citation_accuracy_meaningful,
         questions: total,
+        floor_class: floors.class.to_string(),
+        scored,
+        unanswered,
         hit_rate_at_k,
         mrr,
         citation_accuracy,
@@ -732,9 +880,14 @@ fn summarize(
         // real model chose the citations; enforcing it against the mock would
         // fail a healthy node for the mock's behaviour, which is the kind of
         // red result that teaches people to ignore the command.
-        passed: hit_rate_at_k >= FLOOR_HIT_RATE
-            && mrr >= FLOOR_MRR
-            && (!citation_accuracy_meaningful || citation_accuracy >= FLOOR_CITATION_ACCURACY),
+        // An unanswered question is never a pass. Its cause is the node, not
+        // the corpus, and reporting green on a run that could not finish is the
+        // one result this command must never give.
+        passed: scored
+            && unanswered == 0
+            && hit_rate_at_k >= floors.hit_rate
+            && mrr >= floors.mrr
+            && (!citation_accuracy_meaningful || citation_accuracy >= floors.citation_accuracy),
         latency_ms: LatencySummary {
             answer_p50: percentile(&answer, 0.50),
             answer_p95: percentile(&answer, 0.95),
@@ -743,16 +896,24 @@ fn summarize(
     }
 }
 
-fn print_report(report: &SelfTestReport) {
+fn print_report(report: &SelfTestReport, floors: &Floors) {
+    // An unscored run still prints its numbers; what it must not print is a
+    // verdict, because the sample it drew cannot support one.
     let verdict = |value: f64, floor: f64| {
-        if value >= floor {
+        if !report.scored {
+            "--".dimmed()
+        } else if value >= floor {
             "PASS".green()
         } else {
             "FAIL".red()
         }
     };
 
-    println!("{}", "Answer quality:".bold());
+    println!(
+        "{} {}",
+        "Answer quality:".bold(),
+        format!("(against the {} floors)", floors.class).dimmed()
+    );
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
@@ -760,32 +921,46 @@ fn print_report(report: &SelfTestReport) {
     table.add_row(vec![
         format!("Hit rate @{}", report.top_k),
         format!("{:.1}%", report.hit_rate_at_k * 100.0),
-        format!("{:.0}%", FLOOR_HIT_RATE * 100.0),
-        verdict(report.hit_rate_at_k, FLOOR_HIT_RATE).to_string(),
+        format!("{:.0}%", floors.hit_rate * 100.0),
+        verdict(report.hit_rate_at_k, floors.hit_rate).to_string(),
     ]);
     table.add_row(vec![
         "MRR".to_string(),
         format!("{:.3}", report.mrr),
-        format!("{:.2}", FLOOR_MRR),
-        verdict(report.mrr, FLOOR_MRR).to_string(),
+        format!("{:.2}", floors.mrr),
+        verdict(report.mrr, floors.mrr).to_string(),
     ]);
     table.add_row(vec![
         "Citation accuracy".to_string(),
         format!("{:.1}%", report.citation_accuracy * 100.0),
         if report.citation_accuracy_meaningful {
-            format!("{:.0}%", FLOOR_CITATION_ACCURACY * 100.0)
+            format!("{:.0}%", floors.citation_accuracy * 100.0)
         } else {
             "n/a".to_string()
         },
         if report.citation_accuracy_meaningful {
-            verdict(report.citation_accuracy, FLOOR_CITATION_ACCURACY).to_string()
+            verdict(report.citation_accuracy, floors.citation_accuracy).to_string()
         } else {
             "INFO".dimmed().to_string()
         },
     ]);
     println!("{table}");
 
-    if !report.citation_accuracy_meaningful {
+    if !report.scored {
+        println!(
+            "{} A quick run asks {} of the {} questions and does not score the node.\n     Run {} without {} for a verdict.",
+            "Note:".blue(),
+            report.questions,
+            questions().map(|q| q.len()).unwrap_or(0),
+            crate::brand::cmd("selftest"),
+            "--quick".cyan()
+        );
+    }
+
+    // A run where nothing answered reports no model, which is not the same as
+    // reporting the mock. Claiming the mock there tells the reader their model
+    // was ignored when in fact it never got to speak.
+    if !report.citation_accuracy_meaningful && report.unanswered < report.questions {
         // Say it plainly. A number with no floor invites the reader to assume
         // the worst about it, and this one is not the node's fault.
         println!(
@@ -808,10 +983,41 @@ fn print_report(report: &SelfTestReport) {
 
     // Name what actually failed. A bare percentage tells you something is
     // wrong; the question that missed tells you what to look at.
+    // Separated from the misses below: a question the node never answered says
+    // nothing about retrieval, and listing it as one sends the reader to tune a
+    // corpus when the model was the thing that gave up.
+    let unanswered: Vec<&QuestionOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|o| o.error.is_some())
+        .collect();
+    if !unanswered.is_empty() {
+        println!(
+            "\n{} {} question(s) the node never answered:",
+            "Unanswered:".red(),
+            unanswered.len()
+        );
+        for u in unanswered.iter().take(5) {
+            println!(
+                "  {} [{}] {}",
+                "-".dimmed(),
+                u.domain.dimmed(),
+                u.error.as_deref().unwrap_or("no answer")
+            );
+        }
+        if unanswered.len() > 5 {
+            println!("  {} and {} more", "-".dimmed(), unanswered.len() - 5);
+        }
+        println!(
+            "  {}",
+            "A model that needs longer: knaix local up --generation-timeout <SECONDS>.".dimmed()
+        );
+    }
+
     let misses: Vec<&QuestionOutcome> = report
         .outcomes
         .iter()
-        .filter(|o| o.supporting_rank.is_none())
+        .filter(|o| o.error.is_none() && o.supporting_rank.is_none())
         .collect();
     if !misses.is_empty() {
         println!(
@@ -828,10 +1034,27 @@ fn print_report(report: &SelfTestReport) {
     }
 
     println!();
-    if report.passed {
+    if !report.scored && report.unanswered == 0 {
+        // Neither pass nor fail. A quick run establishes that the node answers,
+        // and saying anything stronger is the thing this change exists to stop.
+        println!(
+            "{} Node answered all {} questions. Not scored: this was a quick run.\n",
+            "✓".green(),
+            report.questions
+        );
+    } else if report.passed {
         println!(
             "{} Node answered {} questions at or above every floor.\n",
             "✓".green(),
+            report.questions
+        );
+    } else if report.unanswered > 0 {
+        // Not a quality verdict. Saying it fell below the bar would send the
+        // reader to look at retrieval when the node never got that far.
+        println!(
+            "{} Node did not answer {} of {} questions, so this run does not score it.\n",
+            "✗".red(),
+            report.unanswered,
             report.questions
         );
     } else {
@@ -846,6 +1069,16 @@ fn print_report(report: &SelfTestReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every test below predates the per-class floors and was written against
+    /// the hosted bar, which is also the bar a regression would show up in.
+    fn scored_summary(
+        node: &str,
+        outcomes: Vec<QuestionOutcome>,
+        model: Option<String>,
+    ) -> SelfTestReport {
+        summarize(node, outcomes, model, &FLOORS_HOSTED, true)
+    }
 
     #[test]
     fn every_question_carries_usable_gold_labels() {
@@ -984,14 +1217,14 @@ mod tests {
             outcome("a", Some(1), Some(true)),
             outcome("b", Some(1), Some(false)),
         ];
-        let mocked = summarize("n", outcomes, Some("mock".into()));
+        let mocked = scored_summary("n", outcomes, Some("mock".into()));
         assert!(!mocked.citation_accuracy_meaningful);
         assert!(
             mocked.passed,
             "retrieval was perfect; the mock must not fail it"
         );
 
-        let real = summarize(
+        let real = scored_summary(
             "n",
             vec![
                 outcome("a", Some(1), Some(true)),
@@ -1008,7 +1241,7 @@ mod tests {
 
     #[test]
     fn a_node_reporting_no_model_is_treated_as_mock() {
-        let r = summarize("n", vec![outcome("a", Some(1), Some(false))], None);
+        let r = scored_summary("n", vec![outcome("a", Some(1), Some(false))], None);
         assert!(!r.citation_accuracy_meaningful);
     }
 
@@ -1021,13 +1254,13 @@ mod tests {
             outcome("b", Some(2), None),
             outcome("c", Some(1), Some(false)),
         ];
-        let report = summarize("node", outcomes, Some("real-model".into()));
+        let report = scored_summary("node", outcomes, Some("real-model".into()));
         assert_eq!(report.citation_accuracy, 0.5);
     }
 
     #[test]
     fn a_miss_costs_both_hit_rate_and_mrr() {
-        let report = summarize(
+        let report = scored_summary(
             "node",
             vec![
                 outcome("a", Some(1), Some(true)),
@@ -1050,6 +1283,99 @@ mod tests {
             cited_supporting: cited,
             answer: String::new(),
             answer_ms: 1,
+            error: None,
         }
+    }
+
+    fn unanswered(id: &str, cause: &str) -> QuestionOutcome {
+        QuestionOutcome {
+            error: Some(cause.into()),
+            ..outcome(id, None, None)
+        }
+    }
+
+    /// A run that could not finish is never green, whatever the questions it
+    /// did manage to ask scored.
+    #[test]
+    fn an_unanswered_question_fails_the_run_and_is_counted() {
+        let report = scored_summary(
+            "node",
+            vec![
+                outcome("a", Some(1), Some(true)),
+                outcome("b", Some(1), Some(true)),
+                unanswered("c", "Local generation timed out"),
+            ],
+            Some("real-model".into()),
+        );
+        assert_eq!(report.unanswered, 1);
+        assert!(
+            !report.passed,
+            "a node that did not answer must not report green"
+        );
+        // Counted in the denominator: scoring only what survived would let a
+        // node time out its way to a pass.
+        assert!((report.hit_rate_at_k - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// Summing no f64 gives -0.0, which reached the table as "-0.000".
+    #[test]
+    fn a_run_that_retrieved_nothing_reports_positive_zero() {
+        let report = scored_summary("node", vec![unanswered("a", "timed out")], None);
+        assert!(
+            report.mrr.is_sign_positive(),
+            "MRR rendered as negative zero: {:?}",
+            report.mrr
+        );
+        assert_eq!(format!("{:.3}", report.mrr), "0.000");
+    }
+
+    /// A node that never answered reported no model, which was then read as
+    /// the mock and told the user their model had been ignored.
+    #[test]
+    fn a_fully_unanswered_run_is_not_reported_as_the_mock() {
+        let report = scored_summary("node", vec![unanswered("a", "timed out")], None);
+        assert_eq!(report.unanswered, report.questions);
+        assert!(
+            !report.citation_accuracy_meaningful,
+            "no model chose anything, so the number cannot be read as one"
+        );
+    }
+
+    /// Retrieval does not depend on the model, so relaxing its floors for a
+    /// local node would hide a reranker that orders badly. Read through
+    /// `for_target` rather than off the constants, so this also pins which bar
+    /// each kind of node is held to.
+    #[test]
+    fn only_the_citation_floor_differs_between_classes() {
+        let local = Floors::for_target(&Target::Local {
+            base: "http://127.0.0.1:8080".into(),
+            instance_id: "abc".into(),
+        });
+        let hosted = Floors::for_target(&Target::Remote { uuid: "u-1".into() });
+
+        assert_eq!(local.class, "local");
+        assert_eq!(hosted.class, "hosted");
+        assert_eq!(
+            local.hit_rate, hosted.hit_rate,
+            "retrieval does not depend on the model"
+        );
+        assert_eq!(
+            local.mrr, hosted.mrr,
+            "MRR reports the node's reranker, not the user's model"
+        );
+        assert!(
+            local.citation_accuracy < hosted.citation_accuracy,
+            "the model's own citing is the only thing that differs"
+        );
+    }
+
+    /// The wait before a timeout is not a latency measurement.
+    #[test]
+    fn a_timed_out_question_does_not_enter_the_latency_summary() {
+        let mut slow = unanswered("c", "Local generation timed out");
+        slow.answer_ms = 600_000;
+        let report = scored_summary("node", vec![outcome("a", Some(1), Some(true)), slow], None);
+        assert_eq!(report.latency_ms.answer_p50, 1);
+        assert_eq!(report.latency_ms.answer_p95, 1);
     }
 }

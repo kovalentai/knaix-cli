@@ -59,6 +59,10 @@ enum Commands {
         /// A node to list the documents of, instead of listing nodes
         #[clap(name = "NODE_ID")]
         node_id: Option<String>,
+
+        /// The node to list, as a flag for symmetry with chat and upload
+        #[clap(short = 'n', long = "node-id", conflicts_with = "NODE_ID")]
+        node: Option<String>,
     },
 
     /// Set the default node for later commands ('local' for the local node)
@@ -350,6 +354,16 @@ enum LocalAction {
         #[clap(long, conflicts_with = "model_url")]
         mock: bool,
 
+        /// Seconds the node may spend on one answer before giving up; raise it
+        /// for a large or reasoning model. Remembered like the model
+        ///
+        /// Bounded here rather than where it is used: the value is multiplied
+        /// into milliseconds, and an unbounded u64 overflows that. Release
+        /// builds do not check overflow, so the wrap was silent and produced a
+        /// sub-second timeout from a request for a long one.
+        #[clap(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        generation_timeout: Option<u64>,
+
         /// Re-pull the image even if it is already present
         #[clap(long)]
         pull: bool,
@@ -559,8 +573,8 @@ async fn run() -> Result<()> {
                 );
             }
         }
-        Commands::List { node_id } => {
-            nodes::list_nodes(&ctx, node_id.as_deref()).await?;
+        Commands::List { node_id, node } => {
+            nodes::list_nodes(&ctx, node.or(node_id).as_deref()).await?;
         }
         Commands::Use { node_id } => {
             let mut config = config::load_stored_config();
@@ -634,7 +648,7 @@ async fn run() -> Result<()> {
             if stdin_arg::is_stdin(&file_path) {
                 // The name is checked before anything is read, so a bad one
                 // fails on the argument rather than after consuming the pipe.
-                let checked = stdin_arg::checked_name(&name)?.to_string();
+                let checked = stdin_arg::checked_name("--name", &name)?.to_string();
                 if dry_run {
                     println!("  {} {}", "would ingest".dimmed(), checked);
                 } else {
@@ -833,8 +847,9 @@ async fn run() -> Result<()> {
                 model_url,
                 model,
                 mock,
+                generation_timeout,
                 pull,
-            } => local::up(port, model_url, model, mock, pull).await?,
+            } => local::up(port, model_url, model, mock, generation_timeout, pull).await?,
             LocalAction::Setup => local::setup().await?,
             LocalAction::Reset { yes } => local::reset(yes).await?,
             LocalAction::Down { purge } => local::down(purge)?,

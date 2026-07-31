@@ -24,6 +24,15 @@ retrieval, reranking and citations run on the node.
 
 ## Install
 
+**Before you install:** the CLI itself is a single binary with no dependencies,
+and everything that talks to a hosted node works with nothing else installed.
+`knaix local` is the exception. It runs the Node Runtime as a container on your
+machine, so it needs **Docker** — Docker Desktop, or any drop-in that provides a
+`docker` command and daemon, such as Colima, Rancher Desktop, or OrbStack. There
+is currently no way to run a local node without one; if that rules your machine
+out, use a hosted node instead. `knaix doctor` reports which of the two paths
+your machine is set up for.
+
 **Homebrew** (macOS and Linux). Brings `brew upgrade knaix`, `brew uninstall
 knaix`, and shell completions:
 
@@ -57,6 +66,10 @@ knaix doctor      # what is configured, what is reachable, what to do about the 
 One command stands up the whole stack on your machine: the Node Runtime, its own
 store, its own embedder, and its own reranker. There is no control plane, no
 login, and no token.
+
+**Requires Docker**, which has to be installed and running before this works.
+The node is a container, and there is no non-container mode; `knaix local up`
+stops with exit code 7 and says which of the two is missing.
 
 ```bash
 knaix local setup

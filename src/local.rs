@@ -158,6 +158,12 @@ pub struct LocalNode {
     /// PID of the background relay started by `local connect --daemon`.
     #[serde(default)]
     pub relay_pid: Option<u32>,
+    /// How long the node waits for one answer, in seconds. Remembered like the
+    /// model, because the model is why it was raised: a bigger or reasoning
+    /// model needs longer, and forgetting it on the next `up` puts the timeouts
+    /// back. Absent means the node's own default.
+    #[serde(default)]
+    pub generation_timeout_secs: Option<u64>,
 }
 
 impl LocalNode {
@@ -323,14 +329,39 @@ pub fn summarize_within(wait: Duration) -> LocalSummary {
     }
 }
 
+/// Whether the docker client exists at all, which the daemon does not answer.
+///
+/// `docker --version` is served by the binary itself, so it succeeds on a
+/// machine where the daemon is stopped and fails only when there is nothing
+/// installed to ask.
+fn docker_installed() -> bool {
+    std::process::Command::new("docker")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
 fn docker_available() -> Result<()> {
     // Context rather than a rebuilt error: rebuilding drops the code the
     // helper attached, and a missing Docker is the precondition case the exit
     // codes exist for. A daemon that is installed but not running is the same
     // precondition, so it is tagged here too.
+    //
+    // The two are told apart because the remedies are different, and `knaix
+    // local` is the first command someone with no account runs: telling a
+    // machine that has never had Docker to "start Docker" describes a state it
+    // was never in, and leaves out the one step that would fix it.
     docker(&["info", "--format", "{{.ServerVersion}}"])
         .map(|_| ())
-        .context("Docker is not available. Start Docker and try again.")
+        .context(if docker_installed() {
+            "Docker is installed but not running. Start Docker and try again."
+        } else {
+            "Docker is not installed, and the local node runs as a container. \
+             Install Docker Desktop (https://docs.docker.com/get-started/get-docker/), \
+             or any drop-in with a docker command such as Colima or Rancher Desktop, then try again."
+        })
         .coded(Code::Precondition)
 }
 
@@ -393,6 +424,7 @@ struct Launch {
     /// True when the server came from memory rather than a flag, so `up` can
     /// say so instead of reusing it silently.
     remembered: bool,
+    generation_timeout_secs: Option<u64>,
 }
 
 /// Merge flags with the remembered node. Forgetting a flag must not change
@@ -406,14 +438,19 @@ fn resolve_launch(
     model_url: Option<String>,
     model: Option<String>,
     mock: bool,
+    generation_timeout_secs: Option<u64>,
 ) -> Launch {
     let port = port.or(saved.map(|n| n.port)).unwrap_or(DEFAULT_PORT);
+    // Kept across the mock too: it describes how long this machine is willing
+    // to wait, not which model it waits for.
+    let timeout = generation_timeout_secs.or(saved.and_then(|n| n.generation_timeout_secs));
     if mock {
         return Launch {
             port,
             model_url: None,
             model: None,
             remembered: false,
+            generation_timeout_secs: timeout,
         };
     }
     let saved_url = saved.and_then(|n| n.model_url.clone());
@@ -429,6 +466,7 @@ fn resolve_launch(
                 model_url: Some(url),
                 model,
                 remembered: false,
+                generation_timeout_secs: timeout,
             }
         }
         None => Launch {
@@ -436,6 +474,7 @@ fn resolve_launch(
             remembered: saved_url.is_some(),
             model_url: saved_url,
             model: model.or(saved_model),
+            generation_timeout_secs: timeout,
         },
     }
 }
@@ -473,6 +512,7 @@ pub async fn up(
     model_url: Option<String>,
     model: Option<String>,
     mock: bool,
+    generation_timeout: Option<u64>,
     pull: bool,
 ) -> Result<()> {
     docker_available()?;
@@ -576,7 +616,14 @@ pub async fn up(
 
     let saved = load();
     let model_flag_given = model.is_some();
-    let launch = resolve_launch(saved.as_ref(), port, model_url, model, mock);
+    let launch = resolve_launch(
+        saved.as_ref(),
+        port,
+        model_url,
+        model,
+        mock,
+        generation_timeout,
+    );
 
     if launch.remembered {
         let what = match &launch.model {
@@ -649,6 +696,22 @@ pub async fn up(
         args.push(arg.to_string());
     }
 
+    // The node's own default is a minute, which a large or reasoning model on
+    // consumer hardware passes routinely. Left unset otherwise, so the node
+    // keeps deciding.
+    //
+    // Saturating, though the flag is already bounded: a release build does not
+    // check overflow, so a plain multiply turns a request for a long timeout
+    // into a sub-second one without saying anything. State files are edited by
+    // hand, so the bound at the flag is not the only way a value arrives here.
+    if let Some(secs) = launch.generation_timeout_secs {
+        args.push("-e".into());
+        args.push(format!(
+            "GENERATION_TIMEOUT_MS={}",
+            secs.saturating_mul(1000)
+        ));
+    }
+
     match &launch.model_url {
         // A real model, if one is being served on this machine.
         Some(url) => {
@@ -698,6 +761,7 @@ pub async fn up(
         model: launch.model.clone(),
         remote_id: prev_remote_id,
         relay_pid: prev_relay_pid,
+        generation_timeout_secs: launch.generation_timeout_secs,
     };
     save(&node)?;
 
@@ -940,6 +1004,7 @@ fn remember_choice(
         model: None,
         remote_id: None,
         relay_pid: None,
+        generation_timeout_secs: None,
     });
     node.model_url = model_url;
     node.model = model;
@@ -989,6 +1054,8 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
         node.model_url.clone(),
         node.model.clone(),
         node.model_url.is_none(),
+        // Left to memory: setup chooses a model, not how long to wait for it.
+        None,
         false,
     )
     .await
@@ -1100,7 +1167,7 @@ pub async fn reset(yes: bool) -> Result<()> {
     let mock = model_url.is_none();
     // Start again, so reset leaves a running, empty node rather than a stopped
     // one the user then has to bring up by hand.
-    up(None, model_url, model, mock, false).await
+    up(None, model_url, model, mock, None, false).await
 }
 
 pub fn down(purge: bool) -> Result<()> {
@@ -1799,6 +1866,7 @@ mod tests {
             model: model.map(String::from),
             remote_id: None,
             relay_pid: None,
+            generation_timeout_secs: None,
         }
     }
 
@@ -1807,7 +1875,7 @@ mod tests {
         // The model name is half of the choice: reusing the server but
         // dropping the name turns every Ollama question into a 404.
         let node = saved(9000, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch = resolve_launch(Some(&node), None, None, None, false);
+        let launch = resolve_launch(Some(&node), None, None, None, false, None);
         assert_eq!(launch.model_url.as_deref(), Some("http://h:11434"));
         assert_eq!(launch.model.as_deref(), Some("qwen3.5:latest"));
         assert_eq!(launch.port, 9000, "the port is part of what was chosen");
@@ -1819,7 +1887,14 @@ mod tests {
         // Model names are the server's, not the machine's: qwen3.5:latest
         // means nothing to a vLLM that hosts something else.
         let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch = resolve_launch(Some(&node), None, Some("http://h:8000".into()), None, false);
+        let launch = resolve_launch(
+            Some(&node),
+            None,
+            Some("http://h:8000".into()),
+            None,
+            false,
+            None,
+        );
         assert_eq!(launch.model_url.as_deref(), Some("http://h:8000"));
         assert_eq!(launch.model, None);
         assert!(!launch.remembered);
@@ -1834,6 +1909,7 @@ mod tests {
             Some("http://h:11434".into()),
             None,
             false,
+            None,
         );
         assert_eq!(launch.model.as_deref(), Some("qwen3.5:latest"));
     }
@@ -1841,7 +1917,14 @@ mod tests {
     #[test]
     fn an_explicit_model_beats_the_remembered_one() {
         let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch = resolve_launch(Some(&node), None, None, Some("phi4:latest".into()), false);
+        let launch = resolve_launch(
+            Some(&node),
+            None,
+            None,
+            Some("phi4:latest".into()),
+            false,
+            None,
+        );
         assert_eq!(launch.model.as_deref(), Some("phi4:latest"));
         assert_eq!(launch.model_url.as_deref(), Some("http://h:11434"));
     }
@@ -1849,7 +1932,7 @@ mod tests {
     #[test]
     fn mock_clears_the_whole_choice_deliberately() {
         let node = saved(8080, Some("http://h:11434"), Some("qwen3.5:latest"));
-        let launch = resolve_launch(Some(&node), None, None, None, true);
+        let launch = resolve_launch(Some(&node), None, None, None, true, None);
         assert_eq!(launch.model_url, None);
         assert_eq!(launch.model, None);
         assert!(!launch.remembered, "asked for, not reused");
@@ -1857,7 +1940,7 @@ mod tests {
 
     #[test]
     fn a_first_start_defaults_quietly() {
-        let launch = resolve_launch(None, None, None, None, false);
+        let launch = resolve_launch(None, None, None, None, false, None);
         assert_eq!(launch.port, DEFAULT_PORT);
         assert_eq!(launch.model_url, None);
         assert!(!launch.remembered);

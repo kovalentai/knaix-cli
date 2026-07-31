@@ -404,6 +404,18 @@ pub fn format_file_size(bytes: u64) -> String {
 }
 
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
+    // Answered before the token is read, because neither a session nor the
+    // control plane has anything to do with it. Reaching for them first is what
+    // made this report a DNS failure on a machine that was working fine.
+    if node_id == Some(crate::local::LOCAL_NODE_ID) {
+        return Err(anyhow!(
+            "The local node keeps chunks and no document registry, so its documents cannot be listed.\n  {} retrieves from them and cites what it used; {} empties the store.",
+            crate::brand::cmd("chat -n local"),
+            crate::brand::cmd("local reset")
+        ))
+        .coded(Code::Error);
+    }
+
     let token = ctx.get_token()?;
 
     if let Some(nid) = node_id {
@@ -2205,6 +2217,35 @@ pub fn memory_key(target: &Target) -> String {
     target.label()
 }
 
+/// Where `--file` reads from, given the node's memory directory.
+///
+/// `join` replaces the directory outright when handed an absolute path, so an
+/// unchecked name here reads any file the user can read rather than one of
+/// their notes. The listing prints bare file names, and this accepts exactly
+/// what that prints.
+///
+/// Checking the name is not enough on its own. A name that cannot escape can
+/// still point somewhere that does: reading follows a symlink, so a link left
+/// in the notes directory reads whatever it targets. Both sides are resolved
+/// and the file has to still be in the directory afterwards.
+fn memory_file_path(memory_dir: &std::path::Path, file_name: &str) -> Result<std::path::PathBuf> {
+    let checked = crate::stdin_arg::checked_name("--file", file_name)?;
+    let path = memory_dir.join(checked);
+
+    // Only when it resolves. A name that does not exist yet is the caller's
+    // "no such note" case, reported below with the listing that fixes it.
+    if let (Ok(real), Ok(root)) = (path.canonicalize(), memory_dir.canonicalize()) {
+        if real.parent() != Some(root.as_path()) {
+            return Err(anyhow!(
+                "{} leaves the notes directory for node memory. Only files inside it can be read.",
+                file_name
+            ))
+            .coded(Code::Denied);
+        }
+    }
+    Ok(path)
+}
+
 pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::path::Path::new(".").to_path_buf());
     let memory_dir = home_dir.join(".knaix").join("memory").join(node_id);
@@ -2220,7 +2261,7 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
     }
 
     if let Some(file_name) = file {
-        let file_path = memory_dir.join(file_name);
+        let file_path = memory_file_path(&memory_dir, file_name)?;
 
         if !file_path.exists() {
             return Err(anyhow!(
@@ -2258,7 +2299,14 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         let mut files = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.is_file() {
+            // `symlink_metadata` does not follow the link, so a link out of the
+            // directory is not offered as a note. `is_file` would follow it and
+            // list whatever it points at as though it were one.
+            let is_plain_file = tokio::fs::symlink_metadata(&path)
+                .await
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if is_plain_file {
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                     files.push(fname.to_string());
                 }
@@ -2472,6 +2520,66 @@ mod tests {
         let r = Target::Remote { uuid: "u-1".into() };
         assert!(!r.is_local());
         assert_eq!(r.label(), "u-1");
+    }
+
+    /// `--file` names one note, so a path never reaches the filesystem. An
+    /// absolute one is the case that matters: `join` would drop the memory
+    /// directory and read whatever was named.
+    #[test]
+    fn a_memory_file_that_is_a_path_is_refused() {
+        let dir = std::path::Path::new("/home/u/.knaix/memory/local");
+        for bad in [
+            "/etc/passwd",
+            "../../../../../etc/passwd",
+            "../escape.md",
+            "docs/notes.md",
+            "..",
+            ".",
+            "",
+        ] {
+            let e = memory_file_path(dir, bad).unwrap_err();
+            assert_eq!(
+                crate::exit::code_of(&e),
+                Code::Usage,
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_memory_file_that_is_a_name_resolves_inside_the_directory() {
+        let dir = std::path::Path::new("/home/u/.knaix/memory/local");
+        assert_eq!(
+            memory_file_path(dir, "_knaix_durable_memory.md").unwrap(),
+            dir.join("_knaix_durable_memory.md")
+        );
+    }
+
+    /// A name that cannot escape can still point somewhere that does. Reading
+    /// follows the link, so the check has to be on where it lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_note_that_is_a_symlink_out_of_the_directory_is_refused() {
+        // Cleared first, not just afterwards. A failing assertion skips the
+        // cleanup below, and `symlink` refuses a path that already exists, so a
+        // run that leaves this behind would fail every later run on the same
+        // pid for a reason that has nothing to do with the code under test.
+        let root = std::env::temp_dir().join(format!("knaix-memlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, b"not a note").unwrap();
+
+        std::os::unix::fs::symlink(&outside, dir.join("innocent.md")).unwrap();
+        let e = memory_file_path(&dir, "innocent.md").unwrap_err();
+        assert_eq!(crate::exit::code_of(&e), Code::Denied);
+
+        // A real note beside it still reads.
+        std::fs::write(dir.join("real.md"), b"a note").unwrap();
+        assert!(memory_file_path(&dir, "real.md").is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
