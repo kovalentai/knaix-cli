@@ -126,6 +126,7 @@ up in the dashboard alongside hosted ones.
 | `knaix status`   | Show who is logged in, the default node, and the local node's state. |
 | `knaix metrics`  | Show a node's health and latency.                     |
 | `knaix logs`     | Show a node's recent log lines.                       |
+| `knaix top`      | Watch every node live: status, load, peers, and the selected node's logs. |
 | `knaix config`   | Show or set the API URL used by the CLI.              |
 
 **Global flags**
@@ -404,6 +405,46 @@ keeps chunks and no document registry, so there is nothing to search: clearing a
 stray document there means `knaix local reset`.
 
 </details>
+
+## Watching a node
+
+`metrics` and `logs` each answer one question about one node, once. `knaix top`
+is the whole mesh at once, refreshed while you watch, with the selected node's
+logs underneath.
+
+```bash
+knaix top                    # every node, refreshed every 3 seconds
+knaix top --interval 1       # faster, floored at one second
+knaix top -n my-node         # open with that node selected
+knaix top -o json            # one snapshot, then exit
+knaix top | tee mesh.log     # a plain table, repeated on the interval
+```
+
+| Key | Does |
+| :--- | :--- |
+| `up` / `down`, or `k` / `j` | Select a node. |
+| `p` | Pause the log pane, and resume it. |
+| `r` | Fetch the selected node's logs now. |
+| `q`, `Esc`, `Ctrl-C` | Quit, restoring the terminal. |
+
+Local nodes appear alongside hosted ones, so `top` is useful with no account at
+all: if the control plane cannot be reached or you are not logged in, the header
+says so and the local node is still shown, rather than the whole command failing.
+
+A node that stops answering keeps its row, marked unreachable with the reason
+and the time it was last seen. Dropping it would read as a deletion, and the
+moment a node goes away is the moment you most want to still see it.
+
+CPU, memory and document counts are read less often than the refresh interval,
+because `docker stats` samples twice before it can report a rate and a document
+count is a request per node. They persist between those readings rather than
+blanking, and a column shows `-` when nothing could be sampled at all, never
+`0%`, which would draw an idle node where there is an unmeasurable one.
+
+Not every surface streams: the control plane serves a node's last N log lines
+rather than a stream, so the pane polls and appends what it has not already
+shown. Overlap is matched on content, so a line that genuinely repeated is shown
+twice and a re-fetched window is not shown at all.
 
 ## Scripting
 

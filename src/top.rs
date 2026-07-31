@@ -10,9 +10,12 @@
 //! terminal being involved at all, and the view has nothing to do but render
 //! what it is handed.
 
+mod view;
+
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use crate::exit::{Code, WithCode};
@@ -118,9 +121,11 @@ pub async fn run(ctx: &KnaixContext, opts: Options) -> Result<()> {
         return Ok(());
     }
 
-    let _ = &opts.node_id;
-    let _ = opts.log_lines;
-    follow_plain(ctx, interval).await
+    if !std::io::stdout().is_terminal() {
+        return follow_plain(ctx, interval).await;
+    }
+
+    view::run(ctx, opts, interval).await
 }
 
 /// The pipe case: the same table, printed again on every interval. No cursor
@@ -214,6 +219,121 @@ pub fn percent_cell(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.0}%"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+
+/// The selected node's log lines, as a pane holds them.
+///
+/// Nothing central streams logs: the control plane serves the last N lines and
+/// nothing more. So the pane polls and keeps what it has already shown, which
+/// reads as a stream without one existing. The local node could be tailed
+/// properly through docker, but it goes through the same path so a reader does
+/// not get two different behaviours depending on which row is selected.
+pub struct LogTail {
+    /// Which row these lines belong to, so selecting another node clears them
+    /// rather than interleaving two nodes' output.
+    pub node: String,
+    pub lines: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl LogTail {
+    pub fn new(node: String, cap: usize) -> Self {
+        Self {
+            node,
+            lines: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Add whatever a fetch returned that is not already shown.
+    pub fn absorb(&mut self, fetched: &[String]) {
+        let seen: Vec<&String> = self.lines.iter().collect();
+        let start = overlap(&seen, fetched);
+        for line in &fetched[start..] {
+            self.lines.push_back(line.clone());
+        }
+        while self.lines.len() > self.cap {
+            self.lines.pop_front();
+        }
+    }
+}
+
+/// How much of a fetch is already on screen.
+///
+/// The last N lines are re-fetched every time, so most of what comes back has
+/// been shown. The overlap is the longest tail of what we hold that is also the
+/// head of what arrived. Matching on content rather than on a count is what
+/// makes repeated identical lines, which logs are full of, land once.
+///
+/// No overlap means the node produced more than a window's worth between polls,
+/// so everything is new and some was missed. Appending all of it is the honest
+/// outcome: the alternative is silently dropping lines that were never shown.
+fn overlap(seen: &[&String], fetched: &[String]) -> usize {
+    let most = seen.len().min(fetched.len());
+    for k in (1..=most).rev() {
+        if seen[seen.len() - k..]
+            .iter()
+            .zip(&fetched[..k])
+            .all(|(a, b)| a.as_str() == b.as_str())
+        {
+            return k;
+        }
+    }
+    0
+}
+
+/// The last `lines` log lines for one node, from wherever they live.
+pub async fn fetch_logs(ctx: &KnaixContext, row: &NodeRow, lines: usize) -> Result<Vec<String>> {
+    if row.local {
+        // Shells out to docker, so it goes to a blocking thread rather than
+        // stalling the runtime the view is drawing on.
+        return tokio::task::spawn_blocking(move || crate::local::log_lines(lines))
+            .await
+            .context("Could not read the local node's logs")?;
+    }
+
+    let uuid = row
+        .uuid
+        .as_deref()
+        .ok_or_else(|| anyhow!("This node has no instance id to read logs from."))?;
+    let token = ctx.get_token()?;
+    let url = format!(
+        "{}/api/nodes/{}/logs?limit={}",
+        ctx.config.api_url, uuid, lines
+    );
+
+    let resp = ctx
+        .client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("Could not reach the Kovalent API")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP {}", resp.status()))
+            .coded(Code::for_status(resp.status().as_u16()));
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    // The route answers with an array of lines, or one blob when the runtime
+    // hands its output over unsplit.
+    if let Some(rows) = body["logs"].as_array() {
+        return Ok(rows
+            .iter()
+            .filter_map(|r| r.as_str())
+            .map(str::to_string)
+            .collect());
+    }
+    Ok(body["logs"]
+        .as_str()
+        .map(|blob| blob.lines().map(str::to_string).collect())
+        .unwrap_or_default())
 }
 
 /// Take one snapshot of every node this machine can see.
@@ -721,6 +841,70 @@ mod tests {
 
         assert_eq!(current.nodes[0].cpu, None);
         assert_eq!(current.nodes[0].documents, None);
+    }
+
+    // --- log tailing ---
+
+    fn lines(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The common case: most of a poll has already been shown, and only the
+    /// tail of it is new.
+    #[test]
+    fn a_poll_appends_only_what_was_not_already_shown() {
+        let mut tail = LogTail::new("local".to_string(), 100);
+        tail.absorb(&lines(&["one", "two", "three"]));
+        tail.absorb(&lines(&["two", "three", "four"]));
+
+        let got: Vec<&String> = tail.lines.iter().collect();
+        assert_eq!(got, vec!["one", "two", "three", "four"]);
+    }
+
+    /// Logs repeat themselves. Overlap is matched on content so a line that
+    /// genuinely occurred twice is shown twice, and a re-fetch of the same
+    /// window is not.
+    #[test]
+    fn repeated_identical_lines_are_not_collapsed_or_duplicated() {
+        let mut tail = LogTail::new("local".to_string(), 100);
+        tail.absorb(&lines(&["ping", "ping"]));
+        // Nothing new happened: the same window comes back.
+        tail.absorb(&lines(&["ping", "ping"]));
+        assert_eq!(tail.lines.len(), 2, "a re-fetch was appended twice");
+
+        // A third ping really did happen.
+        tail.absorb(&lines(&["ping", "ping", "ping"]));
+        assert_eq!(tail.lines.len(), 3, "a genuinely new line was dropped");
+    }
+
+    /// A node noisier than the poll interval overruns the window. Everything
+    /// is new, and appending all of it is better than dropping it silently.
+    #[test]
+    fn a_window_with_no_overlap_is_taken_whole() {
+        let mut tail = LogTail::new("local".to_string(), 100);
+        tail.absorb(&lines(&["a", "b"]));
+        tail.absorb(&lines(&["y", "z"]));
+
+        let got: Vec<&String> = tail.lines.iter().collect();
+        assert_eq!(got, vec!["a", "b", "y", "z"]);
+    }
+
+    /// The pane is bounded. An unbounded tail is a memory leak on a node that
+    /// logs steadily for an afternoon.
+    #[test]
+    fn the_tail_never_grows_past_its_cap() {
+        let mut tail = LogTail::new("local".to_string(), 3);
+        tail.absorb(&lines(&["a", "b", "c", "d", "e"]));
+
+        let got: Vec<&String> = tail.lines.iter().collect();
+        assert_eq!(got, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn the_first_poll_is_taken_whole() {
+        let mut tail = LogTail::new("local".to_string(), 100);
+        tail.absorb(&lines(&["a", "b"]));
+        assert_eq!(tail.lines.len(), 2);
     }
 
     fn row_named(name: &str, local: bool) -> NodeRow {

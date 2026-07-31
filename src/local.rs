@@ -366,7 +366,6 @@ fn parse_usage(out: &str) -> Option<(f64, f64)> {
 }
 
 /// The node's recent log lines, as data rather than printed.
-#[allow(dead_code)]
 pub fn log_lines(lines: usize) -> Result<Vec<String>> {
     docker_available()?;
     if container_state().is_none() {
