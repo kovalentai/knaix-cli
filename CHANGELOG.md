@@ -2,6 +2,44 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.9] - 2026-07-31
+
+A new command, and the results of testing every other one before this CLI is announced publicly.
+
+**If a CI step runs `knaix selftest --quick`, read the first entry under Changed.** It no longer fails, and a gate that stops failing does not tell you it has stopped.
+
+### Added
+
+- **`knaix top`.** One live view of every node, hosted and local. Between `knaix metrics`, which is one node and one snapshot, and the dashboard, which is a browser, there was nothing that answered "what is my mesh doing right now" in a terminal. This is that: every node with its status, load and peers, refreshed on an interval, with the selected node's logs streaming underneath. `--interval` sets the refresh, `--lines` the size of the log pane, and `-n` picks the node selected when it opens.
+
+  It is a data layer with a view attached rather than a screen that fetches, so `-o json` emits one snapshot and exits without a terminal being involved at all, which is what makes it usable from a script. CPU, memory and document counts are read less often than the refresh, because `docker stats` samples twice before it can report a rate; a column shows `-` where nothing could be sampled rather than `0%`, which would draw an idle node where there is an unmeasurable one.
+
+- **`knaix local up --generation-timeout <SECONDS>`.** The node gives a model 60 seconds to answer, which a large or reasoning model on consumer hardware passes routinely, and there was no supported way to change it. Bringing your own model is a headline feature and this was the setting it needed. Remembered like the model itself, so a later `up` does not put the timeouts back.
+
+### Changed
+
+- **`knaix selftest --quick` no longer returns a pass or a fail.** It asks 12 of the 52 questions and takes the first two per document rather than sampling, and at that size the interval around a 90% rate is wider than the gap between passing and failing. It was reporting green on a node the full run reported red. It now prints the numbers, says it did not score the node, and exits 0 unless the node failed to answer at all.
+
+  This changes an exit code, which this CLI treats as an interface. A script gating on `knaix selftest --quick` will stop failing rather than start erroring, so it needs changing to a full run to keep its gate.
+
+- **Self-test floors are separated for local and hosted nodes, and only the citation floor differs.** A node answering from a model you brought and run yourself cites more loosely than a hosted frontier model, so holding it to the same citation bar reports the model's size as a defect in the node. Retrieval floors are unchanged and shared, because retrieval does not depend on which model answers: hit rate and MRR are measured over every passage the node returned, which is the output of its own embedder and reranker. Relaxing those would have hidden a reranker that orders badly, which is the one thing MRR exists to report. The report now names which floors were applied.
+
+- **A self-test survives a model that cannot answer in time.** One slow generation used to end the whole run and discard every question already asked. Questions that go unanswered are now recorded with the reason and the run continues. They stay in the denominator, because a node that cannot answer has not retrieved anything either and scoring only what survived would let a node time out its way to a pass, and a run with any of them can never report green.
+
+- **`knaix list local` says why instead of failing to reach the control plane.** It reached for a session and the control plane before noticing the node was local, so listing a local node's documents reported a DNS failure on a machine that was working perfectly. The local node keeps chunks and no document registry, so there is nothing to enumerate, and it now says that and points at the commands that do reach the corpus. `list` also takes `-n`, which every other node command already took.
+
+- **`knaix login` stops before opening a browser when there is nowhere to sign in.** It used to open a browser, wait five minutes, and then report that no sign-in had been completed, which described the user rather than the problem. It now checks first and fails in about a second with the same code every other command gives. Reachability, not health: a control plane answering 403 or 503 on that path can still complete a sign-in, so only a genuine transport failure stops it.
+
+- **`knaix local up` tells a machine that has never installed Docker something it can act on.** Installed-but-stopped and never-installed were the same sentence, and it was "start Docker and try again", which describes a state the second machine was never in. They are now different, and only one of them carries an install link.
+
+### Fixed
+
+- **`knaix memory --file` read files that were not notes.** `--file /etc/passwd` printed it. Joining a path onto a directory replaces the directory outright when the path is absolute, so the notes directory was advisory rather than a boundary. The flag now takes a file name and refuses a path, and because a name that cannot escape can still point somewhere that does, a symlink out of the notes directory is refused on read and is no longer listed as a note.
+
+- **Two piped uploads in one process could share a directory.** The staging directory was named from the process id and the clock, and two calls can read the same instant; the second then wrote into the first's directory and removed it on the way out.
+
+- **A self-test that retrieved nothing reported its MRR as `-0.000`,** and a run where nothing answered claimed the deterministic mock had written the answers when the model you configured had simply never been asked.
+
 ## [0.4.8] - 2026-07-30
 
 A security release. **If you have run `knaix local up` on a network you do not control, upgrade.**
