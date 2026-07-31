@@ -3,10 +3,14 @@
 #
 #   scripts/bump-version.sh 0.4.7
 #
-# The version appears in three files and they have to agree: release.yml
-# refuses a tag that disagrees with Cargo.toml, and the README title is checked
-# there too, so a release cannot ship with a stale one. This is what a release
-# PR runs instead of editing them by hand.
+# The version appears in Cargo.toml and Cargo.lock and they have to agree:
+# release.yml refuses a tag that disagrees with Cargo.toml, so a release cannot
+# ship with a stale one. This is what a release PR runs instead of editing them
+# by hand.
+#
+# The README does not state the version. It used to, in its title, and it went
+# three releases stale before anyone noticed; it now carries a release badge
+# that reads the latest tag, so there is nothing here to keep in step.
 #
 # CHANGELOG.md is left alone on purpose. Its heading carries a date and a
 # section of prose somebody has to write, so a script that inserted one would
@@ -41,7 +45,6 @@ replace() {
 }
 
 replace "1,10s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"${VERSION}\"/" Cargo.toml
-replace "1s/^# Knaix CLI \(v[0-9]+\.[0-9]+\.[0-9]+\)/# Knaix CLI (v${VERSION})/" README.md
 
 # Cargo.lock states it too, and `cargo update -p` is the only thing that may
 # edit that file. --offline so a version bump never depends on the network.
@@ -59,12 +62,11 @@ check() {
 }
 
 check Cargo.toml    "version = \"${VERSION}\""
-check README.md     "# Knaix CLI (v${VERSION})"
 check Cargo.lock    "version = \"${VERSION}\""
 
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "Set to ${VERSION}: Cargo.toml, Cargo.lock, README.md"
+echo "Set to ${VERSION}: Cargo.toml, Cargo.lock"
 echo "Next: write the CHANGELOG.md section, open the release PR, then tag v${VERSION}."
