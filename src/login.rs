@@ -379,13 +379,20 @@ async fn handle_callback(
     )
 }
 
-/// Whether the control plane that would issue the session is answering.
+/// Whether the control plane that would issue the session can be reached.
 ///
 /// The browser half of the flow cannot report this: it redirects to a callback
 /// that never arrives, and the wait then expires blaming the user for not
 /// finishing a sign-in that had nowhere to complete. Asking first turns five
 /// minutes and a stray browser tab into the same immediate, accurate error
 /// every other command gives.
+///
+/// Reachability, deliberately, and not health. Any reply at all proves there is
+/// something there to sign in against, so a WAF answering 403 on this path, a
+/// moved endpoint answering 404, or a degraded service answering 503 must not
+/// stop a sign-in that would have worked. Only a transport failure -- no DNS,
+/// refused connection, no answer inside the deadline -- means there is nowhere
+/// to go.
 async fn control_plane_answers(api_url: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS))
@@ -394,12 +401,7 @@ async fn control_plane_answers(api_url: &str) -> bool {
         // No client to ask with is not evidence the service is down.
         return true;
     };
-    client
-        .get(format!("{api_url}/health"))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    client.get(format!("{api_url}/health")).send().await.is_ok()
 }
 
 pub async fn login() -> Result<()> {

@@ -32,13 +32,18 @@ const TOP_K: usize = 5;
 /// The bar a node is held to. Do not lower one to make a red run green: the
 /// point of a floor is that falling under it is the finding.
 ///
-/// There are two of these because one number cannot describe both cases. Every
-/// metric here is measured from the answer's own citation list, so all three
-/// move with the model that wrote it -- a model that truncates its context or
-/// cites loosely drops passages out of the list, and retrieval that found them
-/// scores as if it had not. Holding a 7-30B model on consumer hardware to the
-/// bar a hosted frontier model meets therefore reports the model's size as a
-/// defect in the node.
+/// Only one of these three moves with the model. `supporting_rank`, which feeds
+/// both hit rate and MRR, is taken over every passage the node returned,
+/// without regard to which ones the answer cited -- that is the output of the
+/// node's own embedder and reranker, and it is the same whichever model the
+/// user brought. Measured directly: the deterministic mock and a real model
+/// return an identical passage list, in an identical order, for the same
+/// question against the same store. Only the cited flags differ.
+///
+/// So retrieval floors are shared, and only the citation floor is relaxed for a
+/// node answering from a model the user runs themselves. Relaxing the retrieval
+/// floors would hide a reranker that orders badly, which is the one thing MRR
+/// exists to report.
 struct Floors {
     /// Named in the report, so which bar was applied is never a guess.
     class: &'static str,
@@ -57,14 +62,18 @@ const FLOORS_HOSTED: Floors = Floors {
 
 /// A node answering from a model the user brought and runs themselves.
 ///
-/// PROVISIONAL. Calibrated against one model (gemma4 on Apple silicon: hit rate
-/// 96.2%, MRR 0.881, citation accuracy 89.8% over the full 52), which is enough
-/// to show the hosted bar is the wrong one here and not enough to say where the
-/// right one sits. Widen the sample before treating these as settled.
+/// Retrieval floors match the hosted ones, because retrieval does not depend on
+/// which model answers. Only the citation floor moves.
+///
+/// PROVISIONAL, and only the citation number. Calibrated against one model
+/// (gemma4 on Apple silicon cited the supporting passage 89.8% of the time over
+/// the full 52), which is enough to show a small model cites more loosely than
+/// a frontier one and not enough to say where the line belongs. Widen the
+/// sample before treating it as settled.
 const FLOORS_LOCAL: Floors = Floors {
     class: "local",
     hit_rate: 0.95,
-    mrr: 0.85,
+    mrr: 0.90,
     citation_accuracy: 0.85,
 };
 
@@ -190,8 +199,12 @@ pub struct QuestionOutcome {
 pub struct SelfTestReport {
     pub node: String,
     pub model: Option<String>,
-    /// False when the node answered with the deterministic mock, where citation
-    /// accuracy only restates rank-1 retrieval and says nothing about a model.
+    /// Whether the citation number can be read as a measurement of a model.
+    ///
+    /// False when the deterministic mock answered, where it only restates
+    /// rank-1 retrieval, and false when nothing answered at all, where no model
+    /// chose anything. Both report no model, so this must not be read as "the
+    /// mock ran".
     pub citation_accuracy_meaningful: bool,
     pub questions: usize,
     /// Which floors were applied, so a result is never read against the wrong
@@ -843,7 +856,13 @@ fn summarize(
         mrr_sum / total as f64 + 0.0
     };
 
-    let citation_accuracy_meaningful = !is_mock_model(model.as_deref());
+    // Two ways the number cannot be read, and they are not the same thing. The
+    // mock picks the top passage every time, so its accuracy restates rank-1
+    // retrieval. A run where nothing answered reports no model at all, which
+    // looks identical here and is not: that model never got to choose. Both
+    // make the number unreadable, so neither may claim it is meaningful.
+    let answered_any = unanswered < total;
+    let citation_accuracy_meaningful = answered_any && !is_mock_model(model.as_deref());
 
     SelfTestReport {
         node: node_uuid.to_string(),
@@ -1316,6 +1335,38 @@ mod tests {
     fn a_fully_unanswered_run_is_not_reported_as_the_mock() {
         let report = scored_summary("node", vec![unanswered("a", "timed out")], None);
         assert_eq!(report.unanswered, report.questions);
+        assert!(
+            !report.citation_accuracy_meaningful,
+            "no model chose anything, so the number cannot be read as one"
+        );
+    }
+
+    /// Retrieval does not depend on the model, so relaxing its floors for a
+    /// local node would hide a reranker that orders badly. Read through
+    /// `for_target` rather than off the constants, so this also pins which bar
+    /// each kind of node is held to.
+    #[test]
+    fn only_the_citation_floor_differs_between_classes() {
+        let local = Floors::for_target(&Target::Local {
+            base: "http://127.0.0.1:8080".into(),
+            instance_id: "abc".into(),
+        });
+        let hosted = Floors::for_target(&Target::Remote { uuid: "u-1".into() });
+
+        assert_eq!(local.class, "local");
+        assert_eq!(hosted.class, "hosted");
+        assert_eq!(
+            local.hit_rate, hosted.hit_rate,
+            "retrieval does not depend on the model"
+        );
+        assert_eq!(
+            local.mrr, hosted.mrr,
+            "MRR reports the node's reranker, not the user's model"
+        );
+        assert!(
+            local.citation_accuracy < hosted.citation_accuracy,
+            "the model's own citing is the only thing that differs"
+        );
     }
 
     /// The wait before a timeout is not a latency measurement.

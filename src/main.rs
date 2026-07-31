@@ -356,7 +356,12 @@ enum LocalAction {
 
         /// Seconds the node may spend on one answer before giving up; raise it
         /// for a large or reasoning model. Remembered like the model
-        #[clap(long, value_name = "SECONDS")]
+        ///
+        /// Bounded here rather than where it is used: the value is multiplied
+        /// into milliseconds, and an unbounded u64 overflows that. Release
+        /// builds do not check overflow, so the wrap was silent and produced a
+        /// sub-second timeout from a request for a long one.
+        #[clap(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
         generation_timeout: Option<u64>,
 
         /// Re-pull the image even if it is already present

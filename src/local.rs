@@ -699,9 +699,17 @@ pub async fn up(
     // The node's own default is a minute, which a large or reasoning model on
     // consumer hardware passes routinely. Left unset otherwise, so the node
     // keeps deciding.
+    //
+    // Saturating, though the flag is already bounded: a release build does not
+    // check overflow, so a plain multiply turns a request for a long timeout
+    // into a sub-second one without saying anything. State files are edited by
+    // hand, so the bound at the flag is not the only way a value arrives here.
     if let Some(secs) = launch.generation_timeout_secs {
         args.push("-e".into());
-        args.push(format!("GENERATION_TIMEOUT_MS={}", secs * 1000));
+        args.push(format!(
+            "GENERATION_TIMEOUT_MS={}",
+            secs.saturating_mul(1000)
+        ));
     }
 
     match &launch.model_url {

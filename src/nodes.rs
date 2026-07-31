@@ -2223,9 +2223,27 @@ pub fn memory_key(target: &Target) -> String {
 /// unchecked name here reads any file the user can read rather than one of
 /// their notes. The listing prints bare file names, and this accepts exactly
 /// what that prints.
+///
+/// Checking the name is not enough on its own. A name that cannot escape can
+/// still point somewhere that does: reading follows a symlink, so a link left
+/// in the notes directory reads whatever it targets. Both sides are resolved
+/// and the file has to still be in the directory afterwards.
 fn memory_file_path(memory_dir: &std::path::Path, file_name: &str) -> Result<std::path::PathBuf> {
     let checked = crate::stdin_arg::checked_name("--file", file_name)?;
-    Ok(memory_dir.join(checked))
+    let path = memory_dir.join(checked);
+
+    // Only when it resolves. A name that does not exist yet is the caller's
+    // "no such note" case, reported below with the listing that fixes it.
+    if let (Ok(real), Ok(root)) = (path.canonicalize(), memory_dir.canonicalize()) {
+        if real.parent() != Some(root.as_path()) {
+            return Err(anyhow!(
+                "{} leaves the notes directory for node memory. Only files inside it can be read.",
+                file_name
+            ))
+            .coded(Code::Denied);
+        }
+    }
+    Ok(path)
 }
 
 pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
@@ -2281,7 +2299,14 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
         let mut files = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.is_file() {
+            // `symlink_metadata` does not follow the link, so a link out of the
+            // directory is not offered as a note. `is_file` would follow it and
+            // list whatever it points at as though it were one.
+            let is_plain_file = tokio::fs::symlink_metadata(&path)
+                .await
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if is_plain_file {
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                     files.push(fname.to_string());
                 }
@@ -2528,6 +2553,28 @@ mod tests {
             memory_file_path(dir, "_knaix_durable_memory.md").unwrap(),
             dir.join("_knaix_durable_memory.md")
         );
+    }
+
+    /// A name that cannot escape can still point somewhere that does. Reading
+    /// follows the link, so the check has to be on where it lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_note_that_is_a_symlink_out_of_the_directory_is_refused() {
+        let root = std::env::temp_dir().join(format!("knaix-memlink-{}", std::process::id()));
+        let dir = root.join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, b"not a note").unwrap();
+
+        std::os::unix::fs::symlink(&outside, dir.join("innocent.md")).unwrap();
+        let e = memory_file_path(&dir, "innocent.md").unwrap_err();
+        assert_eq!(crate::exit::code_of(&e), Code::Denied);
+
+        // A real note beside it still reads.
+        std::fs::write(dir.join("real.md"), b"a note").unwrap();
+        assert!(memory_file_path(&dir, "real.md").is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
