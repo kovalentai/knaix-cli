@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    carry_forward, fetch_logs, percent_cell, snapshot, LogTail, NodeRow, Options, Reach, Snapshot,
-    DEEP_EVERY,
+    carry_forward, fetch_logs, peers_cell, percent_cell, snapshot, LogTail, NodeRow, Options,
+    Reach, Snapshot, DEEP_EVERY,
 };
 use crate::nodes::KnaixContext;
 
@@ -402,7 +402,7 @@ fn draw_nodes(frame: &mut Frame, area: Rect, state: &State) {
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                 ),
-                Cell::from(node.peers.to_string()),
+                Cell::from(peers_cell(&node.peers)),
             ])
         })
         .collect();
@@ -412,7 +412,7 @@ fn draw_nodes(frame: &mut Frame, area: Rect, state: &State) {
         [
             Constraint::Min(12),
             Constraint::Length(7),
-            Constraint::Length(22),
+            Constraint::Min(24),
             Constraint::Length(10),
             Constraint::Length(6),
             Constraint::Length(6),
@@ -501,12 +501,31 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &State) {
     }
 
     body.push(Line::raw(""));
-    body.push(Line::styled(
-        format!("mesh peers ({})", node.peers),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    if node.peers == 0 {
-        body.push(Line::styled("  none", Style::default().fg(Color::DarkGray)));
+    match &node.peers {
+        Some(peers) => {
+            body.push(Line::styled(
+                format!("mesh peers ({})", peers.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            if peers.is_empty() {
+                body.push(Line::styled("  none", Style::default().fg(Color::DarkGray)));
+            }
+            for peer in peers {
+                body.push(Line::raw(format!("  {peer}")));
+            }
+        }
+        // Saying "0 peers" about a surface that never reports them would be a
+        // claim the CLI cannot make.
+        None => {
+            body.push(Line::styled(
+                "mesh peers",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            body.push(Line::styled(
+                "  not reported",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     frame.render_widget(
@@ -581,7 +600,7 @@ mod tests {
             cpu: None,
             memory: None,
             documents: None,
-            peers: 0,
+            peers: None,
             last_seen: None,
         }
     }
@@ -699,6 +718,37 @@ mod tests {
 
         let frame = render(&state, 100, 24);
         assert!(frame.contains("timed out"), "{frame}");
+    }
+
+    /// The status column flexes. A fixed width clipped the closing paren off
+    /// "unreachable (timed out)", which is exactly the cell a reader is
+    /// squinting at when something has gone wrong.
+    #[test]
+    fn an_unreachable_reason_is_not_clipped() {
+        let mut state = state_with(vec!["alpha"]);
+        state.snapshot.nodes[0].reach = Reach::Unreachable {
+            reason: "timed out".to_string(),
+        };
+
+        let frame = render(&state, 104, 22);
+        assert!(frame.contains("unreachable (timed out)"), "{frame}");
+    }
+
+    /// The control plane's health route does not carry peers, so a hosted node
+    /// reports none rather than zero. Drawing "0" would be a claim the CLI
+    /// cannot make about a mesh it was never told about.
+    #[test]
+    fn a_surface_that_does_not_report_peers_says_so_rather_than_zero() {
+        let mut state = state_with(vec!["alpha"]);
+        state.snapshot.nodes[0].peers = None;
+
+        let frame = render(&state, 104, 22);
+        assert!(frame.contains("not reported"), "{frame}");
+
+        state.snapshot.nodes[0].peers = Some(vec!["beta".to_string()]);
+        let frame = render(&state, 104, 22);
+        assert!(frame.contains("mesh peers (1)"), "{frame}");
+        assert!(frame.contains("beta"), "{frame}");
     }
 
     /// A user with no nodes gets the command that gives them one, not an empty

@@ -76,7 +76,10 @@ pub struct NodeRow {
     pub cpu: Option<f64>,
     pub memory: Option<f64>,
     pub documents: Option<u64>,
-    pub peers: usize,
+    /// Mesh peers by name. `None` means the surface did not report them, which
+    /// is not the same as a node having none: the control plane's health route
+    /// does not carry peers at all, and showing that as 0 would be a claim.
+    pub peers: Option<Vec<String>>,
     pub last_seen: Option<String>,
 }
 
@@ -159,6 +162,9 @@ fn carry_forward(current: &mut Snapshot, previous: &Snapshot) {
         row.cpu = row.cpu.or(before.cpu);
         row.memory = row.memory.or(before.memory);
         row.documents = row.documents.or(before.documents);
+        if row.peers.is_none() {
+            row.peers = before.peers.clone();
+        }
         // A node that has gone unreachable keeps the time it was last seen,
         // which is the one fact worth having about a node that is not there.
         if row.last_seen.is_none() {
@@ -189,7 +195,7 @@ pub fn plain_table(snapshot: &Snapshot) -> String {
             row.documents
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            row.peers.to_string(),
+            peers_cell(&row.peers),
         ]);
     }
 
@@ -211,6 +217,14 @@ pub fn status_cell(row: &NodeRow) -> String {
         Reach::Unreachable { reason } => format!("unreachable ({reason})"),
         Reach::Unknown => "...".to_string(),
     }
+}
+
+/// How many mesh peers, or a dash when the surface did not report them.
+pub fn peers_cell(peers: &Option<Vec<String>>) -> String {
+    peers
+        .as_ref()
+        .map(|p| p.len().to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// A percentage, or a dash when nothing could be sampled. Never 0%, which would
@@ -423,7 +437,7 @@ async fn probe_hosted(ctx: &KnaixContext, node: Node, deep: bool) -> NodeRow {
         cpu: None,
         memory: None,
         documents: None,
-        peers: 0,
+        peers: None,
         last_seen: None,
     };
 
@@ -496,7 +510,7 @@ async fn hosted_health(ctx: &KnaixContext, uuid: &str, row: &mut NodeRow) -> Rea
                 Reach::Ok { latency_ms }
             } else {
                 Reach::Unreachable {
-                    reason: "node reported unhealthy".to_string(),
+                    reason: "unhealthy".to_string(),
                 }
             }
         }
@@ -599,7 +613,7 @@ async fn probe_local(ctx: &KnaixContext, deep: bool) -> Option<NodeRow> {
         cpu: None,
         memory: None,
         documents: None,
-        peers: 0,
+        peers: None,
         last_seen: None,
     };
 
@@ -615,7 +629,13 @@ async fn probe_local(ctx: &KnaixContext, deep: bool) -> Option<NodeRow> {
             let latency_ms = started.elapsed().as_millis() as u64;
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             row.tier = body["tier"].as_str().map(str::to_string);
-            row.peers = body["peers"].as_array().map(|p| p.len()).unwrap_or(0);
+            row.peers = body["peers"].as_array().map(|peers| {
+                peers
+                    .iter()
+                    .filter_map(|p| p.as_str())
+                    .map(str::to_string)
+                    .collect()
+            });
             row.reach = if body["ready"].as_bool().unwrap_or(false) {
                 Reach::Ok { latency_ms }
             } else {
@@ -919,7 +939,7 @@ mod tests {
             cpu: None,
             memory: None,
             documents: None,
-            peers: 0,
+            peers: None,
             last_seen: None,
         }
     }
