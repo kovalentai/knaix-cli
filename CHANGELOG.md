@@ -2,6 +2,14 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.4.10] - 2026-08-01
+
+### Fixed
+
+- **Piping any command into `head` ended in a crash report.** `knaix top | head` and `knaix chat | head` printed a Rust panic, a backtrace note, and an invitation to file a bug, for doing the most ordinary thing anyone does with a stream. Rust ignores the signal that says a reader has gone, which turns writing to a closed pipe into an error the print macros panic on. The signal is now left alone, so the reader leaves and the writer stops, which is what every other tool in a pipeline already does.
+
+  This was every command that writes more than fits in a pipe buffer or keeps writing over time, not only `top`. A command ended this way exits 141, the shell's convention for it, and that is not a failure: nothing went wrong. The exit code table in the README says so; it is deliberately not one of the codes the CLI assigns itself, all of which still mean what they meant.
+
 ## [0.4.9] - 2026-07-31
 
 A new command, and the results of testing every other one before this CLI is announced publicly.
