@@ -39,3 +39,7 @@ globset = "0.4.19"
 toml = "0.8"
 clap_complete = "4.6.7"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+
+# Only to hand SIGPIPE back to the kernel at startup. See restore_sigpipe.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

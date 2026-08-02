@@ -413,6 +413,10 @@ enum LocalAction {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Before anything can write: a closed pipe must end the process, not raise
+    // an error the print macros panic on.
+    restore_sigpipe();
+
     // A panic is always our bug, and until now it printed Rust's default and
     // was gone the moment the terminal scrolled. Recording it first means
     // `knaix report` can carry it, which is the difference between a crash
@@ -457,6 +461,29 @@ async fn main() -> std::process::ExitCode {
         }
     }
 }
+
+/// Hand SIGPIPE back to the kernel, so a closed pipe ends the process quietly.
+///
+/// Rust ignores SIGPIPE on startup, which turns writing to a closed pipe into
+/// an ordinary error, and the print macros panic on it. `knaix top | head` and
+/// `knaix chat | head` therefore ended in a Rust panic and an invitation to
+/// file a crash report, for doing the most ordinary thing anyone does with a
+/// stream. Restoring the default gets the behaviour every other tool in the
+/// pipeline already has: the reader leaves, the writer stops.
+///
+/// Done before any output can be written, and only on unix, where SIGPIPE is
+/// what closing a pipe means. Windows has no equivalent and needs none.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // Safe: setting a disposition to the default is what the process starts
+    // with for every other signal, and nothing here has run yet.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
 
 /// Record a panic before the default hook prints it.
 ///
