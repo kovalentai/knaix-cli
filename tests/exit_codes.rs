@@ -222,6 +222,16 @@ fn a_closed_pipe_ends_quietly_rather_than_panicking() {
         .output()
         .expect("failed to run");
 
+    // Asserted first, and the reason is the whole point: the checks below are
+    // absences, and absences pass when nothing happened at all. If `top` ever
+    // stops producing here -- no node, no network, a future guard that exits
+    // early -- there is no write after the reader leaves, no broken pipe, and
+    // this test goes green having tested nothing.
+    assert!(
+        !out.stdout.is_empty(),
+        "top produced nothing, so the closed pipe was never exercised"
+    );
+
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("panicked"),

@@ -471,12 +471,21 @@ async fn main() -> std::process::ExitCode {
 /// stream. Restoring the default gets the behaviour every other tool in the
 /// pipeline already has: the reader leaves, the writer stops.
 ///
+/// Only stdout and stderr are affected. Sockets are already exempt: the standard
+/// library asks the kernel not to raise SIGPIPE on them, with `MSG_NOSIGNAL` on
+/// Linux and `SO_NOSIGPIPE` on macOS, so a request against a peer that hangs up
+/// still returns an error rather than ending the process. Nothing here writes to
+/// a child's stdin either; every child this CLI starts is given a null one.
+///
 /// Done before any output can be written, and only on unix, where SIGPIPE is
 /// what closing a pipe means. Windows has no equivalent and needs none.
 #[cfg(unix)]
 fn restore_sigpipe() {
-    // Safe: setting a disposition to the default is what the process starts
-    // with for every other signal, and nothing here has run yet.
+    // The runtime is already up by the time this runs, so this is a signal
+    // disposition being set with threads alive. That is fine for what it does:
+    // the kernel keeps one disposition per process, and this assigns the value
+    // every other signal already starts with. It happens before any output, so
+    // nothing can have written to a pipe yet.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
