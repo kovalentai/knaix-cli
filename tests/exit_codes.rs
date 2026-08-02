@@ -191,6 +191,58 @@ fn a_missing_docker_is_a_precondition_not_a_generic_failure() {
     assert_eq!(code, 7, "a missing docker should be Precondition");
 }
 
+/// A reader that stops reading must end the process, not crash it.
+///
+/// Rust ignores SIGPIPE at startup, so writing to a closed pipe became an
+/// ordinary error that the print macros panicked on: `knaix top | head` ended
+/// in a Rust panic and an invitation to file a crash report. The process now
+/// dies from the signal, which a shell reports as 141, and says nothing --
+/// exactly what `yes | head` does.
+///
+/// Driven through a shell because the closed pipe is the point, and the parent
+/// has to be the one that closes it.
+#[cfg(unix)]
+#[test]
+fn a_closed_pipe_ends_quietly_rather_than_panicking() {
+    let home = scratch_home("sigpipe");
+    let bin = env!("CARGO_BIN_EXE_knaix");
+
+    // `top` is the only producer that keeps writing indefinitely, which is what
+    // this needs: anything with a fixed size fits in the pipe buffer, the write
+    // succeeds before the reader is missed, and the test passes with the fix
+    // reverted. `top` writes a table on every interval, so a write after the
+    // reader has gone is guaranteed rather than raced for.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{bin}' top --interval 1 | head -c 200"))
+        .env("HOME", &home)
+        // Nothing listens here, so the run needs no control plane and still
+        // prints its table.
+        .env("KNAIX_API_URL", "http://127.0.0.1:9")
+        .output()
+        .expect("failed to run");
+
+    // Asserted first, and the reason is the whole point: the checks below are
+    // absences, and absences pass when nothing happened at all. If `top` ever
+    // stops producing here -- no node, no network, a future guard that exits
+    // early -- there is no write after the reader leaves, no broken pipe, and
+    // this test goes green having tested nothing.
+    assert!(
+        !out.stdout.is_empty(),
+        "top produced nothing, so the closed pipe was never exercised"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe panicked instead of ending: {stderr}"
+    );
+    assert!(
+        !stderr.contains("report"),
+        "a closed pipe offered a crash report: {stderr}"
+    );
+}
+
 /// Tagging a failure must not change what the user reads.
 #[test]
 fn the_error_text_still_says_what_went_wrong() {

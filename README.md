@@ -476,8 +476,8 @@ outlive the job it was issued for.
 
 ### Exit codes
 
-Every command exits with one of these. They let a script tell a refusal from a
-crash without parsing the error text.
+Every command that runs to completion exits with one of these. They let a script
+tell a refusal from a crash without parsing the error text.
 
 | Code | Name | Means |
 | ---: | --- | --- |
@@ -493,6 +493,11 @@ crash without parsing the error text.
 The distinction that matters most in a pipeline is 4 against 3 and 6. A 4 is
 worth retrying, because the far end was not there. A 3 or a 6 is not: the far end
 answered, and said no.
+
+One ending is not in the table. A reader that closes the pipe — `| head`,
+quitting a pager — ends the command with SIGPIPE, which a shell reports as 141.
+That is the Unix convention rather than one of ours, and it is not a failure:
+nothing went wrong, the reader left.
 
 ```bash
 knaix chat "what changed this week?" || case $? in

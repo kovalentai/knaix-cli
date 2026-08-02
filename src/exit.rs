@@ -10,6 +10,11 @@
 //! raised, with `.coded(Code::X)`. Transport failures are recognised from the
 //! error chain instead, so every call that reaches the network reports
 //! `Unavailable` without each of them having to remember to say so.
+//!
+//! One ending is not a code here. A reader that closes the pipe -- `| head`,
+//! quitting a pager -- kills the process with SIGPIPE, which a shell reports as
+//! 141. That is the Unix convention rather than anything of ours, and it is
+//! deliberately not one of the codes below: nothing failed, the reader left.
 
 use std::fmt;
 

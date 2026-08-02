@@ -413,6 +413,10 @@ enum LocalAction {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Before anything can write: a closed pipe must end the process, not raise
+    // an error the print macros panic on.
+    restore_sigpipe();
+
     // A panic is always our bug, and until now it printed Rust's default and
     // was gone the moment the terminal scrolled. Recording it first means
     // `knaix report` can carry it, which is the difference between a crash
@@ -457,6 +461,38 @@ async fn main() -> std::process::ExitCode {
         }
     }
 }
+
+/// Hand SIGPIPE back to the kernel, so a closed pipe ends the process quietly.
+///
+/// Rust ignores SIGPIPE on startup, which turns writing to a closed pipe into
+/// an ordinary error, and the print macros panic on it. `knaix top | head` and
+/// `knaix chat | head` therefore ended in a Rust panic and an invitation to
+/// file a crash report, for doing the most ordinary thing anyone does with a
+/// stream. Restoring the default gets the behaviour every other tool in the
+/// pipeline already has: the reader leaves, the writer stops.
+///
+/// Only stdout and stderr are affected. Sockets are already exempt: the standard
+/// library asks the kernel not to raise SIGPIPE on them, with `MSG_NOSIGNAL` on
+/// Linux and `SO_NOSIGPIPE` on macOS, so a request against a peer that hangs up
+/// still returns an error rather than ending the process. Nothing here writes to
+/// a child's stdin either; every child this CLI starts is given a null one.
+///
+/// Done before any output can be written, and only on unix, where SIGPIPE is
+/// what closing a pipe means. Windows has no equivalent and needs none.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // The runtime is already up by the time this runs, so this is a signal
+    // disposition being set with threads alive. That is fine for what it does:
+    // the kernel keeps one disposition per process, and this assigns the value
+    // every other signal already starts with. It happens before any output, so
+    // nothing can have written to a pipe yet.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
 
 /// Record a panic before the default hook prints it.
 ///
