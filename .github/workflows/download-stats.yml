@@ -1,0 +1,181 @@
+name: Download stats
+
+# Counts CLI installs from the releases.knaix.com CloudFront access logs and
+# publishes the result to releases.knaix.com/stats.json, which is the payload
+# behind the shields.io endpoint badge and the download figure on the sites.
+#
+# GitHub cannot supply this number: knaix-cli is private, so shields.io reads
+# neither the repo nor its release assets, and both install paths (install.sh
+# and the Homebrew tap) fetch from S3 rather than GitHub Releases anyway.
+#
+# Required repository variables:
+#   AWS_STATS_ROLE_ARN              knaix-cli-github-actions-stats role
+#   KNAIX_RELEASES_DISTRIBUTION_ID  CloudFront distribution for releases.knaix.com
+# Both are Terraform outputs in kovalent-terraform accounts/sandbox/us-west-2.
+
+on:
+  schedule:
+    # 00:17 PT. Off the hour, since scheduled runs queue behind everyone
+    # else's on-the-hour crons.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: download-stats
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  ATHENA_WORKGROUP: knaix-releases-stats
+  RELEASES_BUCKET: knaix-releases
+
+jobs:
+  publish:
+    name: Count and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required variables
+        env:
+          ROLE_ARN: ${{ vars.AWS_STATS_ROLE_ARN }}
+          DISTRIBUTION_ID: ${{ vars.KNAIX_RELEASES_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "$ROLE_ARN" ] || { echo "::error::AWS_STATS_ROLE_ARN is not set"; exit 1; }
+          [ -n "$DISTRIBUTION_ID" ] || { echo "::error::KNAIX_RELEASES_DISTRIBUTION_ID is not set"; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_STATS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      # A download is a successful GET of a versioned binary. /latest-version
+      # is deliberately excluded: every installed CLI polls it on a timer, so
+      # counting it would measure the installed base's update checks, not
+      # installs. 206 is counted because a resumed download still lands one
+      # copy; the deduplicated figure is what absorbs the double-count.
+      - name: Query Athena
+        id: query
+        run: |
+          set -euo pipefail
+
+          SQL=$(cat <<'SQL'
+          SELECT
+            count(*) AS total,
+            count(DISTINCT request_ip || '|' || user_agent || '|' || cast("date" AS varchar)) AS deduped
+          FROM knaix_releases.cloudfront_logs
+          WHERE method = 'GET'
+            AND status IN (200, 206)
+            AND regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux)-(arm64|x86_64)$')
+          SQL
+          )
+
+          QID=$(aws athena start-query-execution \
+            --query-string "$SQL" \
+            --work-group "$ATHENA_WORKGROUP" \
+            --query QueryExecutionId --output text)
+          echo "Query $QID"
+
+          for _ in $(seq 1 60); do
+            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+              --query 'QueryExecution.Status.State' --output text)
+            case "$STATE" in
+              SUCCEEDED)
+                break
+                ;;
+              FAILED|CANCELLED)
+                REASON=$(aws athena get-query-execution --query-execution-id "$QID" \
+                  --query 'QueryExecution.Status.StateChangeReason' --output text)
+                echo "::error::Athena query $STATE: $REASON"
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          if [ "$STATE" != "SUCCEEDED" ]; then
+            echo "::error::Athena query did not finish within five minutes"
+            exit 1
+          fi
+
+          # Row 0 is the header; row 1 holds the two counts, tab separated.
+          ROW=$(aws athena get-query-results \
+            --query-execution-id "$QID" \
+            --query 'ResultSet.Rows[1].Data[*].VarCharValue' --output text)
+          TOTAL=$(printf '%s' "$ROW" | cut -f1)
+          DEDUPED=$(printf '%s' "$ROW" | cut -f2)
+
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "deduped=$DEDUPED" >> "$GITHUB_OUTPUT"
+          echo "Total $TOTAL, deduplicated $DEDUPED"
+
+      # The badge shows the deduplicated count, which is the number that
+      # survives being asked how it was measured. Both are in the file so the
+      # sites can render either without another deploy.
+      - name: Build stats.json
+        env:
+          TOTAL: ${{ steps.query.outputs.total }}
+          DEDUPED: ${{ steps.query.outputs.deduped }}
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+
+          total = int(os.environ["TOTAL"])
+          deduped = int(os.environ["DEDUPED"])
+
+          def short(n):
+              if n < 1000:
+                  return str(n)
+              if n < 1_000_000:
+                  k = n / 1000
+                  return f"{k:.1f}k" if k < 10 else f"{k:.0f}k"
+              m = n / 1_000_000
+              return f"{m:.1f}M" if m < 10 else f"{m:.0f}M"
+
+          payload = {
+              "schemaVersion": 1,
+              "label": "downloads",
+              "message": short(deduped),
+              "color": "7C5CFF",
+              "total": total,
+              "unique": deduped,
+              "updated": datetime.datetime.now(datetime.timezone.utc)
+                             .strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open("stats.json", "w") as f:
+              json.dump(payload, f)
+              f.write("\n")
+          PY
+
+          cat stats.json
+
+      - name: Publish
+        env:
+          DISTRIBUTION_ID: ${{ vars.KNAIX_RELEASES_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+
+          aws s3api put-object \
+            --bucket "$RELEASES_BUCKET" \
+            --key stats.json \
+            --body stats.json \
+            --content-type application/json \
+            --cache-control 'public, max-age=300' > /dev/null
+
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths /stats.json > /dev/null
+
+      - name: Summary
+        run: |
+          {
+            echo "### Knaix CLI downloads"
+            echo
+            echo "- Total requests: ${{ steps.query.outputs.total }}"
+            echo "- Deduplicated: ${{ steps.query.outputs.deduped }}"
+            echo
+            echo "Published to https://releases.knaix.com/stats.json"
+          } >> "$GITHUB_STEP_SUMMARY"
