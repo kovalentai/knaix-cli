@@ -62,14 +62,27 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The counts are filtered to downloads, but the freshness probe
+          # deliberately is not. Freshness has to answer "is CloudFront still
+          # delivering logs", and a quiet week with no installs is not the same
+          # failure as log delivery having stopped. Every installed CLI polls
+          # /latest-version on a timer, so unfiltered traffic keeps flowing as
+          # long as an installed base exists, which makes it the honest probe.
           SQL=$(cat <<'SQL'
           SELECT
-            count(*) AS total,
-            count(DISTINCT request_ip || '|' || user_agent || '|' || cast("date" AS varchar)) AS deduped
-          FROM knaix_releases.cloudfront_logs
-          WHERE method = 'GET'
-            AND status IN (200, 206)
-            AND regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux)-(arm64|x86_64)$')
+            count_if(is_download) AS total,
+            count(DISTINCT if(is_download, dedup_key)) AS deduped,
+            cast(max("date") AS varchar) AS latest
+          FROM (
+            SELECT
+              "date",
+              method = 'GET'
+                AND status IN (200, 206)
+                AND regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux)-(arm64|x86_64)$')
+                AS is_download,
+              concat_ws('|', request_ip, user_agent, cast("date" AS varchar)) AS dedup_key
+            FROM knaix_releases.cloudfront_logs
+          )
           SQL
           )
 
@@ -101,16 +114,50 @@ jobs:
             exit 1
           fi
 
-          # Row 0 is the header; row 1 holds the two counts, tab separated.
+          # Row 0 is the header; row 1 holds the values, tab separated. A NULL
+          # is omitted from the array rather than returned empty, so an empty
+          # table yields two values instead of three and latest reads empty.
+          # The counts are never NULL, so only the last column can shift.
           ROW=$(aws athena get-query-results \
             --query-execution-id "$QID" \
             --query 'ResultSet.Rows[1].Data[*].VarCharValue' --output text)
           TOTAL=$(printf '%s' "$ROW" | cut -f1)
           DEDUPED=$(printf '%s' "$ROW" | cut -f2)
+          LATEST=$(printf '%s' "$ROW" | cut -f3)
 
           echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
           echo "deduped=$DEDUPED" >> "$GITHUB_OUTPUT"
-          echo "Total $TOTAL, deduplicated $DEDUPED"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Total $TOTAL, deduplicated $DEDUPED, newest log entry ${LATEST:-none}"
+
+      # Without this, a break in log delivery does not fail. It just stops the
+      # number growing, and the badge shows a plausible figure forever. AWS
+      # documents that the awslogsdelivery grant can be reset, and that logs
+      # then stop silently, so the stale-but-believable case is the one to
+      # engineer against: a wrong number nobody questions beats a broken badge
+      # only from the perspective of the badge.
+      - name: Check log freshness
+        env:
+          LATEST: ${{ steps.query.outputs.latest }}
+          # Entries can arrive up to 24 hours late, so this is two documented
+          # delays plus a day, not an SLA.
+          MAX_AGE_DAYS: 3
+        run: |
+          set -euo pipefail
+
+          if [ -z "$LATEST" ]; then
+            echo "::error::No log entries at all. Either logging has never delivered, or the query is reading the wrong location."
+            exit 1
+          fi
+
+          AGE_DAYS=$(( ( $(date -u +%s) - $(date -u -d "$LATEST" +%s) ) / 86400 ))
+
+          if [ "$AGE_DAYS" -gt "$MAX_AGE_DAYS" ]; then
+            echo "::error::Newest log entry is $LATEST, $AGE_DAYS days old. Log delivery has likely stopped; check that the awslogsdelivery ACL grant on knaix-releases-logs is intact. Refusing to publish a figure that would look current."
+            exit 1
+          fi
+
+          echo "Newest log entry $LATEST, $AGE_DAYS days old."
 
       # The badge shows the deduplicated count, which is the number that
       # survives being asked how it was measured. Both are in the file so the
