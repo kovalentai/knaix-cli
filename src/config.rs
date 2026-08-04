@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+// Only the unix permission-hardening block below colours anything.
+#[cfg(unix)]
 use colored::Colorize;
 use home::home_dir;
 use serde::{Deserialize, Serialize};

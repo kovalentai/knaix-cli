@@ -46,6 +46,14 @@ brew install kovalentai/tap/knaix
 curl -sSL https://knaix.com/install.sh | sh
 ```
 
+**Windows** (PowerShell). Installs to `%LOCALAPPDATA%\Programs\knaix` and adds it
+to your PATH, so it never needs administrator rights. Open a new terminal
+afterwards. The build is x86_64; Windows on ARM runs it under emulation:
+
+```powershell
+irm https://knaix.com/install.ps1 | iex
+```
+
 **From source** (needs a Rust toolchain):
 
 ```bash
@@ -59,6 +67,7 @@ Check it landed:
 ```bash
 knaix --version
 knaix doctor      # what is configured, what is reachable, what to do about the rest
+knaix verify      # that this binary is the one we published
 ```
 
 ## Try it with no account
@@ -131,6 +140,7 @@ up in the dashboard alongside hosted ones.
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
 | `knaix mcp`      | Print the MCP client config that points Claude Code, Claude Desktop or Cursor at a node. |
 | `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
+| `knaix verify`   | Check that this binary is the one we published: checksum, signature, and build provenance. |
 | `knaix doctor`   | Check everything a command needs, and say what to do about what is wrong. |
 | `knaix report`   | Write a diagnostic bundle you can read, then attach to an issue. |
 | `knaix bench`    | Measure how fast a node reaches, ingests, and answers.  |
@@ -283,6 +293,42 @@ handed a config that fails later in your editor:
 ```bash
 knaix local up --pull    # if 'knaix mcp' says the node predates the endpoint
 ```
+
+## Verifying this binary
+
+Every release is published with a SHA-256 digest, a signature, and a record of
+the build that produced it. `knaix verify` checks all three:
+
+```bash
+knaix verify
+```
+
+```
+  ✓ checksum     SHA-256 matches the published digest
+  ✓ signature    signed by the release workflow of kovalentai/knaix-cli
+  ✓ provenance   built by GitHub Actions in kovalentai/knaix-cli
+```
+
+The digest is served from the same host as the binary, so on its own it proves
+the download arrived intact, not that we published it. The signature is what
+proves origin: releases are signed by the release workflow with a short-lived
+identity rather than a stored key, and the certificate names the workflow, the
+repository and the tag. `knaix verify` pins all three, so a signature made
+anywhere else does not satisfy it.
+
+`cosign` and the GitHub CLI are optional. When they are missing, those checks
+report as **skipped**, with the reason — never as passed. `--strict` turns a
+check that could not run into a failure, which is what a pipeline wants:
+
+```bash
+knaix verify --strict          # exit 7 if any check could not run
+knaix verify ./knaix --version 0.5.0
+knaix -o json verify           # the same result as a document
+```
+
+Releases before v0.5.0 carry no signature or attestation, so those checks report
+as skipped against them. Full instructions, including checking by hand and on
+Windows: <https://knaix.com/docs/verify/>.
 
 ## When something is wrong
 
