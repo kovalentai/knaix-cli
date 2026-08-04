@@ -16,7 +16,7 @@ Knaix runs on Windows, and every release can now be checked against the workflow
 
 - **`knaix verify`.** Checks that the binary you are running is the one we published. It re-hashes the file and compares it with the digest published for that version, verifies the release signature with cosign, and checks the build attestation with the GitHub CLI.
 
-  A check that could not run is reported as **skipped**, with the reason, and never counted as a pass — cosign and the GitHub CLI are optional, and their absence is stated rather than glossed over. `--strict` turns a check that could not run into a failure, which is what a pipeline wants. Exits 6 when a check fails and, under `--strict`, 7 when one could not run. `-o json` emits the same result as a document.
+  A check that could not run is reported as **skipped**, with the reason, and never counted as a pass. cosign and the GitHub CLI are optional, so their absence is stated rather than glossed over. `--strict` turns a check that could not run into a failure, which is what a pipeline wants. Exits 6 when a check fails and, under `--strict`, 7 when one could not run. `-o json` emits the same result as a document.
 
   With no arguments it checks the running binary against the version it reports, not against the newest release, so deliberately staying on an older version does not read as a failure. Checking some other file needs `--version`, because a file on disk does not say which release it came from and a guess produces a mismatch that looks like tampering.
 

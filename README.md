@@ -11,7 +11,7 @@ own machine with no account, or on a hosted node over a zero-trust mesh.
 
 [**CLI Docs**](https://knaix.com) &nbsp;·&nbsp; [Website](https://kovalentai.com) &nbsp;·&nbsp; [Platform Docs](https://docs.kovalentai.com) &nbsp;·&nbsp; [Dashboard](https://app.kovalentai.com) &nbsp;·&nbsp; [Changelog](https://knaix.com/docs/changelog)
 
-[![Release](https://img.shields.io/github/v/release/kovalentai/knaix-cli?label=release&color=7C5CFF)](https://github.com/kovalentai/knaix-cli/releases) [![CI](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-64748B)](LICENSE) [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-64748B)](#install)
+[![Release](https://img.shields.io/github/v/release/kovalentai/knaix-cli?label=release&color=7C5CFF)](https://github.com/kovalentai/knaix-cli/releases) [![CI](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-64748B)](LICENSE) [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B)](#install)
 
 </div>
 
@@ -24,14 +24,11 @@ retrieval, reranking and citations run on the node.
 
 ## Install
 
-**Before you install:** the CLI itself is a single binary with no dependencies,
-and everything that talks to a hosted node works with nothing else installed.
-`knaix local` is the exception. It runs the Node Runtime as a container on your
-machine, so it needs **Docker** — Docker Desktop, or any drop-in that provides a
-`docker` command and daemon, such as Colima, Rancher Desktop, or OrbStack. There
-is currently no way to run a local node without one; if that rules your machine
-out, use a hosted node instead. `knaix doctor` reports which of the two paths
-your machine is set up for.
+**Before you install:** the CLI is one binary with no dependencies. Only `knaix
+local` needs more: it runs the node as a container, so it needs Docker Desktop or
+a drop-in such as Colima, Rancher Desktop or OrbStack. A hosted node needs
+nothing beyond this binary, and `knaix doctor` says which of the two your machine
+is set up for.
 
 **Homebrew** (macOS and Linux). Brings `brew upgrade knaix`, `brew uninstall
 knaix`, and shell completions:
@@ -317,7 +314,7 @@ repository and the tag. `knaix verify` pins all three, so a signature made
 anywhere else does not satisfy it.
 
 `cosign` and the GitHub CLI are optional. When they are missing, those checks
-report as **skipped**, with the reason — never as passed. `--strict` turns a
+report as **skipped**, with the reason, never as passed. `--strict` turns a
 check that could not run into a failure, which is what a pipeline wants:
 
 ```bash
@@ -540,8 +537,8 @@ The distinction that matters most in a pipeline is 4 against 3 and 6. A 4 is
 worth retrying, because the far end was not there. A 3 or a 6 is not: the far end
 answered, and said no.
 
-One ending is not in the table. A reader that closes the pipe — `| head`,
-quitting a pager — ends the command with SIGPIPE, which a shell reports as 141.
+One ending is not in the table. A reader that closes the pipe (`| head`, or
+quitting a pager) ends the command with SIGPIPE, which a shell reports as 141.
 That is the Unix convention rather than one of ours, and it is not a failure:
 nothing went wrong, the reader left.
 
