@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.5.1] - 2026-08-04
+
+**If you ran `knaix verify` on v0.5.0, run it again.** It never checked the signature, on any platform.
+
+### Fixed
+
+- **`knaix verify` never checked a signature.** It looked for cosign by running `cosign --version`, and cosign spells that as a subcommand: `cosign --version` exits 1 with `unknown flag`. So the check concluded cosign was missing on every machine that had it, and reported `cosign is not installed, so the signature was not checked` while cosign sat on the PATH. Both spellings are now tried.
+
+  It under-reported rather than over-reported. Nobody was ever told a signature had been verified when it had not, and `--strict` correctly refused to pass, because the check registered as skipped rather than passed. But the check itself did nothing, which on the release that introduced it is the whole point.
+
+  The installers were never affected: `install.sh` finds cosign with `command -v` and `install.ps1` with `Get-Command`, and both are correct. Only `knaix verify` looked the wrong way.
+
 ## [0.5.0] - 2026-08-03
 
 Knaix runs on Windows, and every release can now be checked against the workflow that built it.
