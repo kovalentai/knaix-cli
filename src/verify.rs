@@ -172,14 +172,22 @@ async fn published_digest(version: &str, artifact: &str) -> Result<String> {
 }
 
 /// Whether a helper is on PATH.
+///
+/// Both spellings are tried because the two helpers disagree. `gh --version`
+/// works; `cosign --version` exits 1 with "unknown flag", because cosign spells
+/// it as a subcommand. Asking only the first way reported cosign as missing on
+/// every machine that had it, so the signature check never ran for anyone and
+/// said "cosign is not installed" while it sat on the PATH.
 fn tool_available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    ["--version", "version"].iter().any(|probe| {
+        Command::new(tool)
+            .arg(probe)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 /// A private directory to stage the signature bundle in.
@@ -651,6 +659,21 @@ mod tests {
             "Error: verification failed: certificate identity mismatch"
         ));
         assert!(!no_attestation_published("signature does not match"));
+    }
+
+    /// The regression this exists for: cosign spells its version as a
+    /// subcommand, so probing only `--version` reported it missing on every
+    /// machine that had it, and the signature check never ran.
+    ///
+    /// Uses real binaries rather than a stub. `sh` accepts neither spelling and
+    /// is present everywhere this runs, so it stands in for the shape of tool
+    /// that answers one way and not the other.
+    #[test]
+    fn a_tool_is_found_by_either_spelling() {
+        // Present, and answers at least one probe.
+        assert!(tool_available("cargo"), "cargo should be detected");
+        // Absent entirely.
+        assert!(!tool_available("knaix-no-such-tool-abcdef"));
     }
 
     /// The certificate identity must not match a fork's workflow of the same
