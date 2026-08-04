@@ -19,6 +19,7 @@ mod stdin_arg;
 mod top;
 mod update;
 mod upload_filter;
+mod verify;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -320,6 +321,20 @@ enum Commands {
         /// Read a specific notes file instead of listing them
         #[clap(short, long)]
         file: Option<String>,
+    },
+
+    /// Check that this binary is the one that was published
+    Verify {
+        /// A binary to check instead of the running one (needs --version)
+        path: Option<String>,
+
+        /// The published release to check against
+        #[clap(long)]
+        version: Option<String>,
+
+        /// Fail if any check could not run, instead of reporting it as skipped
+        #[clap(long)]
+        strict: bool,
     },
 
     /// Print the MCP client config that points an editor at a node
@@ -979,6 +994,14 @@ async fn run() -> Result<()> {
         }
         Commands::Mcp { node_id, node } => {
             mcp::run(&ctx, node_id.or(node)).await?;
+        }
+
+        Commands::Verify {
+            path,
+            version,
+            strict,
+        } => {
+            verify::run(&ctx, path, version, strict).await?;
         }
 
         Commands::Memory {

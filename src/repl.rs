@@ -12,9 +12,9 @@ use termimad::MadSkin;
 /// The prompt as rustyline is given it, with no escapes in it.
 ///
 /// The painted version comes back from the highlighter at render time instead
-/// of being passed to `readline()`. Both spellings measure the same today —
+/// of being passed to `readline()`. Both spellings measure the same today
 /// rustyline's width calculation skips escape sequences (`src/tty/mod.rs`,
-/// "ignore ANSI escape sequence") — but `highlight_prompt` is the API built for
+/// ("ignore ANSI escape sequence"), but `highlight_prompt` is the API built for
 /// this, and it keeps the string we measure and the string we print from having
 /// to agree by coincidence.
 fn plain_prompt(node_id: &str) -> String {

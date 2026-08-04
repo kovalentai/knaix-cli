@@ -2,6 +2,34 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.5.0] - 2026-08-03
+
+Knaix runs on Windows, and every release can now be checked against the workflow that built it.
+
+**If you install with `curl … install.sh | sh`, read the Fixed entry.** On a machine with no hashing tool the installer reported a checksum it had not computed.
+
+### Added
+
+- **Windows.** There is a Windows build, installed from PowerShell with `irm https://knaix.com/install.ps1 | iex`. It installs to `%LOCALAPPDATA%\Programs\knaix` and puts that on the user PATH, so it never asks for administrator rights.
+
+  The build is `x86_64-pc-windows-gnu`. Windows on ARM runs it under emulation, and the installer says so rather than refusing a machine that works. `knaix local` needs Docker Desktop, as it does everywhere else. `knaix local connect --daemon` is the one thing that does not work there: it says so plainly instead of failing halfway.
+
+- **`knaix verify`.** Checks that the binary you are running is the one we published. It re-hashes the file and compares it with the digest published for that version, verifies the release signature with cosign, and checks the build attestation with the GitHub CLI.
+
+  A check that could not run is reported as **skipped**, with the reason, and never counted as a pass. cosign and the GitHub CLI are optional, so their absence is stated rather than glossed over. `--strict` turns a check that could not run into a failure, which is what a pipeline wants. Exits 6 when a check fails and, under `--strict`, 7 when one could not run. `-o json` emits the same result as a document.
+
+  With no arguments it checks the running binary against the version it reports, not against the newest release, so deliberately staying on an older version does not read as a failure. Checking some other file needs `--version`, because a file on disk does not say which release it came from and a guess produces a mismatch that looks like tampering.
+
+- **Signed releases and build provenance.** Every published binary now carries a Sigstore signature and a SLSA build attestation. Signing is keyless: the release workflow proves its identity with a short-lived token, so there is no signing key to steal, rotate or expire. The certificate records which workflow, in which repository, at which tag produced the file, and every verification path pins all three. Releases before this one carry neither, so those checks report as skipped against them.
+
+  An SBOM is published with each release.
+
+### Fixed
+
+- **The install script claimed a checksum it had not computed.** On a machine with neither `sha256sum` nor `shasum`, the installer printed `Checksum verified.` and installed the download anyway. It had hashed nothing: the missing-tool branch assigned the expected value to the actual one, so the comparison it printed that line for was between a value and itself.
+
+  It now tries `openssl` as a third option, and if none of the three is present it stops, names them, and installs nothing. An installer that cannot verify a download is not the thing that should decide to go ahead. It also verifies the release signature when cosign is present, and says the signature was not checked when it is absent.
+
 ## [0.4.10] - 2026-08-01
 
 ### Fixed

@@ -17,6 +17,11 @@ on:
 
 permissions:
   contents: write
+  # Signing and attestation are keyless: the workflow proves who it is with a
+  # short-lived OIDC token instead of a stored key, so there is no signing
+  # secret to leak, rotate or expire.
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,7 +58,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: meta
-    # Every target — Linux musl AND macOS — cross-compiles from one x86_64
+    # Every target, Linux musl and macOS alike, cross-compiles from one x86_64
     # Linux runner via cargo-zigbuild, which uses zig as the C/C++ linker.
     # macOS runners bill at 10x Linux, so building the Apple targets natively
     # was by far the most expensive part of a release; zig links Mach-O just
@@ -68,6 +73,13 @@ jobs:
           - aarch64-unknown-linux-musl
           - x86_64-apple-darwin
           - aarch64-apple-darwin
+          # Windows is the gnu target rather than msvc so it cross-compiles from
+          # this same Linux runner: zig supplies the C toolchain that ring needs,
+          # and msvc would mean either a Windows runner at 2x the billing or
+          # shipping Microsoft's CRT headers. Only x86_64 is built; arm64 Windows
+          # runs x86_64 binaries under emulation, and the aarch64 gnullvm target
+          # is not mature enough to hand to users.
+          - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,8 +107,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # Windows builds knaix.exe, and the extension is not decoration: a
+          # file without it will not run.
+          BIN=knaix
+          case "${{ matrix.target }}" in *-windows-*) BIN=knaix.exe ;; esac
           tar -czf "dist/knaix-${{ needs.meta.outputs.tag }}-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" knaix
+            -C "target/${{ matrix.target }}/release" "$BIN"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -129,6 +145,88 @@ jobs:
           sha256sum knaix-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # The bucket serves raw, platform-named binaries, and those are the bytes
+      # the installer downloads and runs. They are unpacked here rather than
+      # during the manual publish step so that the signature and the attestation
+      # below cover exactly what a user ends up executing -- a signature over the
+      # tarball would say nothing about the file extracted from it.
+      - name: Unpack the platform binaries
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          map() { case "$1" in
+            x86_64-apple-darwin) echo darwin-x86_64 ;;
+            aarch64-apple-darwin) echo darwin-arm64 ;;
+            x86_64-unknown-linux-musl) echo linux-x86_64 ;;
+            aarch64-unknown-linux-musl) echo linux-arm64 ;;
+            x86_64-pc-windows-gnu) echo windows-x86_64 ;;
+          esac; }
+          for t in x86_64-apple-darwin aarch64-apple-darwin \
+                   x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                   x86_64-pc-windows-gnu; do
+            plat=$(map "$t")
+            ext=""; case "$t" in *-windows-*) ext=".exe" ;; esac
+            tar xzf "dist/knaix-${TAG}-${t}.tar.gz" -C out
+            mv "out/knaix${ext}" "out/knaix-${plat}${ext}"
+            sha256sum "out/knaix-${plat}${ext}" | awk '{print $1}' \
+              > "out/knaix-${plat}${ext}.sha256"
+          done
+          ls -l out
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless signing. The certificate records which workflow, in which
+      # repository, at which tag produced these bytes, and `knaix verify` pins
+      # all three -- so a signature made anywhere else does not satisfy it.
+      - name: Sign the binaries
+        run: |
+          set -euo pipefail
+          for f in out/knaix-*; do
+            case "$f" in *.sha256|*.cosign.bundle) continue ;; esac
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+          done
+          ls -l out
+
+      # Named one by one rather than globbed: the directory also holds the
+      # sidecars and bundles, and a pattern that tried to exclude them by suffix
+      # would either attest them too or, worse, quietly attest nothing. A listed
+      # path that does not exist fails the release. Note the converse is not
+      # true: adding a platform to the matrix without adding it here attests the
+      # other five and ships the new one unattested, so the check below counts.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            out/knaix-darwin-x86_64
+            out/knaix-darwin-arm64
+            out/knaix-linux-x86_64
+            out/knaix-linux-arm64
+            out/knaix-windows-x86_64.exe
+
+      # The step above attests what it is given, so a platform added to the
+      # matrix and not to that list ships unattested and nothing says so. This
+      # is what says so.
+      - name: Every binary is attested
+        run: |
+          set -euo pipefail
+          ATTESTED=5
+          BUILT=$(find out -type f ! -name '*.sha256' ! -name '*.cosign.bundle' | wc -l | tr -d ' ')
+          if [ "$BUILT" -ne "$ATTESTED" ]; then
+            echo "::error::${BUILT} platform binaries were built but ${ATTESTED} are listed for attestation. Add the new one to the Attest step's subject-path."
+            exit 1
+          fi
+          echo "${BUILT} binaries, all attested."
+
+      - name: Generate an SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: knaix-${{ needs.meta.outputs.tag }}-sbom.spdx.json
+          output-file: dist/knaix-${{ needs.meta.outputs.tag }}-sbom.spdx.json
+
       - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -136,9 +234,9 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$TAG" dist/* out/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" dist/* \
+            gh release create "$TAG" dist/* out/* \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" \
               --generate-notes \
