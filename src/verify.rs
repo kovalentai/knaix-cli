@@ -182,6 +182,29 @@ fn tool_available(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A private directory to stage the signature bundle in.
+///
+/// `create_dir` refuses an existing path, so a name another user has already
+/// taken fails here rather than being followed somewhere we did not intend. The
+/// name carries the pid and a nanosecond clock so repeated runs do not collide
+/// with themselves.
+fn staging_dir() -> Result<PathBuf> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("knaix-verify-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).context("Could not create a directory to stage the signature")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    Ok(dir)
+}
+
 /// Download the signature bundle for an artifact, if one was published.
 async fn fetch_bundle(version: &str, artifact: &str) -> Result<Option<Vec<u8>>> {
     let url = format!("{RELEASES_URL}/v{version}/{artifact}.cosign.bundle");
@@ -298,11 +321,16 @@ async fn run_checks(binary: &Path, version: &str, artifact: &str) -> Result<Vec<
             Outcome::Skipped("cosign is not installed, so the signature was not checked".into())
         }
         (Some(bytes), true) => {
-            let dir = std::env::temp_dir();
+            // Staged in a directory of our own rather than straight into the
+            // temp dir. On Linux that is /tmp, shared and world-writable, and a
+            // predictable name there is a file another user can point somewhere
+            // else with a symlink before we write it. create_dir fails rather
+            // than follows if the path is already taken.
+            let dir = staging_dir()?;
             let path = dir.join(format!("{artifact}.cosign.bundle"));
             std::fs::write(&path, bytes).context("Could not stage the signature bundle")?;
             let outcome = cosign_verify(binary, &path);
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&dir);
             outcome
         }
     };
@@ -375,7 +403,7 @@ pub async fn run(
         print_text(&checks);
     }
 
-    conclude(&checks, strict, json)
+    conclude(&checks, &version, strict, json)
 }
 
 fn print_json(binary: &Path, version: &str, artifact: &str, checks: &[Check]) -> Result<()> {
@@ -425,7 +453,7 @@ fn is_verified(checks: &[Check], strict: bool) -> bool {
 /// `json` suppresses the closing line only: the document already carries
 /// `verified`, and a sentence printed after it would leave stdout unparseable.
 /// Failures still return an error, which is written to stderr.
-fn conclude(checks: &[Check], strict: bool, json: bool) -> Result<()> {
+fn conclude(checks: &[Check], version: &str, strict: bool, json: bool) -> Result<()> {
     let failed: Vec<&Check> = checks
         .iter()
         .filter(|c| matches!(c.outcome, Outcome::Failed(_)))
@@ -433,9 +461,17 @@ fn conclude(checks: &[Check], strict: bool, json: bool) -> Result<()> {
 
     if !failed.is_empty() {
         let names: Vec<&str> = failed.iter().map(|c| c.name).collect();
+        // The build-from-source case reaches here and is not tampering: a local
+        // build is not byte-identical to the published one, so it fails the
+        // checksum honestly. Telling that user their binary is compromised, with
+        // no other explanation offered, is how a check earns a reputation for
+        // crying wolf.
         return Err(anyhow!(
-            "This binary is not the published one: {} failed. Do not run it; \
-             reinstall from https://knaix.com/install.sh and check again.",
+            "This binary is not the one published as v{version}: {} failed.\n\
+             If you built it yourself, that is expected; this command compares \
+             against the released build.\n\
+             If you installed it, do not run it: reinstall from \
+             https://knaix.com/install.sh and check again.",
             names.join(" and ")
         ))
         .coded(Code::Denied);
@@ -543,9 +579,16 @@ mod tests {
     #[test]
     fn a_checksum_mismatch_exits_denied() {
         let checks = vec![check("checksum", Outcome::Failed("differs".into()))];
-        let err = conclude(&checks, false, false).unwrap_err();
+        let err = conclude(&checks, "0.5.0", false, false).unwrap_err();
         assert_eq!(crate::exit::code_of(&err), Code::Denied);
-        assert!(format!("{err}").contains("not the published one"), "{err}");
+
+        let rendered = format!("{err}");
+        assert!(rendered.contains("is not the one published"), "{rendered}");
+        assert!(rendered.contains("checksum"), "{rendered}");
+        // A local build fails this check honestly, so the message has to offer
+        // that reading rather than only the tampering one.
+        assert!(rendered.contains("built it yourself"), "{rendered}");
+        assert!(rendered.contains("do not run it"), "{rendered}");
     }
 
     #[test]
@@ -554,8 +597,8 @@ mod tests {
             check("checksum", Outcome::Passed("matches".into())),
             check("signature", Outcome::Skipped("cosign missing".into())),
         ];
-        assert!(conclude(&checks, false, false).is_ok());
-        let err = conclude(&checks, true, false).unwrap_err();
+        assert!(conclude(&checks, "0.5.0", false, false).is_ok());
+        let err = conclude(&checks, "0.5.0", true, false).unwrap_err();
         assert_eq!(crate::exit::code_of(&err), Code::Precondition);
     }
 
@@ -583,8 +626,8 @@ mod tests {
         ];
         // Nothing to assert on stdout from here, so assert the contract that
         // keeps it clean: json concludes without printing and without failing.
-        assert!(conclude(&checks, false, true).is_ok());
-        assert!(conclude(&checks, true, true).is_err());
+        assert!(conclude(&checks, "0.5.0", false, true).is_ok());
+        assert!(conclude(&checks, "0.5.0", true, true).is_err());
     }
 
     /// A release with no attestation must not be reported as one whose

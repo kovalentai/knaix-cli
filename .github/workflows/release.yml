@@ -191,9 +191,10 @@ jobs:
 
       # Named one by one rather than globbed: the directory also holds the
       # sidecars and bundles, and a pattern that tried to exclude them by suffix
-      # would either attest them too or, worse, quietly attest nothing. Adding a
-      # platform without adding it here fails the release instead of shipping an
-      # unattested binary.
+      # would either attest them too or, worse, quietly attest nothing. A listed
+      # path that does not exist fails the release. Note the converse is not
+      # true: adding a platform to the matrix without adding it here attests the
+      # other five and ships the new one unattested, so the check below counts.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -203,6 +204,20 @@ jobs:
             out/knaix-linux-x86_64
             out/knaix-linux-arm64
             out/knaix-windows-x86_64.exe
+
+      # The step above attests what it is given, so a platform added to the
+      # matrix and not to that list ships unattested and nothing says so. This
+      # is what says so.
+      - name: Every binary is attested
+        run: |
+          set -euo pipefail
+          ATTESTED=5
+          BUILT=$(find out -type f ! -name '*.sha256' ! -name '*.cosign.bundle' | wc -l | tr -d ' ')
+          if [ "$BUILT" -ne "$ATTESTED" ]; then
+            echo "::error::${BUILT} platform binaries were built but ${ATTESTED} are listed for attestation. Add the new one to the Attest step's subject-path."
+            exit 1
+          fi
+          echo "${BUILT} binaries, all attested."
 
       - name: Generate an SBOM
         uses: anchore/sbom-action@v0
