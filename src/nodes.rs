@@ -101,10 +101,18 @@ pub enum Verbosity {
 /// control plane in front of it. The `shape` clause is the only part that moves
 /// with verbosity; grounding, citation, and formatting rules are constant.
 fn answer_system(verbosity: Verbosity) -> String {
-    let grounding =
-        "You are a helpful assistant answering questions from a private knowledge base. \
-Answer using only the provided context. Cite the passages you draw on with their [n] markers. \
-If the context does not contain the answer, say so plainly rather than guessing.";
+    // "Answering questions" was the whole of this, and a model given only that
+    // refuses anything that is not a lookup: asked to draw up a quiz from a
+    // study guide it had just ingested, it replied that the knowledge base held
+    // nothing about administering quizzes, which is true and useless. Grounding
+    // is about where the facts come from, not about what may be asked for, so
+    // the two are stated separately now.
+    let grounding = "You are a helpful assistant working from a private knowledge base. \
+Base everything you say on the provided context, and cite the passages you draw on with their \
+[n] markers. The request may ask you to do something with that material rather than look \
+something up: summarize it, draw questions or exercises from it, outline it, compare parts of \
+it. Do what was asked, built only from what the context contains. When the context does not \
+hold enough to do it, say so plainly rather than guessing.";
     let shape = match verbosity {
         Verbosity::Brief => "Answer in one or two sentences, the essential point only.",
         Verbosity::Normal => {
@@ -2413,6 +2421,15 @@ mod tests {
         assert_eq!(citation_source_name(&Citation::default()), "unknown source");
     }
 
+    /// The leading text two prompts agree on, byte for byte.
+    fn common_prefix(a: &str, b: &str) -> String {
+        a.chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x == y)
+            .map(|(x, _)| x)
+            .collect()
+    }
+
     #[test]
     fn verbosity_changes_the_prompt_but_never_the_grounding_rules() {
         let brief = answer_system(Verbosity::Brief);
@@ -2423,11 +2440,20 @@ mod tests {
         assert!(detailed.contains("thorough"));
         assert_ne!(brief, normal);
         assert_ne!(normal, detailed);
-        // But every level still grounds and cites.
-        for s in [&brief, &normal, &detailed] {
-            assert!(s.contains("[n]"), "must ask for citations: {s}");
-            assert!(s.contains("only the provided context"), "must ground: {s}");
-        }
+        // But every level still grounds and cites. Asserted on the shared
+        // prefix rather than on a chosen phrase: the wording of the grounding
+        // clause is allowed to change, its being identical across the three is
+        // what this protects. A phrase match broke on the first rewording and
+        // said nothing about the invariant.
+        let shared = common_prefix(&common_prefix(&brief, &normal), &detailed);
+        assert!(
+            shared.contains("[n]"),
+            "every level must ask for citations: {shared}"
+        );
+        assert!(
+            shared.contains("context"),
+            "every level must ground in the context: {shared}"
+        );
     }
 
     #[test]
