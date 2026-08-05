@@ -289,9 +289,9 @@ enum Commands {
 
     /// Print the shell integration that paints the knaix wordmark as you type
     ShellInit {
-        /// Shell to generate for
+        /// Shell to generate for (defaults to zsh, the only one supported)
         #[clap(value_enum)]
-        shell: shell::InitShell,
+        shell: Option<shell::InitShell>,
 
         /// Add it to your shell profile, after showing you what will change
         #[clap(long, conflicts_with = "uninstall")]
@@ -304,9 +304,9 @@ enum Commands {
 
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions {
-        /// Shell to generate for
+        /// Shell to generate for (defaults to the shell you are running)
         #[clap(value_enum)]
-        shell: clap_complete::Shell,
+        shell: Option<clap_complete::Shell>,
     },
 
     /// List or read the notes saved with /remember in the REPL
@@ -991,6 +991,9 @@ async fn run() -> Result<()> {
             install,
             uninstall,
         } => {
+            // One shell is supported, so requiring it named was a required
+            // argument with a single legal value. Naming it still works.
+            let init_shell = init_shell.unwrap_or(shell::InitShell::Zsh);
             if uninstall {
                 shell::uninstall(init_shell)?;
             } else if install {
@@ -1004,6 +1007,19 @@ async fn run() -> Result<()> {
         }
 
         Commands::Completions { shell } => {
+            // The shell you are running is the one you almost always want, and
+            // the process already knows it. Naming one still works, and is the
+            // only way to generate for a shell you are not currently in.
+            let shell = match shell.or_else(clap_complete::Shell::from_env) {
+                Some(s) => s,
+                None => {
+                    use crate::exit::WithCode;
+                    return Err(anyhow::anyhow!(
+                        "Could not tell which shell you are running. Name one: knaix completions <bash|zsh|fish|powershell|elvish>"
+                    ))
+                    .coded(exit::Code::Usage);
+                }
+            };
             // Written to stdout so it can be sourced or redirected directly;
             // anything else on stdout here would be sourced as shell code.
             use clap::CommandFactory;
