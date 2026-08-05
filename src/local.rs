@@ -1201,11 +1201,32 @@ async fn warm(node: &LocalNode) -> bool {
 /// The timing is worth printing because it is the wait it just moved off the
 /// first question. A failure is not worth printing: nothing is wrong with the
 /// node, and an alarming line about an optimization would be worse than silence.
+/// A dot per second while the warm-up runs, matching how waiting for the store
+/// to open already reads. Loading a large model's weights is most of this wait,
+/// and it can run to the timeout; an unchanging line for ninety seconds is the
+/// exact thing this command is meant to stop doing.
 async fn warm_up(node: &LocalNode) {
     print!("  Warming the store and model");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let started = std::time::Instant::now();
-    if warm(node).await {
+
+    let mut warming = std::pin::pin!(warm(node));
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+    // The first tick resolves immediately, which would print a dot before any
+    // waiting has happened.
+    ticks.tick().await;
+
+    let warmed = loop {
+        tokio::select! {
+            done = &mut warming => break done,
+            _ = ticks.tick() => {
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    };
+
+    if warmed {
         println!(" ({:.1}s)", started.elapsed().as_secs_f64());
     } else {
         println!();
