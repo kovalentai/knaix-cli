@@ -102,7 +102,10 @@ fn print_help() {
             "Save a fact to this node's notes and ingest it",
         ),
         ("/memory", "List the notes saved for this node"),
-        ("/reset", "Forget the conversation so far and start fresh"),
+        (
+            "/reset",
+            "Start a new conversation; earlier questions leave the context",
+        ),
         (
             "/brief, /normal, /detailed",
             "Set how much detail answers carry (local node)",
@@ -162,6 +165,13 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
     // How much detail answers carry, adjustable mid-session with /brief etc.
     let mut verbosity = crate::nodes::Verbosity::Normal;
+    // The hosted thread this session is in, named by the control plane on the
+    // first answer and sent back with every question after it. Stays None for a
+    // local node, which is kept in context by `history` instead.
+    let mut conversation: Option<String> = None;
+    // Said once per session, so a hosted node that cannot keep a thread is not
+    // silently answering every question as though it were the first.
+    let mut warned_threadless = false;
 
     // The node does not change mid-session, so the prompt is built once.
     let prompt = plain_prompt(node_id);
@@ -202,11 +212,26 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             continue;
                         }
                         "/reset" => {
-                            let had = !history.is_empty();
+                            // Both kinds of context, since which one is in play
+                            // depends on the node and the user asked for neither
+                            // to carry forward. Dropping the id starts a new
+                            // thread; the old one is kept, not deleted.
+                            let had = !history.is_empty() || conversation.is_some();
+                            // A hosted thread is left behind, not deleted, so
+                            // say that rather than "cleared". Someone resetting
+                            // to drop a question would otherwise read this as
+                            // the transcript being gone.
+                            let kept = conversation.is_some();
                             history.clear();
-                            if had {
+                            conversation = None;
+                            if had && kept {
                                 println!(
-                                    "{} Conversation cleared. The next question starts fresh.",
+                                    "{} Starting a new conversation. Earlier questions leave the context; the previous conversation is kept.",
+                                    "✓".green()
+                                );
+                            } else if had {
+                                println!(
+                                    "{} Starting fresh. Earlier questions leave the context.",
                                     "✓".green()
                                 );
                             } else {
@@ -254,6 +279,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                     crate::nodes::Echo::Markdown,
                     &history,
                     verbosity,
+                    conversation.as_deref(),
                 )
                 .await
                 {
@@ -268,6 +294,24 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                     Ok(Some(answer)) => {
                         crate::nodes::print_answer_footer(target, &answer);
                         println!();
+                        // Follow the thread the control plane opened, so the
+                        // next question is answered in the context of this one.
+                        if answer.conversation_id.is_some() {
+                            conversation = answer.conversation_id.clone();
+                        // A turn the control plane could not store. The id in
+                        // hand is kept rather than dropped, because the failure
+                        // is often transient and the next turn resumes the
+                        // thread -- so this says what happened to this answer,
+                        // not that the node keeps no conversations at all.
+                        } else if !target.is_local() && !warned_threadless {
+                            warned_threadless = true;
+                            println!(
+                                "{}",
+                                "That answer was not added to the conversation, so it may not carry into the next question."
+                                    .dimmed()
+                            );
+                            println!();
+                        }
                         // Record the exchange only once it succeeded, so a
                         // failed turn does not poison the context of the next.
                         crate::nodes::record_turn(
