@@ -130,6 +130,38 @@ pub enum Verbosity {
     Detailed,
 }
 
+/// The node's default output ceiling, mirrored here so the CLI can ask for a
+/// share of it. The node clamps whatever arrives to its own configured value,
+/// so asking for more than it allows is safe: the ask is a request, not a
+/// promise, and the node has the last word.
+const NODE_OUTPUT_CEILING: u32 = 1024;
+
+impl Verbosity {
+    /// How many output tokens to ask the node for.
+    ///
+    /// The system prompt asks for a shape and this makes the ask stick. Without
+    /// it a detailed answer is silently cut off at the node's default, which is
+    /// one of the two reasons answers come back shorter than they were asked to
+    /// be; the prompt alone was the other.
+    fn max_tokens(self) -> u32 {
+        match self {
+            Verbosity::Brief => NODE_OUTPUT_CEILING / 4,
+            Verbosity::Normal => NODE_OUTPUT_CEILING,
+            Verbosity::Detailed => NODE_OUTPUT_CEILING * 3,
+        }
+    }
+
+    /// The wire name the control plane reads. A hosted node is prompted there,
+    /// so the level travels rather than the prompt it produces.
+    fn as_str(self) -> &'static str {
+        match self {
+            Verbosity::Brief => "brief",
+            Verbosity::Normal => "normal",
+            Verbosity::Detailed => "detailed",
+        }
+    }
+}
+
 /// The grounding instructions the local node answers under when a command does
 /// not supply its own. The direct `/api/query/answer` route applies no default
 /// of its own, so without this the model is handed an empty system prompt and
@@ -197,6 +229,7 @@ fn build_local_answer_body(
         "query": message,
         "system": answer_system(verbosity),
         "history": history,
+        "max_tokens": verbosity.max_tokens(),
     })
 }
 
@@ -851,9 +884,8 @@ pub async fn chat(
         return chat_local(ctx, base, instance_id, message, echo, history, verbosity).await;
     }
     // The control plane holds the thread and replays it into the prompt, so the
-    // hosted path sends the conversation id rather than the transcript. Its
-    // verbosity is decided there too.
-    let _ = (history, verbosity);
+    // hosted path sends the conversation id rather than the transcript.
+    let _ = history;
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
@@ -869,7 +901,13 @@ pub async fn chat(
     // knows the thread. See `resend_without_conversation`.
     let mut thread = conversation.map(|s| s.to_string());
     let resp = loop {
-        let mut payload = serde_json::json!({ "message": message, "stream": true });
+        let mut payload = serde_json::json!({
+            "message": message,
+            "stream": true,
+            // The level, not a prompt: a hosted node is prompted by the control
+            // plane, which maps this to both a shape and a cap.
+            "verbosity": verbosity.as_str(),
+        });
         if let Some(id) = &thread {
             payload["conversationId"] = serde_json::json!(id);
         }
@@ -2785,6 +2823,41 @@ mod tests {
         let flags = |cs: &[Citation]| cs.iter().map(|c| c.cited).collect::<Vec<_>>();
         assert_eq!(flags(&split), flags(&at_once));
         assert_eq!(flags(&split), vec![Some(false), Some(true)]);
+    }
+
+    /// The prompt asks for a shape; this is what makes the ask stick. Without a
+    /// cap, a detailed answer is cut off at the node's default.
+    #[test]
+    fn a_detailed_answer_is_given_more_room_than_a_brief_one() {
+        assert!(Verbosity::Brief.max_tokens() < Verbosity::Normal.max_tokens());
+        assert!(Verbosity::Detailed.max_tokens() > Verbosity::Normal.max_tokens());
+    }
+
+    /// Normal has to stay exactly the node's own default, so a user who passes
+    /// no flag gets the length they always got.
+    #[test]
+    fn normal_asks_for_the_nodes_own_ceiling() {
+        assert_eq!(Verbosity::Normal.max_tokens(), NODE_OUTPUT_CEILING);
+    }
+
+    #[test]
+    fn the_local_body_carries_the_cap_alongside_the_prompt() {
+        let body = build_local_answer_body("abc", "why?", &[], Verbosity::Detailed);
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(Verbosity::Detailed.max_tokens() as u64)
+        );
+        // Both halves travel: the cap does not replace the shape.
+        assert!(body["system"].as_str().unwrap().contains("thorough answer"));
+    }
+
+    /// The control plane matches on these exact strings, and anything it does
+    /// not recognise silently becomes normal, so a typo here is invisible.
+    #[test]
+    fn the_wire_names_are_the_ones_the_control_plane_reads() {
+        assert_eq!(Verbosity::Brief.as_str(), "brief");
+        assert_eq!(Verbosity::Normal.as_str(), "normal");
+        assert_eq!(Verbosity::Detailed.as_str(), "detailed");
     }
 
     /// A fast answer must not pick up a counter it never needed.
