@@ -7,7 +7,7 @@ use base64::Engine as _;
 use colored::*;
 use crossterm::{cursor, execute};
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::header::AUTHORIZATION;
 use reqwest::multipart;
 use serde::Deserialize;
@@ -749,6 +749,56 @@ pub async fn resolve_node_id(
     select_node_interactively(ctx).await
 }
 
+/// How long a wait has to run before the spinner puts a number on it. Under
+/// this, a count is noise on an answer that is about to arrive anyway.
+const WAITED_AFTER: Duration = Duration::from_secs(5);
+
+/// How the elapsed wait reads once it is worth showing.
+///
+/// Written against a duration rather than the progress state so the thresholds
+/// can be tested without a live bar.
+fn waited_label(elapsed: Duration) -> String {
+    if elapsed < WAITED_AFTER {
+        return String::new();
+    }
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ")
+    } else {
+        format!("{}m{:02}s ", secs / 60, secs % 60)
+    }
+}
+
+/// The spinner both chat paths run behind.
+///
+/// A long generation used to sit on one unchanging line, which reads the same
+/// whether the model is working or the connection has died. Past a few seconds
+/// it counts, so the wait is visibly moving. The count leads the message
+/// because `wide_msg` claims the rest of the line.
+fn chat_spinner(ctx: &KnaixContext) -> ProgressBar {
+    let pb = ctx.spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars(
+                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
+            )
+            // Wide, so a progress line naming several documents is truncated to
+            // the terminal rather than wrapping into the answer below it.
+            .template("{spinner:.cyan} {waited}{wide_msg}")
+            .unwrap()
+            .with_key(
+                "waited",
+                |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let _ = write!(w, "{}", waited_label(state.elapsed()));
+                },
+            ),
+    );
+    // Replaced with the retrieved sources as soon as the `meta` frame lands.
+    pb.set_message("Searching your documents...");
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
 /// Send one message to a node and stream the grounded answer back.
 ///
 /// Talks to the native chat route, where the whole RAG pipeline runs on the
@@ -772,20 +822,7 @@ pub async fn chat(
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
-    let pb = ctx.spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars(
-                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
-            )
-            // Wide, so a progress line naming several documents is truncated to
-            // the terminal rather than wrapping into the answer below it.
-            .template("{spinner:.cyan} {wide_msg}")
-            .unwrap(),
-    );
-    // Replaced with the retrieved sources as soon as the `meta` frame lands.
-    pb.set_message("Searching your documents...");
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let pb = chat_spinner(ctx);
 
     let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
     let payload = serde_json::json!({ "message": message, "stream": true });
@@ -845,20 +882,7 @@ async fn chat_local(
     history: &[ChatTurn],
     verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
-    let pb = ctx.spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars(
-                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
-            )
-            // Wide, so a progress line naming several documents is truncated to
-            // the terminal rather than wrapping into the answer below it.
-            .template("{spinner:.cyan} {wide_msg}")
-            .unwrap(),
-    );
-    // Replaced with the retrieved sources as soon as the `meta` frame lands.
-    pb.set_message("Searching your documents...");
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let pb = chat_spinner(ctx);
 
     let body = build_local_answer_body(instance_id, message, history, verbosity);
 
@@ -2681,6 +2705,30 @@ mod tests {
         let flags = |cs: &[Citation]| cs.iter().map(|c| c.cited).collect::<Vec<_>>();
         assert_eq!(flags(&split), flags(&at_once));
         assert_eq!(flags(&split), vec![Some(false), Some(true)]);
+    }
+
+    /// A fast answer must not pick up a counter it never needed.
+    #[test]
+    fn a_short_wait_is_not_counted() {
+        assert_eq!(waited_label(Duration::from_secs(0)), "");
+        assert_eq!(waited_label(Duration::from_millis(4_999)), "");
+    }
+
+    /// Past the threshold the wait is visibly moving, which is the difference
+    /// between a model working and a connection that has died.
+    #[test]
+    fn a_long_wait_is_counted_in_seconds() {
+        assert_eq!(waited_label(Duration::from_secs(5)), "5s ");
+        assert_eq!(waited_label(Duration::from_secs(59)), "59s ");
+    }
+
+    /// Three digits of seconds is a number the reader has to divide before they
+    /// can react to it.
+    #[test]
+    fn a_wait_past_a_minute_reads_as_minutes() {
+        assert_eq!(waited_label(Duration::from_secs(60)), "1m00s ");
+        assert_eq!(waited_label(Duration::from_secs(125)), "2m05s ");
+        assert_eq!(waited_label(Duration::from_secs(3_600)), "60m00s ");
     }
 
     #[test]
