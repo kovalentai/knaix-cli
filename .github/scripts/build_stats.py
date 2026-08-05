@@ -120,6 +120,10 @@ def main():
             "total": total,
             "unique": deduped,
             "last7d": downloads_7d,
+            # Deduplicated, so it can be compared against a visit count. The
+            # raw last7d cannot: it counts fetches, and a machine that fetches
+            # twice would read as two installs.
+            "unique7d": as_int(w, "unique_7d"),
         },
         "active": {
             "day": as_int(w, "active_1d"),
