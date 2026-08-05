@@ -1,10 +1,20 @@
 name: Download stats
 
 # Counts CLI installs from the releases.knaix.com CloudFront access logs and
-# publishes the result to releases.knaix.com/stats.json, which is the payload
-# behind the shields.io endpoint badge and the download figure on the sites.
+# publishes three payloads:
 #
-# GitHub cannot supply this number: knaix-cli is private, so shields.io reads
+#   stats.json          public, the shields.io badge and the download figure
+#                       on the sites
+#   metrics/metrics.json  private, fleet health: active installs, version
+#                       adoption, platform and channel splits, failure rate
+#   metrics/history.json  private, the daily series behind the trend lines
+#
+# Everything under /metrics/ is behind a shared key checked by a CloudFront
+# Function, because active installs and install-failure rates describe how the
+# product is doing and have no business being served anonymously. The key
+# guards reads only, so this workflow needs no secret to publish.
+#
+# GitHub cannot supply any of this: knaix-cli is private, so shields.io reads
 # neither the repo nor its release assets, and both install paths (install.sh
 # and the Homebrew tap) fetch from S3 rather than GitHub Releases anyway.
 #
@@ -52,59 +62,37 @@ jobs:
           role-to-assume: ${{ vars.AWS_STATS_ROLE_ARN }}
           aws-region: us-west-2
 
-      # A download is a successful GET of a versioned binary. /latest-version
-      # is deliberately excluded: every installed CLI polls it on a timer, so
-      # counting it would measure the installed base's update checks, not
-      # installs. 206 is counted because a resumed download still lands one
-      # copy; the deduplicated figure is what absorbs the double-count.
-      - name: Query Athena
-        id: query
+      # Results are read from the workgroup's S3 output rather than through
+      # get-query-results: the API pages at a thousand rows, and the daily cube
+      # grows without bound as versions accumulate. Reading the CSV also means
+      # a real CSV parser rather than cutting on tabs.
+      - name: Install query helper
         run: |
           set -euo pipefail
+          mkdir -p .stats
 
-          # The counts are filtered to downloads, but the freshness probe
-          # deliberately is not. Freshness has to answer "is CloudFront still
-          # delivering logs", and a quiet week with no installs is not the same
-          # failure as log delivery having stopped. Every installed CLI polls
-          # /latest-version on a timer, so unfiltered traffic keeps flowing as
-          # long as an installed base exists, which makes it the honest probe.
-          SQL=$(cat <<'SQL'
-          SELECT
-            count_if(is_download) AS total,
-            count(DISTINCT if(is_download, dedup_key)) AS deduped,
-            cast(max("date") AS varchar) AS latest
-          FROM (
-            SELECT
-              "date",
-              method = 'GET'
-                AND status IN (200, 206)
-                AND regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux)-(arm64|x86_64)$')
-                AS is_download,
-              concat_ws('|', request_ip, user_agent, cast("date" AS varchar)) AS dedup_key
-            FROM knaix_releases.cloudfront_logs
-          )
-          SQL
-          )
+          cat > .stats/athena.sh <<'HELPER'
+          #!/bin/bash
+          # Runs $1 (a SQL file) and writes the result CSV to $2.
+          set -euo pipefail
 
           QID=$(aws athena start-query-execution \
-            --query-string "$SQL" \
+            --query-string "$(cat "$1")" \
             --work-group "$ATHENA_WORKGROUP" \
             --query QueryExecutionId --output text)
-          echo "Query $QID"
+          echo "Query $QID" >&2
 
+          STATE=RUNNING
           for _ in $(seq 1 60); do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
               --query 'QueryExecution.Status.State' --output text)
             case "$STATE" in
-              SUCCEEDED)
-                break
-                ;;
+              SUCCEEDED) break ;;
               FAILED|CANCELLED)
                 REASON=$(aws athena get-query-execution --query-execution-id "$QID" \
                   --query 'QueryExecution.Status.StateChangeReason' --output text)
                 echo "::error::Athena query $STATE: $REASON"
-                exit 1
-                ;;
+                exit 1 ;;
             esac
             sleep 5
           done
@@ -114,21 +102,135 @@ jobs:
             exit 1
           fi
 
-          # Row 0 is the header; row 1 holds the values, tab separated. A NULL
-          # is omitted from the array rather than returned empty, so an empty
-          # table yields two values instead of three and latest reads empty.
-          # The counts are never NULL, so only the last column can shift.
-          ROW=$(aws athena get-query-results \
-            --query-execution-id "$QID" \
-            --query 'ResultSet.Rows[1].Data[*].VarCharValue' --output text)
-          TOTAL=$(printf '%s' "$ROW" | cut -f1)
-          DEDUPED=$(printf '%s' "$ROW" | cut -f2)
-          LATEST=$(printf '%s' "$ROW" | cut -f3)
+          OUTPUT=$(aws athena get-work-group --work-group "$ATHENA_WORKGROUP" \
+            --query 'WorkGroup.Configuration.ResultConfiguration.OutputLocation' --output text)
+          aws s3 cp "${OUTPUT%/}/${QID}.csv" "$2" >/dev/null
+          HELPER
 
-          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
-          echo "deduped=$DEDUPED" >> "$GITHUB_OUTPUT"
+          chmod +x .stats/athena.sh
+
+      # One scan, every breakdown. Grouping by day as well as by dimension is
+      # what makes this double as the history series, so the trend lines cost
+      # nothing extra.
+      #
+      # A download is a successful GET of a versioned binary, on any of the
+      # three platforms we publish. The .sha256 and .cosign.bundle companions
+      # are excluded by the anchored regex, since fetching a checksum or a
+      # signature is part of one install rather than a second one. The optional
+      # .exe is what admits the Windows build: before it was matched, every
+      # Windows install was invisible to the published figure.
+      #
+      # /latest-version is three populations wearing one URI, and they must not
+      # be added together:
+      #   empty UA   the installed CLI checking in on its daily timer. reqwest
+      #              sends no User-Agent, which is what makes this separable.
+      #   curl UA    install.sh resolving which version to fetch. That is an
+      #              install in progress, not an installed base checking in;
+      #              counting it would roughly double the active figure.
+      #   scripted   the PowerShell installer resolving a version, same as curl.
+      # Only the first is a heartbeat.
+      #
+      # Homebrew's own User-Agent embeds curl/x.y.z, so the Homebrew test has
+      # to come first or every tap install is misfiled as install.sh.
+      - name: Query daily cube
+        run: |
+          set -euo pipefail
+          cat > .stats/cube.sql <<'SQL'
+          WITH classified AS (
+            SELECT
+              "date" AS day,
+              status,
+              uri,
+              user_agent,
+              regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
+              trim(user_agent) IN ('-', '') AS is_silent,
+              concat_ws('|', request_ip, user_agent) AS device
+            FROM knaix_releases.cloudfront_logs
+            WHERE method = 'GET'
+          ),
+          labelled AS (
+            SELECT
+              day,
+              CASE
+                WHEN is_binary AND status IN (200, 206) THEN 'download'
+                WHEN is_binary AND status >= 400 THEN 'failure'
+                WHEN uri = '/latest-version' AND is_silent THEN 'heartbeat'
+                ELSE 'other'
+              END AS kind,
+              COALESCE(regexp_extract(uri, '^/v([0-9]+\.[0-9]+\.[0-9]+)/', 1), '') AS version,
+              COALESCE(regexp_extract(uri, 'knaix-(darwin|linux|windows)-', 1), '') AS os,
+              COALESCE(regexp_extract(uri, 'knaix-(?:darwin|linux|windows)-(arm64|x86_64)(?:\.exe)?$', 1), '') AS arch,
+              CASE
+                WHEN lower(user_agent) LIKE '%homebrew%' THEN 'homebrew'
+                WHEN lower(user_agent) LIKE '%powershell%' THEN 'powershell'
+                WHEN lower(user_agent) LIKE '%curl%' THEN 'install.sh'
+                WHEN is_silent THEN 'cli'
+                ELSE 'other'
+              END AS channel,
+              device
+            FROM classified
+          )
+          SELECT day, kind, version, os, arch, channel,
+                 count(*) AS hits,
+                 count(DISTINCT device) AS devices
+          FROM labelled
+          WHERE kind <> 'other'
+          GROUP BY day, kind, version, os, arch, channel
+          ORDER BY day
+          SQL
+
+          .stats/athena.sh .stats/cube.sql .stats/cube.csv
+          wc -l < .stats/cube.csv | xargs echo "Cube rows:"
+
+      # A second scan rather than a second grouping set. Distinct-device counts
+      # over rolling windows cannot be recovered by summing per-day distincts,
+      # since one machine checking in on Monday and Tuesday is one active
+      # install and not two. The all-time figures are recomputed here too, at
+      # the same grain the badge has always used, so the published number does
+      # not shift underneath the sites.
+      - name: Query rolling windows
+        id: windows
+        run: |
+          set -euo pipefail
+          cat > .stats/windows.sql <<'SQL'
+          WITH classified AS (
+            SELECT
+              "date" AS day,
+              status,
+              uri,
+              user_agent,
+              regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
+              trim(user_agent) IN ('-', '') AS is_silent,
+              concat_ws('|', request_ip, user_agent) AS device,
+              concat_ws('|', request_ip, user_agent, cast("date" AS varchar)) AS dedup_key
+            FROM knaix_releases.cloudfront_logs
+            WHERE method = 'GET'
+          ),
+          flagged AS (
+            SELECT
+              day, device, dedup_key,
+              is_binary AND status IN (200, 206) AS is_download,
+              is_binary AND status >= 400 AS is_failure,
+              uri = '/latest-version' AND is_silent AS is_heartbeat
+            FROM classified
+          )
+          SELECT
+            count_if(is_download) AS total,
+            count(DISTINCT if(is_download, dedup_key)) AS deduped,
+            count(DISTINCT if(is_heartbeat AND day >= current_date - interval '1' day, device)) AS active_1d,
+            count(DISTINCT if(is_heartbeat AND day >= current_date - interval '7' day, device)) AS active_7d,
+            count(DISTINCT if(is_heartbeat AND day >= current_date - interval '30' day, device)) AS active_30d,
+            count_if(is_download AND day >= current_date - interval '7' day) AS downloads_7d,
+            count_if(is_failure AND day >= current_date - interval '7' day) AS failures_7d,
+            cast(max(day) AS varchar) AS latest
+          FROM flagged
+          SQL
+
+          .stats/athena.sh .stats/windows.sql .stats/windows.csv
+
+          LATEST=$(python3 -c "import csv,sys; r=list(csv.DictReader(open('.stats/windows.csv'))); print(r[0]['latest'] if r else '')")
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "Total $TOTAL, deduplicated $DEDUPED, newest log entry ${LATEST:-none}"
+          cat .stats/windows.csv
 
       # Without this, a break in log delivery does not fail. It just stops the
       # number growing, and the badge shows a plausible figure forever. AWS
@@ -136,9 +238,15 @@ jobs:
       # then stop silently, so the stale-but-believable case is the one to
       # engineer against: a wrong number nobody questions beats a broken badge
       # only from the perspective of the badge.
+      #
+      # The probe deliberately reads the newest log line of any kind, not the
+      # newest download. A quiet week with no installs is not the same failure
+      # as log delivery having stopped, and every installed CLI polls
+      # /latest-version on a timer, so traffic keeps flowing as long as an
+      # installed base exists.
       - name: Check log freshness
         env:
-          LATEST: ${{ steps.query.outputs.latest }}
+          LATEST: ${{ steps.windows.outputs.latest }}
           # Entries can arrive up to 24 hours late, so this is two documented
           # delays plus a day, not an SLA.
           MAX_AGE_DAYS: 3
@@ -159,45 +267,8 @@ jobs:
 
           echo "Newest log entry $LATEST, $AGE_DAYS days old."
 
-      # The badge shows the deduplicated count, which is the number that
-      # survives being asked how it was measured. Both are in the file so the
-      # sites can render either without another deploy.
-      - name: Build stats.json
-        env:
-          TOTAL: ${{ steps.query.outputs.total }}
-          DEDUPED: ${{ steps.query.outputs.deduped }}
-        run: |
-          python3 - <<'PY'
-          import json, os, datetime
-
-          total = int(os.environ["TOTAL"])
-          deduped = int(os.environ["DEDUPED"])
-
-          def short(n):
-              if n < 1000:
-                  return str(n)
-              if n < 1_000_000:
-                  k = n / 1000
-                  return f"{k:.1f}k" if k < 10 else f"{k:.0f}k"
-              m = n / 1_000_000
-              return f"{m:.1f}M" if m < 10 else f"{m:.0f}M"
-
-          payload = {
-              "schemaVersion": 1,
-              "label": "downloads",
-              "message": short(deduped),
-              "color": "7C5CFF",
-              "total": total,
-              "unique": deduped,
-              "updated": datetime.datetime.now(datetime.timezone.utc)
-                             .strftime("%Y-%m-%dT%H:%M:%SZ"),
-          }
-          with open("stats.json", "w") as f:
-              json.dump(payload, f)
-              f.write("\n")
-          PY
-
-          cat stats.json
+      - name: Build payloads
+        run: python3 .github/scripts/build_stats.py .stats/cube.csv .stats/windows.csv .stats
 
       - name: Publish
         env:
@@ -205,24 +276,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          aws s3api put-object \
-            --bucket "$RELEASES_BUCKET" \
-            --key stats.json \
-            --body stats.json \
-            --content-type application/json \
-            --cache-control 'public, max-age=300' > /dev/null
+          put() {
+            aws s3api put-object \
+              --bucket "$RELEASES_BUCKET" \
+              --key "$1" \
+              --body "$2" \
+              --content-type application/json \
+              --cache-control 'public, max-age=300' > /dev/null
+          }
+
+          put stats.json .stats/stats.json
+          put metrics/metrics.json .stats/metrics.json
+          put metrics/history.json .stats/history.json
 
           aws cloudfront create-invalidation \
             --distribution-id "$DISTRIBUTION_ID" \
-            --paths /stats.json > /dev/null
+            --paths /stats.json '/metrics/*' > /dev/null
 
       - name: Summary
-        run: |
-          {
-            echo "### Knaix CLI downloads"
-            echo
-            echo "- Total requests: ${{ steps.query.outputs.total }}"
-            echo "- Deduplicated: ${{ steps.query.outputs.deduped }}"
-            echo
-            echo "Published to https://releases.knaix.com/stats.json"
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: python3 .github/scripts/summarize_stats.py .stats/metrics.json >> "$GITHUB_STEP_SUMMARY"
