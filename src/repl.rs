@@ -298,11 +298,16 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                         // next question is answered in the context of this one.
                         if answer.conversation_id.is_some() {
                             conversation = answer.conversation_id.clone();
+                        // A turn the control plane could not store. The id in
+                        // hand is kept rather than dropped, because the failure
+                        // is often transient and the next turn resumes the
+                        // thread -- so this says what happened to this answer,
+                        // not that the node keeps no conversations at all.
                         } else if !target.is_local() && !warned_threadless {
                             warned_threadless = true;
                             println!(
                                 "{}",
-                                "This node is not keeping the conversation, so each question is answered on its own."
+                                "That answer was not added to the conversation, so it may not carry into the next question."
                                     .dimmed()
                             );
                             println!();
