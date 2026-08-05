@@ -130,11 +130,19 @@ pub enum Verbosity {
     Detailed,
 }
 
-/// The node's default output ceiling, mirrored here so the CLI can ask for a
-/// share of it. The node clamps whatever arrives to its own configured value,
-/// so asking for more than it allows is safe: the ask is a request, not a
-/// promise, and the node has the last word.
+/// What the CLI calls a normal answer, and the node's own default ceiling.
 const NODE_OUTPUT_CEILING: u32 = 1024;
+
+/// The most any level asks for, and what `knaix local up` raises the node's
+/// ceiling to.
+///
+/// The node clamps every answer to its configured ceiling, whose default is the
+/// same 1024 as a normal answer. Left alone, a detailed answer was clamped
+/// straight back to a normal one and the flag did nothing. Raising the ceiling
+/// to the largest ask puts the limiting back in the per-question `max_tokens`,
+/// where the flag can reach it. A hosted node is configured by the control
+/// plane, so this applies only to the node the CLI starts.
+pub const MAX_ANSWER_TOKENS: u32 = NODE_OUTPUT_CEILING * 3;
 
 impl Verbosity {
     /// How many output tokens to ask the node for.
@@ -147,7 +155,7 @@ impl Verbosity {
         match self {
             Verbosity::Brief => NODE_OUTPUT_CEILING / 4,
             Verbosity::Normal => NODE_OUTPUT_CEILING,
-            Verbosity::Detailed => NODE_OUTPUT_CEILING * 3,
+            Verbosity::Detailed => MAX_ANSWER_TOKENS,
         }
     }
 
@@ -2838,6 +2846,19 @@ mod tests {
     #[test]
     fn normal_asks_for_the_nodes_own_ceiling() {
         assert_eq!(Verbosity::Normal.max_tokens(), NODE_OUTPUT_CEILING);
+    }
+
+    /// The node clamps to the ceiling `local up` gives it, so a level asking for
+    /// more than that is clamped back and the flag does nothing. This is the
+    /// pairing that keeps detailed reachable.
+    #[test]
+    fn no_level_asks_for_more_than_the_node_is_started_with() {
+        for level in [Verbosity::Brief, Verbosity::Normal, Verbosity::Detailed] {
+            assert!(
+                level.max_tokens() <= MAX_ANSWER_TOKENS,
+                "{level:?} asks past the ceiling local up sets"
+            );
+        }
     }
 
     #[test]
