@@ -71,6 +71,28 @@ pub struct ChatAnswer {
     pub first_token_ms: Option<u128>,
 }
 
+/// What a caller wants done with the tokens as they arrive.
+///
+/// A bool could say "print" but not how, which left the REPL choosing between
+/// streaming raw and rendering markdown at the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Echo {
+    /// Accumulate silently; the caller prints the finished answer, or nothing.
+    Silent,
+    /// Print each token as it arrives. The only shape safe to pipe: no escapes
+    /// are added that were not in the answer.
+    Raw,
+    /// Render markdown progressively, a line or a fenced block at a time.
+    Markdown,
+}
+
+impl Echo {
+    /// Whether anything is printed as the answer arrives.
+    fn prints(self) -> bool {
+        self != Echo::Silent
+    }
+}
+
 /// One prior turn of a conversation, sent to the local node so a follow-up
 /// ("what about the exceptions?") is answered in the context of what came
 /// before rather than as a fresh, contextless question.
@@ -736,21 +758,12 @@ pub async fn chat(
     ctx: &KnaixContext,
     target: &Target,
     message: &str,
-    stream_to_stdout: bool,
+    echo: Echo,
     history: &[ChatTurn],
     verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
-        return chat_local(
-            ctx,
-            base,
-            instance_id,
-            message,
-            stream_to_stdout,
-            history,
-            verbosity,
-        )
-        .await;
+        return chat_local(ctx, base, instance_id, message, echo, history, verbosity).await;
     }
     // The hosted path is prompted and, where supported, kept in session by the
     // control plane; the history and verbosity that shape the local node's
@@ -765,10 +778,13 @@ pub async fn chat(
             .tick_chars(
                 "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
             )
-            .template("{spinner:.cyan} {msg}")
+            // Wide, so a progress line naming several documents is truncated to
+            // the terminal rather than wrapping into the answer below it.
+            .template("{spinner:.cyan} {wide_msg}")
             .unwrap(),
     );
-    pb.set_message("Thinking...");
+    // Replaced with the retrieved sources as soon as the `meta` frame lands.
+    pb.set_message("Searching your documents...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
@@ -800,9 +816,9 @@ pub async fn chat(
     }
 
     let (text, citations, model, first_token_ms) =
-        read_chat_stream(resp, &pb, stream_to_stdout, asked_at).await?;
+        read_chat_stream(resp, &pb, echo, asked_at).await?;
 
-    if stream_to_stdout {
+    if echo.prints() {
         print_citations(&citations);
     }
 
@@ -825,7 +841,7 @@ async fn chat_local(
     base: &str,
     instance_id: &str,
     message: &str,
-    print: bool,
+    echo: Echo,
     history: &[ChatTurn],
     verbosity: Verbosity,
 ) -> Result<Option<ChatAnswer>> {
@@ -835,10 +851,13 @@ async fn chat_local(
             .tick_chars(
                 "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
             )
-            .template("{spinner:.cyan} {msg}")
+            // Wide, so a progress line naming several documents is truncated to
+            // the terminal rather than wrapping into the answer below it.
+            .template("{spinner:.cyan} {wide_msg}")
             .unwrap(),
     );
-    pb.set_message("Thinking...");
+    // Replaced with the retrieved sources as soon as the `meta` frame lands.
+    pb.set_message("Searching your documents...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let body = build_local_answer_body(instance_id, message, history, verbosity);
@@ -862,7 +881,7 @@ async fn chat_local(
     // against an older local node, answer through the blocking endpoint it does
     // have: the reserved `local` node upgrades on its own schedule, not the CLI's.
     if matches!(resp.status().as_u16(), 404 | 405) {
-        return chat_local_blocking(ctx, base, &body, &pb, print).await;
+        return chat_local_blocking(ctx, base, &body, &pb, echo).await;
     }
 
     // Any other non-2xx never reaches the event stream: it is a normal JSON body.
@@ -883,7 +902,7 @@ async fn chat_local(
     }
 
     let (text, citations, model, first_token_ms) =
-        read_local_answer_stream(resp, &pb, print, asked_at).await?;
+        read_local_answer_stream(resp, &pb, echo, asked_at).await?;
 
     Ok(Some(ChatAnswer {
         text,
@@ -903,7 +922,7 @@ async fn chat_local_blocking(
     base: &str,
     body: &serde_json::Value,
     pb: &ProgressBar,
-    print: bool,
+    echo: Echo,
 ) -> Result<Option<ChatAnswer>> {
     let resp = ctx
         .client
@@ -937,8 +956,18 @@ async fn chat_local_blocking(
     let citations = node_citations(&body["citations"], &text);
     let model = body["model"].as_str().map(|s| s.to_string());
 
-    if print {
-        println!("{} {}", "AI:".cyan().bold(), text);
+    // Nothing streamed, so there is no progressive rendering to do; the answer
+    // is printed the way this echo mode would have assembled it.
+    match echo {
+        Echo::Markdown => {
+            let mut md = crate::markdown::MarkdownStream::new();
+            md.push(&text);
+            md.finish();
+        }
+        Echo::Raw => println!("{} {}", "AI:".cyan().bold(), text),
+        Echo::Silent => {}
+    }
+    if echo.prints() {
         print_citations(&citations);
     }
 
@@ -965,14 +994,15 @@ async fn chat_local_blocking(
 async fn read_local_answer_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
-    print: bool,
+    echo: Echo,
     asked_at: std::time::Instant,
 ) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
-    let mut raw_citations = serde_json::Value::Null;
+    let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
+    let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
     let mut event = String::new();
     let mut first_token = true;
     let mut first_token_ms: Option<u128> = None;
@@ -1001,8 +1031,12 @@ async fn read_local_answer_stream(
 
             match event.as_str() {
                 "meta" => {
-                    raw_citations = parsed["citations"].clone();
+                    // Parsed here rather than at the end so the sources can be
+                    // named while the model is still generating; which of them
+                    // the answer used is stamped on once it is complete.
+                    citations = parse_node_citations(&parsed["citations"]);
                     model = parsed["model"].as_str().map(|s| s.to_string());
+                    pb.set_message(retrieval_progress(&citations));
                 }
                 "error" => {
                     stream_error = Some(
@@ -1016,15 +1050,24 @@ async fn read_local_answer_stream(
                 "done" => {}
                 _ => {
                     if let Some(token) = parsed["token"].as_str() {
-                        if print {
-                            // Clear the spinner only once the first token is in
-                            // hand, so the line it occupied is reused.
-                            if first_token {
-                                pb.finish_and_clear();
+                        // Clear the spinner only once the first token is in
+                        // hand, so the line it occupied is reused.
+                        if first_token && echo.prints() {
+                            pb.finish_and_clear();
+                            // The markdown renderer owns whole lines, so a
+                            // prefix on the first one would only misalign the
+                            // rest of the answer under it.
+                            if echo == Echo::Raw {
                                 print!("{} ", "AI:".cyan().bold());
                             }
-                            print!("{}", token);
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        match &mut markdown {
+                            Some(md) => md.push(token),
+                            None if echo == Echo::Raw => {
+                                print!("{}", token);
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                            None => {}
                         }
                         if first_token {
                             first_token_ms = Some(asked_at.elapsed().as_millis());
@@ -1041,7 +1084,9 @@ async fn read_local_answer_stream(
     }
 
     pb.finish_and_clear();
-    if print && !first_token {
+    if let Some(md) = &mut markdown {
+        md.finish();
+    } else if echo == Echo::Raw && !first_token {
         println!();
     }
 
@@ -1049,8 +1094,8 @@ async fn read_local_answer_stream(
         return Err(anyhow!("Local node could not answer: {}", code));
     }
 
-    let citations = node_citations(&raw_citations, &answer);
-    if print {
+    stamp_cited(&mut citations, &answer);
+    if echo.prints() {
         print_citations(&citations);
     }
     Ok((answer, citations, model, first_token_ms))
@@ -1065,23 +1110,44 @@ async fn read_local_answer_stream(
 /// answer never referenced is context the model saw, not a source it cited, and
 /// showing the two alike would overstate what the answer rests on.
 fn node_citations(raw: &serde_json::Value, answer: &str) -> Vec<Citation> {
-    let referenced = referenced_indexes(answer);
+    let mut citations = parse_node_citations(raw);
+    stamp_cited(&mut citations, answer);
+    citations
+}
+
+/// The passages the node retrieved, before anything is known about which of
+/// them the answer used.
+///
+/// Split out because the `meta` frame arrives before the first token, so the
+/// sources can be named while the model is still generating. `cited` stays
+/// false until the answer can settle it.
+fn parse_node_citations(raw: &serde_json::Value) -> Vec<Citation> {
     raw.as_array()
         .map(|items| {
             items
                 .iter()
-                .map(|c| {
-                    let index = c["index"].as_u64().map(|n| n as u32);
-                    Citation {
-                        index,
-                        content: c["content"].as_str().map(|s| s.to_string()),
-                        source: serde_json::from_value(c["metadata"]["source"].clone()).ok(),
-                        cited: Some(index.map(|i| referenced.contains(&i)).unwrap_or(false)),
-                    }
+                .map(|c| Citation {
+                    index: c["index"].as_u64().map(|n| n as u32),
+                    content: c["content"].as_str().map(|s| s.to_string()),
+                    source: serde_json::from_value(c["metadata"]["source"].clone()).ok(),
+                    cited: Some(false),
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Mark the passages whose `[n]` markers appear in the finished answer.
+fn stamp_cited(citations: &mut [Citation], answer: &str) {
+    let referenced = referenced_indexes(answer);
+    for citation in citations.iter_mut() {
+        citation.cited = Some(
+            citation
+                .index
+                .map(|i| referenced.contains(&i))
+                .unwrap_or(false),
+        );
+    }
 }
 
 /// The citation markers an answer actually used, as in "... [1] ... [3]".
@@ -1120,7 +1186,7 @@ fn referenced_indexes(answer: &str) -> Vec<u32> {
 async fn read_chat_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
-    stream_to_stdout: bool,
+    echo: Echo,
     asked_at: std::time::Instant,
 ) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
     let mut stream = resp.bytes_stream();
@@ -1128,6 +1194,7 @@ async fn read_chat_stream(
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
+    let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
     // Which citations the answer actually referenced. It arrives at the end, in
     // the `done` frame, rather than on the citations themselves.
     let mut cited_indexes: Vec<u32> = Vec::new();
@@ -1162,6 +1229,9 @@ async fn read_chat_stream(
                     citations =
                         serde_json::from_value(parsed["citations"].clone()).unwrap_or_default();
                     model = parsed["model"].as_str().map(|s| s.to_string());
+                    // Retrieval is done; the rest of the wait is the model. Say
+                    // what it found rather than leaving "Thinking..." up.
+                    pb.set_message(retrieval_progress(&citations));
                 }
                 "error" => {
                     stream_error = Some(
@@ -1183,15 +1253,24 @@ async fn read_chat_stream(
                 }
                 _ => {
                     if let Some(token) = parsed["token"].as_str() {
-                        if stream_to_stdout {
-                            // Clear the spinner only once the first token is in
-                            // hand, so the line it occupied is reused.
-                            if first_token {
-                                pb.finish_and_clear();
+                        // Clear the spinner only once the first token is in
+                        // hand, so the line it occupied is reused.
+                        if first_token && echo.prints() {
+                            pb.finish_and_clear();
+                            // The markdown renderer owns whole lines, so a
+                            // prefix on the first one would only misalign the
+                            // rest of the answer under it.
+                            if echo == Echo::Raw {
                                 print!("{} ", "AI:".cyan().bold());
                             }
-                            print!("{}", token);
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        match &mut markdown {
+                            Some(md) => md.push(token),
+                            None if echo == Echo::Raw => {
+                                print!("{}", token);
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                            None => {}
                         }
                         if first_token {
                             first_token_ms = Some(asked_at.elapsed().as_millis());
@@ -1209,7 +1288,9 @@ async fn read_chat_stream(
     }
 
     pb.finish_and_clear();
-    if stream_to_stdout && !first_token {
+    if let Some(md) = &mut markdown {
+        md.finish();
+    } else if echo == Echo::Raw && !first_token {
         println!();
     }
 
@@ -1300,6 +1381,52 @@ fn citation_source_name(citation: &Citation) -> String {
     } else {
         raw
     }
+}
+
+/// How many source names the progress line lists before summarising the rest.
+/// Two fits a narrow terminal; past that the names stop being the useful part.
+const PROGRESS_SOURCES: usize = 2;
+
+/// The progress line shown once retrieval lands and generation begins.
+///
+/// Both answer streams send the citations before the first token, so the wait
+/// for the model is time we can already say something about. Naming the
+/// documents turns it into evidence that retrieval found the right ones.
+fn retrieval_progress(citations: &[Citation]) -> String {
+    if citations.is_empty() {
+        // Not a failure: the model is told to say it lacks the answer. Saying so
+        // now explains an "I don't have that" that is still seconds away.
+        return "No matching passages found; answering without context...".to_string();
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for citation in citations {
+        let name = citation_source_name(citation);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    let passages = if citations.len() == 1 {
+        "1 passage".to_string()
+    } else {
+        format!("{} passages", citations.len())
+    };
+
+    let shown = names
+        .iter()
+        .take(PROGRESS_SOURCES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = names.len().saturating_sub(PROGRESS_SOURCES);
+    let sources = if rest > 0 {
+        format!("{} and {} more", shown, rest)
+    } else {
+        shown
+    };
+
+    format!("Reading {} from {}...", passages, sources)
 }
 
 /// Render the passages an answer was grounded in, so a claim can be checked
@@ -2515,6 +2642,109 @@ mod tests {
         assert_eq!(cites[0].cited, Some(true));
         // Retrieved but never referenced: context, not a source.
         assert_eq!(cites[1].cited, Some(false));
+    }
+
+    /// The progress line is built from the `meta` frame, which lands before a
+    /// single token of the answer does. Nothing may be claimed there that is
+    /// only knowable afterwards -- above all not which passages were cited.
+    #[test]
+    fn sources_are_named_from_meta_before_the_answer_exists() {
+        let raw = serde_json::json!([
+            { "index": 1, "content": "p", "metadata": { "source": { "name": "a.md" } } },
+            { "index": 2, "content": "q", "metadata": { "source": { "name": "b.md" } } }
+        ]);
+        let parsed = parse_node_citations(&raw);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].source.as_ref().unwrap().name.as_deref(),
+            Some("a.md")
+        );
+        // Unknowable this early, so claimed for nothing.
+        assert!(parsed.iter().all(|c| c.cited == Some(false)));
+    }
+
+    /// Parsing early and stamping late has to land where parsing late did, or
+    /// the local path's citations would differ from the blocking path's.
+    #[test]
+    fn parsing_early_and_stamping_late_matches_doing_both_at_the_end() {
+        let raw = serde_json::json!([
+            { "index": 1, "content": "p", "metadata": { "source": { "name": "a.md" } } },
+            { "index": 2, "content": "q", "metadata": { "source": { "name": "b.md" } } }
+        ]);
+        let answer = "Grounded in [2].";
+
+        let mut split = parse_node_citations(&raw);
+        stamp_cited(&mut split, answer);
+        let at_once = node_citations(&raw, answer);
+
+        let flags = |cs: &[Citation]| cs.iter().map(|c| c.cited).collect::<Vec<_>>();
+        assert_eq!(flags(&split), flags(&at_once));
+        assert_eq!(flags(&split), vec![Some(false), Some(true)]);
+    }
+
+    #[test]
+    fn the_progress_line_names_the_documents_retrieval_found() {
+        let cites = vec![citation_named("Handbook.md"), citation_named("Refunds.md")];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 2 passages from Handbook.md, Refunds.md..."
+        );
+    }
+
+    #[test]
+    fn one_passage_is_not_pluralised() {
+        assert_eq!(
+            retrieval_progress(&[citation_named("Handbook.md")]),
+            "Reading 1 passage from Handbook.md..."
+        );
+    }
+
+    /// Several passages from one document are one source to a reader.
+    #[test]
+    fn repeated_sources_are_named_once() {
+        let cites = vec![citation_named("Handbook.md"), citation_named("Handbook.md")];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 2 passages from Handbook.md..."
+        );
+    }
+
+    /// A long list would push the spinner past the width of a terminal, and the
+    /// names stop being the useful part well before that.
+    #[test]
+    fn a_long_source_list_is_summarised() {
+        let cites = vec![
+            citation_named("a.md"),
+            citation_named("b.md"),
+            citation_named("c.md"),
+            citation_named("d.md"),
+        ];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 4 passages from a.md, b.md and 2 more..."
+        );
+    }
+
+    /// Retrieval finding nothing is not an error, but it does decide the answer
+    /// that is still seconds away; saying so early explains it.
+    #[test]
+    fn an_empty_retrieval_says_so_rather_than_naming_nothing() {
+        assert_eq!(
+            retrieval_progress(&[]),
+            "No matching passages found; answering without context..."
+        );
+    }
+
+    /// The progress line goes through the same naming as the citation list, so
+    /// a saved note is not shown by its internal filename here either.
+    #[test]
+    fn a_remember_note_is_named_the_same_way_in_progress() {
+        let cites = vec![citation_named(NOTES_FILE)];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 1 passage from your saved note (/remember)..."
+        );
     }
 
     #[test]
