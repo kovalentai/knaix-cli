@@ -48,6 +48,10 @@ jobs:
     name: Count and publish
     runs-on: ubuntu-latest
     steps:
+      # The payload builders live in .github/scripts, so unlike the original
+      # all-inline version this job needs the repository on disk.
+      - uses: actions/checkout@v4
+
       - name: Check required variables
         env:
           ROLE_ARN: ${{ vars.AWS_STATS_ROLE_ARN }}
