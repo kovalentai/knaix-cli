@@ -466,6 +466,26 @@ async fn main() -> std::process::ExitCode {
                     exit::Code::Unavailable | exit::Code::Auth | exit::Code::Precondition
                 )
             {
+                // A running local node is the more useful thing to say than
+                // "run doctor", because it is an answer rather than another
+                // diagnosis: the command that just failed to reach the control
+                // plane would have worked against the node on this machine.
+                // Probed with a short deadline, since this is the error path and
+                // nothing here is worth hanging on.
+                let local_up = code == exit::Code::Unavailable
+                    && local::summarize_within(std::time::Duration::from_millis(400)).state
+                        == "running";
+                if local_up {
+                    eprintln!(
+                        "\n  {} A local node is running on this machine.",
+                        "Note:".blue()
+                    );
+                    eprintln!(
+                        "        Add {} to reach it, or run {} to make it the default.",
+                        "-n local".cyan(),
+                        brand::cmd("use local")
+                    );
+                }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",
                     brand::cmd("doctor")
