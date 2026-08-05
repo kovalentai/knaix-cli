@@ -225,6 +225,10 @@ jobs:
             count(DISTINCT if(is_heartbeat AND day >= current_date - interval '7' day, device)) AS active_7d,
             count(DISTINCT if(is_heartbeat AND day >= current_date - interval '30' day, device)) AS active_30d,
             count_if(is_download AND day >= current_date - interval '7' day) AS downloads_7d,
+            -- Deduplicated at the same grain as the all-time figure, so it can
+            -- be divided by a visit count without one machine fetching twice
+            -- reading as two installs.
+            count(DISTINCT if(is_download AND day >= current_date - interval '7' day, dedup_key)) AS unique_7d,
             count_if(is_failure AND day >= current_date - interval '7' day) AS failures_7d,
             cast(max(day) AS varchar) AS latest
           FROM flagged
