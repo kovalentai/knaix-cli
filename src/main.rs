@@ -6,6 +6,7 @@ mod doctor;
 mod exit;
 mod local;
 mod login;
+mod markdown;
 mod mcp;
 mod model_server;
 mod nodes;
@@ -689,12 +690,15 @@ async fn run() -> Result<()> {
                 }
                 if ctx.output_format == "json" {
                     if let Some(answer) =
-                        nodes::chat(&ctx, &target, &message, false, &[], verbosity).await?
+                        nodes::chat(&ctx, &target, &message, nodes::Echo::Silent, &[], verbosity)
+                            .await?
                     {
                         nodes::print_answer_json(&answer)?;
                     }
+                // Raw rather than markdown: this is the output people pipe, and
+                // it must stay the text the node sent.
                 } else if let Some(answer) =
-                    nodes::chat(&ctx, &target, &message, true, &[], verbosity).await?
+                    nodes::chat(&ctx, &target, &message, nodes::Echo::Raw, &[], verbosity).await?
                 {
                     nodes::print_answer_footer(&target, &answer);
                 }

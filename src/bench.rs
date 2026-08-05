@@ -387,19 +387,26 @@ async fn measure_answers(
         }
         let started = Instant::now();
         // No history and default verbosity, so every run asks for the same work.
-        let answer = crate::nodes::chat(ctx, target, QUESTION, false, &[], Verbosity::Normal)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("429") {
-                    anyhow!(
-                        "Rate limited part-way through the benchmark. A run spends one request per \
+        let answer = crate::nodes::chat(
+            ctx,
+            target,
+            QUESTION,
+            crate::nodes::Echo::Silent,
+            &[],
+            Verbosity::Normal,
+        )
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("429") {
+                anyhow!(
+                    "Rate limited part-way through the benchmark. A run spends one request per \
                          answer; wait for the window to reset, or lower --runs."
-                    )
-                } else {
-                    e
-                }
-            })?
-            .ok_or_else(|| anyhow!("The node returned no answer on run {}", i + 1))?;
+                )
+            } else {
+                e
+            }
+        })?
+        .ok_or_else(|| anyhow!("The node returned no answer on run {}", i + 1))?;
 
         total_ms.push(started.elapsed().as_millis());
         if let Some(ms) = answer.first_token_ms {
