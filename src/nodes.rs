@@ -69,6 +69,21 @@ pub struct ChatAnswer {
     /// only way to tell a slow knowledge base from a slow model, which is what
     /// `knaix bench` reports. Absent when the answer did not stream.
     pub first_token_ms: Option<u128>,
+    /// The thread this answer belongs to, for a hosted node. Sent back with the
+    /// next question so the control plane answers it in context. Absent for a
+    /// local node, which has no control plane to keep the thread, and absent
+    /// when the control plane could not open one.
+    pub conversation_id: Option<String>,
+}
+
+/// What one answer stream produced. A struct rather than a tuple because both
+/// readers return it and it now carries five things.
+struct StreamOutcome {
+    text: String,
+    citations: Vec<Citation>,
+    model: Option<String>,
+    first_token_ms: Option<u128>,
+    conversation_id: Option<String>,
 }
 
 /// What a caller wants done with the tokens as they arrive.
@@ -799,6 +814,22 @@ fn chat_spinner(ctx: &KnaixContext) -> ProgressBar {
     pb
 }
 
+/// Whether a failed question is worth asking again without its thread.
+///
+/// A conversation can go away underneath a session: deleted from the dashboard,
+/// or opened against a node the caller has since lost. The control plane answers
+/// 404 for that, and it answers 404 for a missing node too, so the body has to
+/// distinguish them. Retrying blind would cost a second request on every 404;
+/// ending the session on a thread the user never mentioned would be worse.
+fn resend_without_conversation(status: u16, body: &serde_json::Value, sent_one: bool) -> bool {
+    if status != 404 || !sent_one {
+        return false;
+    }
+    body["error"]
+        .as_str()
+        .is_some_and(|e| e.to_ascii_lowercase().contains("conversation"))
+}
+
 /// Send one message to a node and stream the grounded answer back.
 ///
 /// Talks to the native chat route, where the whole RAG pipeline runs on the
@@ -811,13 +842,17 @@ pub async fn chat(
     echo: Echo,
     history: &[ChatTurn],
     verbosity: Verbosity,
+    conversation: Option<&str>,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
+        // A local node has no control plane to hold a thread, so its context is
+        // the history the caller replays.
+        let _ = conversation;
         return chat_local(ctx, base, instance_id, message, echo, history, verbosity).await;
     }
-    // The hosted path is prompted and, where supported, kept in session by the
-    // control plane; the history and verbosity that shape the local node's
-    // system prompt do not apply to it.
+    // The control plane holds the thread and replays it into the prompt, so the
+    // hosted path sends the conversation id rather than the transcript. Its
+    // verbosity is decided there too.
     let _ = (history, verbosity);
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
@@ -825,35 +860,58 @@ pub async fn chat(
     let pb = chat_spinner(ctx);
 
     let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
-    let payload = serde_json::json!({ "message": message, "stream": true });
 
     // Timed from before the request leaves, so time-to-first-token covers the
     // whole wait a person actually sits through, not just the node's share.
     let asked_at = std::time::Instant::now();
-    let resp = ctx
-        .client
-        .post(&url)
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        // An answer takes as long as the model takes; the client default that
-        // protects quick lookups would cut off a long generation mid-stream.
-        .timeout(Duration::from_secs(300))
-        .json(&payload)
-        .send()
-        .await
-        .inspect_err(|_| pb.finish_and_clear())
-        .context("Networking error during chat request")?;
 
-    if !resp.status().is_success() {
-        pb.finish_and_clear();
+    // Sent with the question, and dropped once if the control plane no longer
+    // knows the thread. See `resend_without_conversation`.
+    let mut thread = conversation.map(|s| s.to_string());
+    let resp = loop {
+        let mut payload = serde_json::json!({ "message": message, "stream": true });
+        if let Some(id) = &thread {
+            payload["conversationId"] = serde_json::json!(id);
+        }
+
+        let resp = ctx
+            .client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            // An answer takes as long as the model takes; the client default
+            // that protects quick lookups would cut off a long generation
+            // mid-stream.
+            .timeout(Duration::from_secs(300))
+            .json(&payload)
+            .send()
+            .await
+            .inspect_err(|_| pb.finish_and_clear())
+            .context("Networking error during chat request")?;
+
+        if resp.status().is_success() {
+            break resp;
+        }
+
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if resend_without_conversation(status.as_u16(), &body, thread.is_some()) {
+            thread = None;
+            continue;
+        }
+
+        pb.finish_and_clear();
         let detail = body["error"].as_str().unwrap_or("no detail");
         return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail))
             .coded(Code::for_status(status.as_u16()));
-    }
+    };
 
-    let (text, citations, model, first_token_ms) =
-        read_chat_stream(resp, &pb, echo, asked_at).await?;
+    let StreamOutcome {
+        text,
+        citations,
+        model,
+        first_token_ms,
+        conversation_id,
+    } = read_chat_stream(resp, &pb, echo, asked_at).await?;
 
     if echo.prints() {
         print_citations(&citations);
@@ -864,6 +922,7 @@ pub async fn chat(
         citations,
         model,
         first_token_ms,
+        conversation_id,
     }))
 }
 
@@ -925,14 +984,14 @@ async fn chat_local(
         .coded(Code::for_status(status.as_u16()));
     }
 
-    let (text, citations, model, first_token_ms) =
-        read_local_answer_stream(resp, &pb, echo, asked_at).await?;
+    let outcome = read_local_answer_stream(resp, &pb, echo, asked_at).await?;
 
     Ok(Some(ChatAnswer {
-        text,
-        citations,
-        model,
-        first_token_ms,
+        text: outcome.text,
+        citations: outcome.citations,
+        model: outcome.model,
+        first_token_ms: outcome.first_token_ms,
+        conversation_id: None,
     }))
 }
 
@@ -1003,6 +1062,7 @@ async fn chat_local_blocking(
         // whole wait here would read as an instant answer that then took
         // seconds to finish, which is the opposite of what happened.
         first_token_ms: None,
+        conversation_id: None,
     }))
 }
 
@@ -1020,7 +1080,7 @@ async fn read_local_answer_stream(
     pb: &ProgressBar,
     echo: Echo,
     asked_at: std::time::Instant,
-) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
+) -> Result<StreamOutcome> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
@@ -1122,7 +1182,13 @@ async fn read_local_answer_stream(
     if echo.prints() {
         print_citations(&citations);
     }
-    Ok((answer, citations, model, first_token_ms))
+    Ok(StreamOutcome {
+        text: answer,
+        citations,
+        model,
+        first_token_ms,
+        conversation_id: None,
+    })
 }
 
 /// Map the node's citation shape onto the CLI's.
@@ -1212,7 +1278,7 @@ async fn read_chat_stream(
     pb: &ProgressBar,
     echo: Echo,
     asked_at: std::time::Instant,
-) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
+) -> Result<StreamOutcome> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
@@ -1222,6 +1288,7 @@ async fn read_chat_stream(
     // Which citations the answer actually referenced. It arrives at the end, in
     // the `done` frame, rather than on the citations themselves.
     let mut cited_indexes: Vec<u32> = Vec::new();
+    let mut conversation_id: Option<String> = None;
     let mut event = String::new();
     let mut first_token = true;
     let mut first_token_ms: Option<u128> = None;
@@ -1253,6 +1320,9 @@ async fn read_chat_stream(
                     citations =
                         serde_json::from_value(parsed["citations"].clone()).unwrap_or_default();
                     model = parsed["model"].as_str().map(|s| s.to_string());
+                    // Null when the control plane could not open a thread, so a
+                    // failure to persist is not read as a thread called "null".
+                    conversation_id = parsed["conversationId"].as_str().map(|s| s.to_string());
                     // Retrieval is done; the rest of the wait is the model. Say
                     // what it found rather than leaving "Thinking..." up.
                     pb.set_message(retrieval_progress(&citations));
@@ -1333,7 +1403,13 @@ async fn read_chat_stream(
         citation.cited = Some(referenced);
     }
 
-    Ok((answer, citations, model, first_token_ms))
+    Ok(StreamOutcome {
+        text: answer,
+        citations,
+        model,
+        first_token_ms,
+        conversation_id,
+    })
 }
 
 /// True when the deterministic mock wrote the answer.
@@ -1381,6 +1457,10 @@ pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
             "answer": answer.text,
             "model": answer.model,
             "citations": answer.citations,
+            // Null for a local node, and for a hosted one that could not open a
+            // thread. A script that wants a follow-up answered in context sends
+            // this back; there is nothing else to correlate two questions by.
+            "conversationId": answer.conversation_id,
         }))?
     );
     Ok(())
@@ -2782,6 +2862,48 @@ mod tests {
             retrieval_progress(&[]),
             "No matching passages found; answering without context..."
         );
+    }
+
+    /// A thread deleted underneath a session must not end it. The question is
+    /// asked again without the id, and the control plane opens a new thread.
+    #[test]
+    fn a_vanished_conversation_is_asked_again_without_it() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        assert!(resend_without_conversation(404, &body, true));
+    }
+
+    /// A 404 for the node itself is the caller's real error. Retrying it would
+    /// spend a second request to arrive at the same failure.
+    #[test]
+    fn a_404_that_is_not_about_the_thread_is_not_retried() {
+        let body = serde_json::json!({ "error": "Node not found" });
+        assert!(!resend_without_conversation(404, &body, true));
+        assert!(!resend_without_conversation(
+            404,
+            &serde_json::json!({}),
+            true
+        ));
+    }
+
+    /// Nothing to drop, so nothing to retry: a second identical request would
+    /// only ask the same question twice.
+    #[test]
+    fn a_first_question_is_never_retried() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        assert!(!resend_without_conversation(404, &body, false));
+    }
+
+    /// Only 404 means the thread is gone. A 500 is the control plane's problem
+    /// and asking again would double a question that may already have run.
+    #[test]
+    fn other_statuses_are_left_alone() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        for status in [400, 401, 403, 429, 500, 503] {
+            assert!(
+                !resend_without_conversation(status, &body, true),
+                "status {status}"
+            );
+        }
     }
 
     /// The progress line goes through the same naming as the citation list, so

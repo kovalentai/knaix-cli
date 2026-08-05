@@ -394,6 +394,7 @@ async fn measure_answers(
             crate::nodes::Echo::Silent,
             &[],
             Verbosity::Normal,
+            None,
         )
         .await
         .map_err(|e| {
