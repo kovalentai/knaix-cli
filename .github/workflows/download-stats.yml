@@ -230,6 +230,13 @@ jobs:
             -- reading as two installs.
             count(DISTINCT if(is_download AND day >= current_date - interval '7' day, dedup_key)) AS unique_7d,
             count_if(is_failure AND day >= current_date - interval '7' day) AS failures_7d,
+            count_if(is_download AND day >= current_date - interval '30' day) AS downloads_30d,
+            count(DISTINCT if(is_download AND day >= current_date - interval '30' day, dedup_key)) AS unique_30d,
+            -- The badge has to be able to say what it counts from. CloudFront
+            -- logging was switched on long after the first release, so the
+            -- cumulative figure is not a lifetime one and must not be shown as
+            -- though it were.
+            cast(min(day) AS varchar) AS first_log,
             cast(max(day) AS varchar) AS latest
           FROM flagged
           SQL

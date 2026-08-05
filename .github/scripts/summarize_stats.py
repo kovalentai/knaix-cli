@@ -27,7 +27,9 @@ def main():
     lines = [
         "### Knaix CLI fleet health",
         "",
-        f"- Downloads: **{d['total']}** total, {d['unique']} unique, {d['last7d']} in the last 7 days",
+        f"- Downloads: **{d['unique30d']}** unique in the last 30 days "
+        f"(the badge figure), {d['last7d']} fetches in the last 7",
+        f"- Since logging began ({d['since'] or 'unknown'}): {d['total']} fetches, {d['unique']} unique",
         f"- Active installs: **{a['month']}** monthly, {a['week']} weekly, {a['day']} daily",
         f"- Install failures: {i['failures7d']} of {i['attempts7d']} attempts "
         f"in 7 days ({i['failureRate7d']:.1%})",
