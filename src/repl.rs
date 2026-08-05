@@ -7,7 +7,6 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 use std::borrow::Cow::{self, Borrowed, Owned};
-use termimad::MadSkin;
 
 /// The prompt as rustyline is given it, with no escapes in it.
 ///
@@ -146,7 +145,6 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     let mut rl: Editor<ReplHelper, DefaultHistory> =
         Editor::new().context("Failed to initialize readline")?;
     rl.set_helper(Some(ReplHelper::new(node_id)));
-    let skin = MadSkin::default_dark();
 
     println!(
         "\n{} {} session with {}. {} lists commands; {} ends the session.",
@@ -243,13 +241,31 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
 
                 message_count += 1;
 
-                match crate::nodes::chat(ctx, target, &input, false, &history, verbosity).await {
+                // The blank line goes out before the request, because from here
+                // on the answer prints itself as it arrives: the spinner takes
+                // the next line, and the first rendered line replaces it.
+                println!();
+                // Markdown, not raw: a hosted answer is prompted by the control
+                // plane, which does not constrain formatting the way the local
+                // system prompt does, so headings and bullets do turn up.
+                // Sources print inside, as they do for a one-shot question --
+                // an ungrounded claim should be as visible in a session.
+                match crate::nodes::chat(
+                    ctx,
+                    target,
+                    &input,
+                    crate::nodes::Echo::Markdown,
+                    &history,
+                    verbosity,
+                )
+                .await
+                {
+                    // An answer that streamed nothing printed nothing, so say so
+                    // rather than returning a bare prompt.
+                    Ok(Some(answer)) if answer.text.trim().is_empty() => {
+                        println!("{}", "Warning: Node returned an empty response.".yellow());
+                    }
                     Ok(Some(answer)) => {
-                        println!();
-                        skin.print_text(&answer.text);
-                        // Show sources here too: an ungrounded claim should be
-                        // as visible in a session as in a one-shot command.
-                        crate::nodes::print_citations(&answer.citations);
                         crate::nodes::print_answer_footer(target, &answer);
                         println!();
                         // Record the exchange only once it succeeded, so a
