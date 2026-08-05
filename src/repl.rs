@@ -102,7 +102,10 @@ fn print_help() {
             "Save a fact to this node's notes and ingest it",
         ),
         ("/memory", "List the notes saved for this node"),
-        ("/reset", "Forget the conversation so far and start fresh"),
+        (
+            "/reset",
+            "Start a new conversation; earlier questions leave the context",
+        ),
         (
             "/brief, /normal, /detailed",
             "Set how much detail answers carry (local node)",
@@ -214,11 +217,21 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             // to carry forward. Dropping the id starts a new
                             // thread; the old one is kept, not deleted.
                             let had = !history.is_empty() || conversation.is_some();
+                            // A hosted thread is left behind, not deleted, so
+                            // say that rather than "cleared". Someone resetting
+                            // to drop a question would otherwise read this as
+                            // the transcript being gone.
+                            let kept = conversation.is_some();
                             history.clear();
                             conversation = None;
-                            if had {
+                            if had && kept {
                                 println!(
-                                    "{} Conversation cleared. The next question starts fresh.",
+                                    "{} Starting a new conversation. Earlier questions leave the context; the previous conversation is kept.",
+                                    "✓".green()
+                                );
+                            } else if had {
+                                println!(
+                                    "{} Starting fresh. Earlier questions leave the context.",
                                     "✓".green()
                                 );
                             } else {
