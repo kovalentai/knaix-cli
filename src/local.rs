@@ -766,6 +766,7 @@ pub async fn up(
     save(&node)?;
 
     wait_until_ready(&node).await?;
+    warm_up(&node).await;
 
     println!(
         "\n{} Local node ready on {}.",
@@ -1149,6 +1150,89 @@ fn new_instance_id() -> String {
 }
 
 /// Poll until the node reports ready, or explain why it never did.
+/// How long a warm-up is allowed to run before `up` stops waiting on it.
+///
+/// Generous, because loading a model's weights is the slow part and is exactly
+/// what this exists to absorb, but bounded: the node already serves, so a
+/// warm-up that has not finished by now is better left to finish under the
+/// first question than to hold up the command.
+const WARM_TIMEOUT_SECS: u64 = 90;
+
+/// Ask the node one throwaway question, so the first real one does not pay for
+/// the cold start.
+///
+/// A cold node loads its query embedder on the first question it answers, and a
+/// model server loads its weights, which together are why the answer route is
+/// given five minutes rather than the client default. Paying that here, once,
+/// where it can be labelled, beats paying it invisibly under someone's first
+/// question and leaving them to conclude the product is slow.
+///
+/// Best effort throughout. The node is already serving by this point, so a
+/// warm-up that fails, times out, or hits a node with no model runtime is not a
+/// reason to fail `up`; it only means the saving is not collected.
+async fn warm(node: &LocalNode) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(WARM_TIMEOUT_SECS))
+        .build()
+    else {
+        return false;
+    };
+    let body = serde_json::json!({
+        "instance_id": node.instance_id,
+        "query": "warm up",
+        "system": "Reply with one word.",
+        // One token is enough to make a model server load its weights, and the
+        // answer is thrown away. Retrieval runs either way, which is what loads
+        // the embedder.
+        "max_tokens": 1,
+    });
+    matches!(
+        client
+            .post(format!("{}/api/query/answer", node.base_url()))
+            .json(&body)
+            .send()
+            .await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// Warm the node and say how long it took, or say nothing at all.
+///
+/// The timing is worth printing because it is the wait it just moved off the
+/// first question. A failure is not worth printing: nothing is wrong with the
+/// node, and an alarming line about an optimization would be worse than silence.
+/// A dot per second while the warm-up runs, matching how waiting for the store
+/// to open already reads. Loading a large model's weights is most of this wait,
+/// and it can run to the timeout; an unchanging line for ninety seconds is the
+/// exact thing this command is meant to stop doing.
+async fn warm_up(node: &LocalNode) {
+    print!("  Warming the store and model");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let started = std::time::Instant::now();
+
+    let mut warming = std::pin::pin!(warm(node));
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+    // The first tick resolves immediately, which would print a dot before any
+    // waiting has happened.
+    ticks.tick().await;
+
+    let warmed = loop {
+        tokio::select! {
+            done = &mut warming => break done,
+            _ = ticks.tick() => {
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    };
+
+    if warmed {
+        println!(" ({:.1}s)", started.elapsed().as_secs_f64());
+    } else {
+        println!();
+    }
+}
+
 async fn wait_until_ready(node: &LocalNode) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
