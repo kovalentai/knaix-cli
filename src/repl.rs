@@ -261,9 +261,12 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                 .await
                 {
                     // An answer that streamed nothing printed nothing, so say so
-                    // rather than returning a bare prompt.
+                    // rather than returning a bare prompt. Spaced like an answer
+                    // would have been, so the prompt does not jump up the screen
+                    // on the one turn that failed.
                     Ok(Some(answer)) if answer.text.trim().is_empty() => {
                         println!("{}", "Warning: Node returned an empty response.".yellow());
+                        println!();
                     }
                     Ok(Some(answer)) => {
                         crate::nodes::print_answer_footer(target, &answer);
