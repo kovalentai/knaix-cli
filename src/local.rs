@@ -806,12 +806,20 @@ pub async fn up(
             "✓".green(),
             "-n local".cyan()
         ),
-        DefaultOutcome::Other(other) => println!(
-            "  {} Your default node is {}; pass {} to reach this one.",
-            "Note:".blue(),
-            other.cyan(),
-            "-n local".cyan()
-        ),
+        DefaultOutcome::Other(other) => {
+            println!(
+                "  {} Your default node is {}; pass {} to reach this one.",
+                "Note:".blue(),
+                other.cyan(),
+                "-n local".cyan()
+            );
+            // Saying only "pass -n local" leaves the reader typing it forever.
+            // The flag is the workaround; this is the way out of it.
+            println!(
+                "        Run {} to make this one the default instead.",
+                "knaix use local".cyan()
+            );
+        }
         DefaultOutcome::AlreadyLocal => {}
     }
 
@@ -1058,7 +1066,69 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
         None,
         false,
     )
-    .await
+    .await?;
+
+    offer_local_as_default();
+    Ok(())
+}
+
+/// Whether setup should offer the default, and the node it would replace.
+///
+/// `None` when there is nothing to ask: no default at all, because `up` has
+/// already granted it; `local` already, because there is nothing to change; or
+/// no terminal, because a piped setup must keep what it had rather than block
+/// on a prompt nobody can answer.
+fn should_offer_default(current: Option<&str>, interactive: bool) -> Option<String> {
+    if !interactive {
+        return None;
+    }
+    match current {
+        None => None,
+        Some(id) if id == LOCAL_NODE_ID => None,
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Offer to hand the default to `local`, at the end of setup only.
+///
+/// `up` deliberately never takes a default the user chose, because starting a
+/// node is not a statement about which one you address. Setup is: somebody who
+/// has just picked a server and a model is onboarding onto this node, and
+/// ending that with "pass -n local to everything from now on" is the wrong
+/// answer to what they came to do. So it asks, once, rather than either
+/// stealing the default or leaving them with a flag they have to remember.
+fn offer_local_as_default() {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+
+    let cfg = crate::config::load_stored_config();
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let Some(current) = should_offer_default(cfg.default_node_id.as_deref(), interactive) else {
+        return;
+    };
+
+    let yes = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Make local your default node instead of {current}?"
+        ))
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+    if !yes {
+        return;
+    }
+
+    let mut cfg = crate::config::load_stored_config();
+    cfg.default_node_id = Some(LOCAL_NODE_ID.to_string());
+    match crate::config::save_config(&cfg) {
+        Ok(()) => println!(
+            "  {} local is your default node. {} needs no {}.",
+            "✓".green(),
+            "knaix chat".cyan(),
+            "-n local".cyan()
+        ),
+        // The node is up either way, so this costs the shorthand and nothing else.
+        Err(e) => println!("  {} Could not save the default: {e}", "Note:".blue()),
+    }
 }
 
 fn new_instance_id() -> String {
@@ -1646,6 +1716,33 @@ fn spawn_relay_worker() -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::should_offer_default;
+
+    /// The case that prompted this: a hosted node holds the default, so setup
+    /// ended by telling the user to pass -n local to everything, forever.
+    #[test]
+    fn a_different_default_is_worth_asking_about() {
+        assert_eq!(
+            should_offer_default(Some("claude-9aeb349918"), true),
+            Some("claude-9aeb349918".to_string())
+        );
+    }
+
+    #[test]
+    fn nothing_to_ask_when_there_is_no_default_or_it_is_already_local() {
+        // up() grants the default when the slot is empty, so setup finds it set.
+        assert_eq!(should_offer_default(None, true), None);
+        assert_eq!(should_offer_default(Some("local"), true), None);
+    }
+
+    /// A piped or scripted setup must not stop on a question nobody can answer,
+    /// and must not silently take a default either.
+    #[test]
+    fn without_a_terminal_it_asks_nothing_and_changes_nothing() {
+        assert_eq!(should_offer_default(Some("claude-9aeb349918"), false), None);
+        assert_eq!(should_offer_default(None, false), None);
+    }
+
     use super::*;
 
     #[test]
