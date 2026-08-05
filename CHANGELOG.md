@@ -2,6 +2,22 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.5.2] - 2026-08-04
+
+Everything here came from watching a first run rather than from reading the code.
+
+### Fixed
+
+- **`knaix local setup` left you passing `-n local` to everything.** A default node you have already chosen is kept, deliberately, so a machine with a hosted node saved never handed the shorthand to the local one. That is the right rule and it was the wrong ending for setup: somebody who has just been asked which server should answer and which model to use is onboarding onto that node. Setup now asks whether to make it the default, once, defaulting to no. `knaix local up` still keeps its hands off, because starting a node is not a statement about which one you address.
+
+- **A command that could not reach the control plane never mentioned the node on the same machine.** `knaix upload doc.md` against a hosted default with no route out printed a DNS chain and suggested `knaix doctor`. Both true, neither useful, while a local node sat running and would have taken the upload. The error now says so and names the two ways to use it.
+
+- **The local node refused to do anything but look things up.** Asked to draw a quiz out of a study guide it had just ingested, it answered that the knowledge base held no information about administering quizzes. That was the prompt, not the model: it described a lookup and nothing else, so any request to work *with* the material was refused. Grounding is about where the facts come from, not about what may be asked for, and the two are stated separately now. Summaries, questions, outlines and comparisons all work, still built only from the context and still cited.
+
+- **`knaix shell-init` and `knaix completions` refused to run without the shell named.** For `shell-init` that argument had exactly one legal value. For `completions` the process can read `$SHELL` itself. Both now default to the shell you are running, and naming one still works, which remains the only way to generate for a shell you are not in.
+
+- **Installing on Windows failed at the checksum.** `irm https://knaix.com/install.ps1 | iex` stopped with "Could not download the checksum file" when the download had in fact succeeded. Already fixed for everyone, without a new release: the installer is served from the docs site, and the published checksums now carry the content type PowerShell needs.
+
 ## [0.5.1] - 2026-08-04
 
 **If you ran `knaix verify` on v0.5.0, run it again.** It never checked the signature, on any platform.
