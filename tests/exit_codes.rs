@@ -254,3 +254,59 @@ fn the_error_text_still_says_what_went_wrong() {
         "expected the original message on stderr, got: {stderr}"
     );
 }
+
+/// Both shell commands used to require the shell named, so `knaix completions`
+/// with nothing after it exited 2 with clap's "required arguments were not
+/// provided". `shell-init` did the same, for an argument with exactly one legal
+/// value. Bare is now the common case, so these assert it succeeds and prints
+/// the right thing, not merely that it exits 0.
+#[test]
+fn the_shell_commands_work_with_no_shell_named() {
+    let home = scratch_home("shellbare");
+    for (arg, marker) in [
+        ("shell-init", "knaix shell integration"),
+        ("completions", "compdef"),
+    ] {
+        let out = knaix(&home)
+            .arg(arg)
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("failed to run knaix");
+        assert!(
+            out.status.success(),
+            "knaix {arg} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(marker), "knaix {arg} printed: {stdout}");
+    }
+}
+
+/// Naming a shell still works, and still wins over the one being run.
+#[test]
+fn a_named_shell_overrides_the_running_one() {
+    let home = scratch_home("shellnamed");
+    let out = knaix(&home)
+        .args(["completions", "bash"])
+        .env("SHELL", "/bin/zsh")
+        .output()
+        .expect("failed to run knaix");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("_knaix()"),
+        "expected bash output: {stdout}"
+    );
+}
+
+/// With no shell to detect and none named, the usage error is the right answer.
+/// Guessing would write the wrong completions into a real profile.
+#[test]
+fn completions_without_a_detectable_shell_is_a_usage_error() {
+    let home = scratch_home("shellnone");
+    assert_eq!(
+        code_of(knaix(&home).arg("completions").env_remove("SHELL")),
+        2
+    );
+}
