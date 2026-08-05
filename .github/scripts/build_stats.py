@@ -90,17 +90,33 @@ def main():
     deduped = as_int(w, "deduped")
     downloads_7d = as_int(w, "downloads_7d")
     failures_7d = as_int(w, "failures_7d")
+    downloads_30d = as_int(w, "downloads_30d")
+    unique_30d = as_int(w, "unique_30d")
+    first_log = (w.get("first_log") or "").strip()
 
-    # The badge payload keeps the shape and the grain it has always had. The
-    # sites read this file, so a redefinition here would silently restate a
-    # public number.
+    # The badge shows a rolling thirty days, not a cumulative count.
+    #
+    # CloudFront access logging was enabled months after the first release, so
+    # everything before that is unlogged and unrecoverable. A cumulative figure
+    # labelled "downloads" would be read as lifetime and would understate the
+    # project by however many installs happened first. A rolling window makes
+    # no claim about a past it cannot see, and it is the same number whether or
+    # not anyone knows when logging started.
+    #
+    # The cumulative figures stay in the payload, paired with `since` so that
+    # anything rendering them can say what they count from.
     stats = {
         "schemaVersion": 1,
-        "label": "downloads",
-        "message": short(deduped),
+        "label": "downloads (30d)",
+        "message": short(unique_30d),
         "color": "7C5CFF",
+        "last30d": {
+            "downloads": downloads_30d,
+            "unique": unique_30d,
+        },
         "total": total,
         "unique": deduped,
+        "since": first_log,
         "updated": stamp,
     }
 
@@ -119,6 +135,11 @@ def main():
         "downloads": {
             "total": total,
             "unique": deduped,
+            # What the cumulative figures count from. Logging started long
+            # after the first release, so they are not lifetime totals.
+            "since": first_log,
+            "last30d": downloads_30d,
+            "unique30d": unique_30d,
             "last7d": downloads_7d,
             # Deduplicated, so it can be compared against a visit count. The
             # raw last7d cannot: it counts fetches, and a machine that fetches
