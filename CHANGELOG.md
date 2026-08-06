@@ -2,6 +2,48 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.5.3] - 2026-08-05
+
+Answers arrive as they are written, say where they came from, and can be asked to be longer, shorter, or about one document. Most of this release is about the wait and the evidence rather than the model.
+
+Two of the fixes below were found by running the CLI against a real model and a real corpus rather than by reading the code, and one of them was a regression introduced earlier in this same release.
+
+### Added
+
+- **`knaix repl` streams its answers.** The tokens were already arriving one at a time; the session held all of them and rendered the finished answer at the end, so the surface built for conversation was the one that showed you least. It now renders as the answer lands, a line at a time, and keeps the markdown: a fenced code block is held until it closes so it arrives whole.
+
+- **The wait says what it is doing.** Both the node and the control plane hand over the retrieved passages before the first word of the answer. `Thinking...` became `Searching your documents...`, then the documents retrieval actually found. Past five seconds the spinner also counts, because a line that never changes reads the same whether the model is working or the connection has died.
+
+- **`knaix local up` warms the node before handing it over.** The first question a cold node answered paid for loading the query embedder, the reranker, and the model's weights. On a real machine that was nineteen seconds, spent under whoever asked first. It is now spent once, at startup, where it is labelled and counted.
+
+- **A hosted session is a conversation.** Every question used to be sent on its own and opened a new thread, so a follow-up had no idea what came before and your transcripts filled with one-message conversations. `knaix repl` now follows the thread the control plane opens. `/reset` starts a new one; the previous conversation is kept, not deleted.
+
+- **`/source <n>` prints a passage in full.** The node returns each retrieved passage whole and the Grounded in list showed the first line or so, so the evidence behind a claim was arriving and being discarded at the point of display. A passage that was retrieved and never cited is reachable too, and labelled: that is what the model saw and did not use.
+
+- **`--doc <name>` grounds an answer in a document you name.** Every question was a search of the whole corpus for its best few passages, which answers a lookup well and answers "summarize this" or "draw me a quiz from this" badly, because the passages that best match the word *summarize* are rarely the ones the task needs. Naming a document reads it in order instead. On a thirteen-chunk study guide the difference is five passages against thirteen. Needs a node new enough to serve it; an older one says so.
+
+- **`--k <n>` chooses how many passages an answer rests on**, and `--doc`, `--brief` and `--detailed` now work in `knaix repl` too, both as flags that set where a session starts and as commands that change it as you go.
+
+- **A slow answer says where the time went.** Every answer was already timed at its first word and its last, and only `knaix bench` ever read those numbers. Past five seconds the answer now reports how much of the wait was finding and how much was writing, which is the difference between a slow knowledge base and a slow model.
+
+### Changed
+
+- **`--brief` and `--detailed` change the answer.** They shaped a prompt and nothing else, so a detailed answer was still cut off at the node's default length whatever the prompt asked for, and against a hosted node the flags printed a note admitting they did nothing at all. They now carry both a shape and a length, on either kind of node. Measured on a real model, the same question answers in 53, 82 and 130 words.
+
+- **A local node reranks every answer.** The cross-encoder runs on your own machine, behind the same boundary as everything else, so there was nothing to meter and no reason to leave the largest quality lever switched off.
+
+- **`knaix repl --help` describes the session.** It listed three flags and nothing about the commands inside, so `/source`, `/k`, `/doc`, `/remember` and `/reset` could only be found by starting a session and guessing that `/help` existed.
+
+### Fixed
+
+- **Half of all answers showed no sources.** Turning on reranking, earlier in this same release, also handed the reranker the decision about what the model was allowed to read, against a fixed score floor. Its scores turn out to be bimodal rather than calibrated: near 1 when it is confident and near 0 when it is not, with everything below at a thousandth. So a confident reranker admitted exactly one passage and an unconfident one admitted none, which meant answers were better the less sure it was.
+
+  One passage is worse than thin. Handed a single passage numbered `[1]`, a model writes a multi-point answer and numbers its own points `[1] [2] [3]`; every marker past the first matches nothing, so no passage is marked as cited and the Grounded in block disappears entirely. Against a real corpus, three of six answers cited nothing. All six do now. The reranker orders the passages; retrieval depth decides how many there are.
+
+- **`/reset` said a hosted conversation had been cleared.** It starts a new thread and leaves the old one stored, so anyone resetting to take back a question was told the transcript was gone when it was not.
+
+- **A flag that could not take effect said so.** `--k` against a hosted node, `--k` alongside `--doc`, and a hosted answer the control plane could not add to a conversation were all accepted in silence. Each now says what happened.
+
 ## [0.5.2] - 2026-08-04
 
 Everything here came from watching a first run rather than from reading the code.

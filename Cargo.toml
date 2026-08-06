@@ -1,6 +1,6 @@
 [package]
 name = "knaix"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "The command-line client for Kovalent AI: provision nodes, ingest documents, and chat over a zero-trust mesh."
 authors = ["Kovalent AI"]
