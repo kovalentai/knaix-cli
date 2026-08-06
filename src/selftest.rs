@@ -621,9 +621,10 @@ async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::
         ctx,
         target,
         query,
-        false,
+        crate::nodes::Echo::Silent,
         &[],
-        crate::nodes::Verbosity::Normal,
+        &crate::nodes::AnswerOptions::default(),
+        None,
     )
     .await
     {

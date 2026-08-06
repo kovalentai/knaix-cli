@@ -7,7 +7,7 @@ use base64::Engine as _;
 use colored::*;
 use crossterm::{cursor, execute};
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::header::AUTHORIZATION;
 use reqwest::multipart;
 use serde::Deserialize;
@@ -69,6 +69,54 @@ pub struct ChatAnswer {
     /// only way to tell a slow knowledge base from a slow model, which is what
     /// `knaix bench` reports. Absent when the answer did not stream.
     pub first_token_ms: Option<u128>,
+    /// Milliseconds from sending the question to the last token arriving.
+    ///
+    /// With `first_token_ms` this splits the wait into the part spent finding
+    /// things and the part spent writing, which is the difference between a
+    /// slow knowledge base and a slow model.
+    pub total_ms: Option<u128>,
+    /// The thread this answer belongs to, for a hosted node. Sent back with the
+    /// next question so the control plane answers it in context. Absent for a
+    /// local node, which has no control plane to keep the thread, and absent
+    /// when the control plane could not open one.
+    pub conversation_id: Option<String>,
+    /// For a document-scoped answer: how many of the named documents' passages
+    /// reached the model, against how many there were.
+    pub scope: Option<(u64, u64)>,
+}
+
+/// What one answer stream produced. A struct rather than a tuple because both
+/// readers return it and it now carries five things.
+struct StreamOutcome {
+    text: String,
+    citations: Vec<Citation>,
+    model: Option<String>,
+    first_token_ms: Option<u128>,
+    total_ms: Option<u128>,
+    conversation_id: Option<String>,
+    scope: Option<(u64, u64)>,
+}
+
+/// What a caller wants done with the tokens as they arrive.
+///
+/// A bool could say "print" but not how, which left the REPL choosing between
+/// streaming raw and rendering markdown at the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Echo {
+    /// Accumulate silently; the caller prints the finished answer, or nothing.
+    Silent,
+    /// Print each token as it arrives. The only shape safe to pipe: no escapes
+    /// are added that were not in the answer.
+    Raw,
+    /// Render markdown progressively, a line or a fenced block at a time.
+    Markdown,
+}
+
+impl Echo {
+    /// Whether anything is printed as the answer arrives.
+    fn prints(self) -> bool {
+        self != Echo::Silent
+    }
 }
 
 /// One prior turn of a conversation, sent to the local node so a follow-up
@@ -78,6 +126,240 @@ pub struct ChatAnswer {
 pub struct ChatTurn {
     pub role: String,
     pub content: String,
+}
+
+/// The node's own default retrieval depth, mirrored so `--k` has a default to
+/// show and so an unset value asks for exactly what the node would have done.
+pub const DEFAULT_K: u32 = 5;
+
+/// The node clamps depth to this. Matched here so an impossible `--k` is
+/// refused with a number the user can act on, rather than silently clamped into
+/// something they did not ask for.
+pub const MAX_K: u32 = 50;
+
+/// How the node should retrieve for one question.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Retrieval {
+    /// How many passages to admit as context.
+    pub k: u32,
+    /// Ground the answer in these documents rather than in a search of the
+    /// whole corpus. Empty keeps the ordinary top-k path.
+    pub document_ids: Vec<String>,
+}
+
+impl Default for Retrieval {
+    fn default() -> Self {
+        Self {
+            k: DEFAULT_K,
+            document_ids: Vec::new(),
+        }
+    }
+}
+
+/// Everything about one question other than the question.
+///
+/// Bundled because these travel together through every layer, and because a
+/// chat call taking eight positional arguments is one nobody can read.
+#[derive(Clone, Debug, Default)]
+pub struct AnswerOptions {
+    pub verbosity: Verbosity,
+    pub retrieval: Retrieval,
+}
+
+/// One document the node holds, as `/api/kb/documents` reports it.
+#[derive(Deserialize, Debug, Clone)]
+pub struct NodeDocument {
+    #[serde(rename = "document_id")]
+    pub document_id: String,
+    pub source: Option<String>,
+    /// Reported by the node. Not read yet; kept so the struct documents the
+    /// shape the route returns rather than half of it.
+    #[allow(dead_code)]
+    pub chunks: Option<u64>,
+}
+
+impl NodeDocument {
+    /// What a person would call this document.
+    pub fn label(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.document_id)
+    }
+}
+
+/// The documents a local node holds.
+pub async fn local_documents(
+    ctx: &KnaixContext,
+    base: &str,
+    instance_id: &str,
+) -> Result<Vec<NodeDocument>> {
+    let resp = ctx
+        .client
+        .post(format!("{}/api/kb/documents", base))
+        .json(&serde_json::json!({ "instance_id": instance_id }))
+        .send()
+        .await
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    if resp.status() == 404 {
+        return Err(anyhow!(
+            "This node is too old to list its documents, so {} cannot resolve a name. Update it with {}.",
+            "--doc",
+            crate::brand::cmd("local up --pull")
+        ))
+        .coded(Code::Precondition);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "Could not list the node's documents: HTTP {}",
+            resp.status()
+        ))
+        .coded(Code::for_status(resp.status().as_u16()));
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok(serde_json::from_value(body["documents"].clone()).unwrap_or_default())
+}
+
+/// Resolve what the user typed against the documents the node holds.
+///
+/// People name a document by its filename, and rarely the whole of it, so an
+/// exact match wins and a unique case-insensitive substring is accepted after
+/// it. An ambiguous name is refused with the candidates rather than resolved to
+/// whichever happened to be first: grounding an answer in the wrong document
+/// and saying nothing is the failure this command exists to avoid.
+pub fn resolve_document<'a>(
+    documents: &'a [NodeDocument],
+    wanted: &str,
+) -> Result<&'a NodeDocument> {
+    if documents.is_empty() {
+        return Err(anyhow!("This node holds no documents yet.")).coded(Code::Precondition);
+    }
+    if let Some(exact) = documents
+        .iter()
+        .find(|d| d.label().eq_ignore_ascii_case(wanted) || d.document_id == wanted)
+    {
+        return Ok(exact);
+    }
+
+    let needle = wanted.to_lowercase();
+    let matches: Vec<&NodeDocument> = documents
+        .iter()
+        .filter(|d| d.label().to_lowercase().contains(&needle))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(anyhow!(
+            "No document matching '{}'. This node holds: {}",
+            wanted,
+            documents
+                .iter()
+                .map(|d| d.label().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .coded(Code::Usage),
+        many => Err(anyhow!(
+            "'{}' matches {} documents: {}. Name one of them.",
+            wanted,
+            many.len(),
+            many.iter()
+                .map(|d| d.label().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .coded(Code::Usage),
+    }
+}
+
+/// Turn the document names a caller typed into ids the node will accept.
+///
+/// Local only: a hosted node's retrieval is the control plane's to decide, and
+/// there is no route there to resolve a name against. Saying so beats resolving
+/// names that would then be dropped from the request in silence.
+pub async fn scope_to_documents(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &[String],
+) -> Result<Vec<String>> {
+    let Target::Local { base, instance_id } = target else {
+        return Err(anyhow!(
+            "--doc applies to a local node; a hosted node's retrieval is set by the control plane."
+        ))
+        .coded(Code::Usage);
+    };
+
+    let documents = local_documents(ctx, base, instance_id).await?;
+    let mut ids = Vec::new();
+    for name in wanted {
+        let doc = resolve_document(&documents, name)?;
+        if !ids.contains(&doc.document_id) {
+            ids.push(doc.document_id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+/// Validate a `--k`, or fall back to the node's own default.
+///
+/// The node clamps silently, so an out-of-range value would come back as an
+/// answer built on a depth nobody asked for. Refusing it here is the difference
+/// between a typo the user can see and one they cannot.
+pub fn checked_k(requested: Option<u32>) -> Result<u32> {
+    match requested {
+        None => Ok(DEFAULT_K),
+        Some(k) if (1..=MAX_K).contains(&k) => Ok(k),
+        Some(k) => Err(anyhow!(
+            "--k must be between 1 and {}; {} was asked for",
+            MAX_K,
+            k
+        ))
+        .coded(Code::Usage),
+    }
+}
+
+/// The rerank score a passage must beat to be admitted as context.
+///
+/// Zero, which means the reranker orders the passages and `k` decides how many
+/// there are. Measured rather than guessed: the cross-encoder's scores are
+/// bimodal, not calibrated. On a real corpus the top passage scores 0.96 or
+/// 0.99 when the reranker is confident and 0.03 or 0.004 when it is not, with
+/// everything below it at 0.0007 or less.
+///
+/// Against the node's own default floor that produces the opposite of what a
+/// floor is for. A confident reranker admits exactly one passage, so the answer
+/// is thin and the model, handed a single passage numbered [1], numbers its own
+/// points [1] [2] [3] and cites passages that do not exist -- which leaves the
+/// Grounded in block empty. An unconfident one admits nothing, the starvation
+/// fallback re-admits on distance, and the answer gets all of them. The system
+/// answered better the less sure the reranker was.
+///
+/// No absolute threshold fixes that, because the scores are not on a scale a
+/// threshold can read. Ranking is what a cross-encoder is good for.
+const MIN_RERANK_SCORE: f64 = 0.0;
+
+/// The retrieval policy the CLI asks a local node for.
+///
+/// `rerank` is always on. The cross-encoder runs on the node's own compute,
+/// behind the same boundary as everything else, so there is nothing to meter
+/// and no reason to withhold the largest quality lever the pipeline has. A
+/// hosted node is policed by the control plane, which decides rerank by tier.
+///
+/// It is not free: the reranker is a real model, so it loads once and re-reads
+/// every candidate per question. `knaix local up` warms it with the same policy
+/// for that reason, so the cost lands at startup rather than under the first
+/// question.
+fn local_policy(retrieval: &Retrieval) -> serde_json::Value {
+    let mut policy = serde_json::json!({
+        "k": retrieval.k,
+        "rerank": true,
+        "min_rerank_score": MIN_RERANK_SCORE,
+    });
+    // Only when scoping, so an ordinary question's body is unchanged and a node
+    // that predates document scoping sees exactly what it always did.
+    if !retrieval.document_ids.is_empty() {
+        policy["document_ids"] = serde_json::json!(retrieval.document_ids);
+    }
+    policy
 }
 
 /// How long an answer the local node is asked for. The difference is only in
@@ -91,6 +373,46 @@ pub enum Verbosity {
     Normal,
     /// Everything the context supports, organized.
     Detailed,
+}
+
+/// What the CLI calls a normal answer, and the node's own default ceiling.
+const NODE_OUTPUT_CEILING: u32 = 1024;
+
+/// The most any level asks for, and what `knaix local up` raises the node's
+/// ceiling to.
+///
+/// The node clamps every answer to its configured ceiling, whose default is the
+/// same 1024 as a normal answer. Left alone, a detailed answer was clamped
+/// straight back to a normal one and the flag did nothing. Raising the ceiling
+/// to the largest ask puts the limiting back in the per-question `max_tokens`,
+/// where the flag can reach it. A hosted node is configured by the control
+/// plane, so this applies only to the node the CLI starts.
+pub const MAX_ANSWER_TOKENS: u32 = NODE_OUTPUT_CEILING * 3;
+
+impl Verbosity {
+    /// How many output tokens to ask the node for.
+    ///
+    /// The system prompt asks for a shape and this makes the ask stick. Without
+    /// it a detailed answer is silently cut off at the node's default, which is
+    /// one of the two reasons answers come back shorter than they were asked to
+    /// be; the prompt alone was the other.
+    fn max_tokens(self) -> u32 {
+        match self {
+            Verbosity::Brief => NODE_OUTPUT_CEILING / 4,
+            Verbosity::Normal => NODE_OUTPUT_CEILING,
+            Verbosity::Detailed => MAX_ANSWER_TOKENS,
+        }
+    }
+
+    /// The wire name the control plane reads. A hosted node is prompted there,
+    /// so the level travels rather than the prompt it produces.
+    fn as_str(self) -> &'static str {
+        match self {
+            Verbosity::Brief => "brief",
+            Verbosity::Normal => "normal",
+            Verbosity::Detailed => "detailed",
+        }
+    }
 }
 
 /// The grounding instructions the local node answers under when a command does
@@ -107,9 +429,17 @@ fn answer_system(verbosity: Verbosity) -> String {
     // nothing about administering quizzes, which is true and useless. Grounding
     // is about where the facts come from, not about what may be asked for, so
     // the two are stated separately now.
+    // "with their [n] markers" was not explicit enough: against a real model,
+    // half of all answers cited by section heading instead -- "[Section 3 --
+    // Damage claims]" -- which no bracketed-number parser can resolve, so every
+    // passage came back uncited and the Grounded in block silently vanished.
+    // Naming the format, forbidding the alternative, and saying what happens to
+    // a citation that is neither is what stopped it.
     let grounding = "You are a helpful assistant working from a private knowledge base. \
-Base everything you say on the provided context, and cite the passages you draw on with their \
-[n] markers. The request may ask you to do something with that material rather than look \
+Base everything you say on the provided context. The passages are numbered [1], [2] and so on; \
+cite each claim with that bracketed number and nothing else. Never cite a section heading, a \
+document name, or a title: a citation that is not a bracketed number cannot be matched to a \
+passage and is dropped, leaving the claim looking unsupported. The request may ask you to do something with that material rather than look \
 something up: summarize it, draw questions or exercises from it, outline it, compare parts of \
 it. Do what was asked, built only from what the context contains. When the context does not \
 hold enough to do it, say so plainly rather than guessing.";
@@ -153,13 +483,15 @@ fn build_local_answer_body(
     instance_id: &str,
     message: &str,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: &AnswerOptions,
 ) -> serde_json::Value {
     serde_json::json!({
         "instance_id": instance_id,
         "query": message,
-        "system": answer_system(verbosity),
+        "system": answer_system(options.verbosity),
         "history": history,
+        "max_tokens": options.verbosity.max_tokens(),
+        "policy": local_policy(&options.retrieval),
     })
 }
 
@@ -727,6 +1059,72 @@ pub async fn resolve_node_id(
     select_node_interactively(ctx).await
 }
 
+/// How long a wait has to run before the spinner puts a number on it. Under
+/// this, a count is noise on an answer that is about to arrive anyway.
+const WAITED_AFTER: Duration = Duration::from_secs(5);
+
+/// How the elapsed wait reads once it is worth showing.
+///
+/// Written against a duration rather than the progress state so the thresholds
+/// can be tested without a live bar.
+fn waited_label(elapsed: Duration) -> String {
+    if elapsed < WAITED_AFTER {
+        return String::new();
+    }
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ")
+    } else {
+        format!("{}m{:02}s ", secs / 60, secs % 60)
+    }
+}
+
+/// The spinner both chat paths run behind.
+///
+/// A long generation used to sit on one unchanging line, which reads the same
+/// whether the model is working or the connection has died. Past a few seconds
+/// it counts, so the wait is visibly moving. The count leads the message
+/// because `wide_msg` claims the rest of the line.
+fn chat_spinner(ctx: &KnaixContext) -> ProgressBar {
+    let pb = ctx.spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars(
+                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
+            )
+            // Wide, so a progress line naming several documents is truncated to
+            // the terminal rather than wrapping into the answer below it.
+            .template("{spinner:.cyan} {waited}{wide_msg}")
+            .unwrap()
+            .with_key(
+                "waited",
+                |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let _ = write!(w, "{}", waited_label(state.elapsed()));
+                },
+            ),
+    );
+    // Replaced with the retrieved sources as soon as the `meta` frame lands.
+    pb.set_message("Searching your documents...");
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+/// Whether a failed question is worth asking again without its thread.
+///
+/// A conversation can go away underneath a session: deleted from the dashboard,
+/// or opened against a node the caller has since lost. The control plane answers
+/// 404 for that, and it answers 404 for a missing node too, so the body has to
+/// distinguish them. Retrying blind would cost a second request on every 404;
+/// ending the session on a thread the user never mentioned would be worse.
+fn resend_without_conversation(status: u16, body: &serde_json::Value, sent_one: bool) -> bool {
+    if status != 404 || !sent_one {
+        return false;
+    }
+    body["error"]
+        .as_str()
+        .is_some_and(|e| e.to_ascii_lowercase().contains("conversation"))
+}
+
 /// Send one message to a node and stream the grounded answer back.
 ///
 /// Talks to the native chat route, where the whole RAG pipeline runs on the
@@ -736,73 +1134,88 @@ pub async fn chat(
     ctx: &KnaixContext,
     target: &Target,
     message: &str,
-    stream_to_stdout: bool,
+    echo: Echo,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: &AnswerOptions,
+    conversation: Option<&str>,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
-        return chat_local(
-            ctx,
-            base,
-            instance_id,
-            message,
-            stream_to_stdout,
-            history,
-            verbosity,
-        )
-        .await;
+        // A local node has no control plane to hold a thread, so its context is
+        // the history the caller replays.
+        let _ = conversation;
+        return chat_local(ctx, base, instance_id, message, echo, history, options).await;
     }
-    // The hosted path is prompted and, where supported, kept in session by the
-    // control plane; the history and verbosity that shape the local node's
-    // system prompt do not apply to it.
-    let _ = (history, verbosity);
+    // The control plane holds the thread and replays it into the prompt, so the
+    // hosted path sends the conversation id rather than the transcript.
+    let _ = history;
     let node_uuid = &target.label();
     let token = ctx.get_token()?;
 
-    let pb = ctx.spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars(
-                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
-            )
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Thinking...");
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let pb = chat_spinner(ctx);
 
     let url = format!("{}/api/nodes/{}/native-chat", ctx.config.api_url, node_uuid);
-    let payload = serde_json::json!({ "message": message, "stream": true });
 
     // Timed from before the request leaves, so time-to-first-token covers the
     // whole wait a person actually sits through, not just the node's share.
     let asked_at = std::time::Instant::now();
-    let resp = ctx
-        .client
-        .post(&url)
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        // An answer takes as long as the model takes; the client default that
-        // protects quick lookups would cut off a long generation mid-stream.
-        .timeout(Duration::from_secs(300))
-        .json(&payload)
-        .send()
-        .await
-        .inspect_err(|_| pb.finish_and_clear())
-        .context("Networking error during chat request")?;
 
-    if !resp.status().is_success() {
-        pb.finish_and_clear();
+    // Sent with the question, and dropped once if the control plane no longer
+    // knows the thread. See `resend_without_conversation`.
+    let mut thread = conversation.map(|s| s.to_string());
+    let resp = loop {
+        let mut payload = serde_json::json!({
+            "message": message,
+            "stream": true,
+            // The level, not a prompt: a hosted node is prompted by the control
+            // plane, which maps this to both a shape and a cap.
+            "verbosity": options.verbosity.as_str(),
+        });
+        if let Some(id) = &thread {
+            payload["conversationId"] = serde_json::json!(id);
+        }
+
+        let resp = ctx
+            .client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            // An answer takes as long as the model takes; the client default
+            // that protects quick lookups would cut off a long generation
+            // mid-stream.
+            .timeout(Duration::from_secs(300))
+            .json(&payload)
+            .send()
+            .await
+            .inspect_err(|_| pb.finish_and_clear())
+            .context("Networking error during chat request")?;
+
+        if resp.status().is_success() {
+            break resp;
+        }
+
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if resend_without_conversation(status.as_u16(), &body, thread.is_some()) {
+            thread = None;
+            continue;
+        }
+
+        pb.finish_and_clear();
         let detail = body["error"].as_str().unwrap_or("no detail");
         return Err(anyhow!("Chat failed on node: HTTP {} - {}", status, detail))
             .coded(Code::for_status(status.as_u16()));
-    }
+    };
 
-    let (text, citations, model, first_token_ms) =
-        read_chat_stream(resp, &pb, stream_to_stdout, asked_at).await?;
+    let StreamOutcome {
+        text,
+        citations,
+        model,
+        first_token_ms,
+        total_ms,
+        conversation_id,
+        scope,
+    } = read_chat_stream(resp, &pb, echo, asked_at).await?;
 
-    if stream_to_stdout {
+    if echo.prints() {
         print_citations(&citations);
     }
 
@@ -811,6 +1224,9 @@ pub async fn chat(
         citations,
         model,
         first_token_ms,
+        total_ms,
+        conversation_id,
+        scope,
     }))
 }
 
@@ -825,23 +1241,13 @@ async fn chat_local(
     base: &str,
     instance_id: &str,
     message: &str,
-    print: bool,
+    echo: Echo,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: &AnswerOptions,
 ) -> Result<Option<ChatAnswer>> {
-    let pb = ctx.spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars(
-                "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}",
-            )
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Thinking...");
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let pb = chat_spinner(ctx);
 
-    let body = build_local_answer_body(instance_id, message, history, verbosity);
+    let body = build_local_answer_body(instance_id, message, history, options);
 
     // Timed from before the request leaves, so time-to-first-token covers the
     // whole wait a person actually sits through, not just the node's share.
@@ -862,7 +1268,7 @@ async fn chat_local(
     // against an older local node, answer through the blocking endpoint it does
     // have: the reserved `local` node upgrades on its own schedule, not the CLI's.
     if matches!(resp.status().as_u16(), 404 | 405) {
-        return chat_local_blocking(ctx, base, &body, &pb, print).await;
+        return chat_local_blocking(ctx, base, &body, &pb, echo).await;
     }
 
     // Any other non-2xx never reaches the event stream: it is a normal JSON body.
@@ -882,14 +1288,16 @@ async fn chat_local(
         .coded(Code::for_status(status.as_u16()));
     }
 
-    let (text, citations, model, first_token_ms) =
-        read_local_answer_stream(resp, &pb, print, asked_at).await?;
+    let outcome = read_local_answer_stream(resp, &pb, echo, asked_at).await?;
 
     Ok(Some(ChatAnswer {
-        text,
-        citations,
-        model,
-        first_token_ms,
+        text: outcome.text,
+        citations: outcome.citations,
+        model: outcome.model,
+        first_token_ms: outcome.first_token_ms,
+        total_ms: outcome.total_ms,
+        conversation_id: None,
+        scope: outcome.scope,
     }))
 }
 
@@ -903,7 +1311,7 @@ async fn chat_local_blocking(
     base: &str,
     body: &serde_json::Value,
     pb: &ProgressBar,
-    print: bool,
+    echo: Echo,
 ) -> Result<Option<ChatAnswer>> {
     let resp = ctx
         .client
@@ -936,9 +1344,20 @@ async fn chat_local_blocking(
     let text = body["answer"].as_str().unwrap_or_default().to_string();
     let citations = node_citations(&body["citations"], &text);
     let model = body["model"].as_str().map(|s| s.to_string());
+    let scope = read_scope(&body);
 
-    if print {
-        println!("{} {}", "AI:".cyan().bold(), text);
+    // Nothing streamed, so there is no progressive rendering to do; the answer
+    // is printed the way this echo mode would have assembled it.
+    match echo {
+        Echo::Markdown => {
+            let mut md = crate::markdown::MarkdownStream::new();
+            md.push(&text);
+            md.finish();
+        }
+        Echo::Raw => println!("{} {}", "AI:".cyan().bold(), text),
+        Echo::Silent => {}
+    }
+    if echo.prints() {
         print_citations(&citations);
     }
 
@@ -950,6 +1369,9 @@ async fn chat_local_blocking(
         // whole wait here would read as an instant answer that then took
         // seconds to finish, which is the opposite of what happened.
         first_token_ms: None,
+        total_ms: None,
+        conversation_id: None,
+        scope,
     }))
 }
 
@@ -965,14 +1387,16 @@ async fn chat_local_blocking(
 async fn read_local_answer_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
-    print: bool,
+    echo: Echo,
     asked_at: std::time::Instant,
-) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
+) -> Result<StreamOutcome> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
-    let mut raw_citations = serde_json::Value::Null;
+    let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
+    let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
+    let mut scope: Option<(u64, u64)> = None;
     let mut event = String::new();
     let mut first_token = true;
     let mut first_token_ms: Option<u128> = None;
@@ -1001,8 +1425,13 @@ async fn read_local_answer_stream(
 
             match event.as_str() {
                 "meta" => {
-                    raw_citations = parsed["citations"].clone();
+                    // Parsed here rather than at the end so the sources can be
+                    // named while the model is still generating; which of them
+                    // the answer used is stamped on once it is complete.
+                    citations = parse_node_citations(&parsed["citations"]);
+                    scope = read_scope(&parsed);
                     model = parsed["model"].as_str().map(|s| s.to_string());
+                    pb.set_message(retrieval_progress(&citations));
                 }
                 "error" => {
                     stream_error = Some(
@@ -1016,15 +1445,24 @@ async fn read_local_answer_stream(
                 "done" => {}
                 _ => {
                     if let Some(token) = parsed["token"].as_str() {
-                        if print {
-                            // Clear the spinner only once the first token is in
-                            // hand, so the line it occupied is reused.
-                            if first_token {
-                                pb.finish_and_clear();
+                        // Clear the spinner only once the first token is in
+                        // hand, so the line it occupied is reused.
+                        if first_token && echo.prints() {
+                            pb.finish_and_clear();
+                            // The markdown renderer owns whole lines, so a
+                            // prefix on the first one would only misalign the
+                            // rest of the answer under it.
+                            if echo == Echo::Raw {
                                 print!("{} ", "AI:".cyan().bold());
                             }
-                            print!("{}", token);
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        match &mut markdown {
+                            Some(md) => md.push(token),
+                            None if echo == Echo::Raw => {
+                                print!("{}", token);
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                            None => {}
                         }
                         if first_token {
                             first_token_ms = Some(asked_at.elapsed().as_millis());
@@ -1040,8 +1478,14 @@ async fn read_local_answer_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
-    if print && !first_token {
+    if let Some(md) = &mut markdown {
+        md.finish();
+    } else if echo == Echo::Raw && !first_token {
         println!();
     }
 
@@ -1049,11 +1493,19 @@ async fn read_local_answer_stream(
         return Err(anyhow!("Local node could not answer: {}", code));
     }
 
-    let citations = node_citations(&raw_citations, &answer);
-    if print {
+    stamp_cited(&mut citations, &answer);
+    if echo.prints() {
         print_citations(&citations);
     }
-    Ok((answer, citations, model, first_token_ms))
+    Ok(StreamOutcome {
+        text: answer,
+        citations,
+        model,
+        first_token_ms,
+        total_ms,
+        conversation_id: None,
+        scope,
+    })
 }
 
 /// Map the node's citation shape onto the CLI's.
@@ -1065,23 +1517,80 @@ async fn read_local_answer_stream(
 /// answer never referenced is context the model saw, not a source it cited, and
 /// showing the two alike would overstate what the answer rests on.
 fn node_citations(raw: &serde_json::Value, answer: &str) -> Vec<Citation> {
-    let referenced = referenced_indexes(answer);
+    let mut citations = parse_node_citations(raw);
+    stamp_cited(&mut citations, answer);
+    citations
+}
+
+/// The passages the node retrieved, before anything is known about which of
+/// them the answer used.
+///
+/// Split out because the `meta` frame arrives before the first token, so the
+/// sources can be named while the model is still generating. `cited` stays
+/// false until the answer can settle it.
+fn parse_node_citations(raw: &serde_json::Value) -> Vec<Citation> {
     raw.as_array()
         .map(|items| {
             items
                 .iter()
-                .map(|c| {
-                    let index = c["index"].as_u64().map(|n| n as u32);
-                    Citation {
-                        index,
-                        content: c["content"].as_str().map(|s| s.to_string()),
-                        source: serde_json::from_value(c["metadata"]["source"].clone()).ok(),
-                        cited: Some(index.map(|i| referenced.contains(&i)).unwrap_or(false)),
-                    }
+                .map(|c| Citation {
+                    index: c["index"].as_u64().map(|n| n as u32),
+                    content: c["content"].as_str().map(|s| s.to_string()),
+                    source: serde_json::from_value(c["metadata"]["source"].clone()).ok(),
+                    cited: Some(false),
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// How much of a scoped answer's documents reached the model.
+///
+/// Absent for an ordinary question, and absent from a node that predates
+/// document scoping, which is the same thing as far as the reader is concerned:
+/// nothing to say about a scope that was never asked for.
+fn read_scope(value: &serde_json::Value) -> Option<(u64, u64)> {
+    let scope = value.get("scope")?;
+    Some((
+        scope["chunksUsed"].as_u64()?,
+        scope["chunksTotal"].as_u64()?,
+    ))
+}
+
+/// One dim line when a scoped answer saw only part of what it was pointed at.
+///
+/// Silent when the whole of it fitted. The point of scoping is to stop a
+/// confident answer resting on an arbitrary sliver, so an answer that still
+/// rests on part of the material has to say which part it is missing, or the
+/// same failure returns wearing a different flag.
+pub fn print_scope_note(answer: &ChatAnswer) {
+    let Some((used, total)) = answer.scope else {
+        return;
+    };
+    if used >= total || total == 0 {
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "Grounded in the first {} of {} passages; the rest did not fit.",
+            used, total
+        )
+        .dimmed()
+    );
+}
+
+/// Mark the passages whose `[n]` markers appear in the finished answer.
+fn stamp_cited(citations: &mut [Citation], answer: &str) {
+    let referenced = referenced_indexes(answer);
+    for citation in citations.iter_mut() {
+        citation.cited = Some(
+            citation
+                .index
+                .map(|i| referenced.contains(&i))
+                .unwrap_or(false),
+        );
+    }
 }
 
 /// The citation markers an answer actually used, as in "... [1] ... [3]".
@@ -1120,17 +1629,20 @@ fn referenced_indexes(answer: &str) -> Vec<u32> {
 async fn read_chat_stream(
     resp: reqwest::Response,
     pb: &ProgressBar,
-    stream_to_stdout: bool,
+    echo: Echo,
     asked_at: std::time::Instant,
-) -> Result<(String, Vec<Citation>, Option<String>, Option<u128>)> {
+) -> Result<StreamOutcome> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
+    let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
+    let mut scope: Option<(u64, u64)> = None;
     // Which citations the answer actually referenced. It arrives at the end, in
     // the `done` frame, rather than on the citations themselves.
     let mut cited_indexes: Vec<u32> = Vec::new();
+    let mut conversation_id: Option<String> = None;
     let mut event = String::new();
     let mut first_token = true;
     let mut first_token_ms: Option<u128> = None;
@@ -1162,6 +1674,13 @@ async fn read_chat_stream(
                     citations =
                         serde_json::from_value(parsed["citations"].clone()).unwrap_or_default();
                     model = parsed["model"].as_str().map(|s| s.to_string());
+                    // Null when the control plane could not open a thread, so a
+                    // failure to persist is not read as a thread called "null".
+                    conversation_id = parsed["conversationId"].as_str().map(|s| s.to_string());
+                    scope = read_scope(&parsed);
+                    // Retrieval is done; the rest of the wait is the model. Say
+                    // what it found rather than leaving "Thinking..." up.
+                    pb.set_message(retrieval_progress(&citations));
                 }
                 "error" => {
                     stream_error = Some(
@@ -1183,15 +1702,24 @@ async fn read_chat_stream(
                 }
                 _ => {
                     if let Some(token) = parsed["token"].as_str() {
-                        if stream_to_stdout {
-                            // Clear the spinner only once the first token is in
-                            // hand, so the line it occupied is reused.
-                            if first_token {
-                                pb.finish_and_clear();
+                        // Clear the spinner only once the first token is in
+                        // hand, so the line it occupied is reused.
+                        if first_token && echo.prints() {
+                            pb.finish_and_clear();
+                            // The markdown renderer owns whole lines, so a
+                            // prefix on the first one would only misalign the
+                            // rest of the answer under it.
+                            if echo == Echo::Raw {
                                 print!("{} ", "AI:".cyan().bold());
                             }
-                            print!("{}", token);
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        match &mut markdown {
+                            Some(md) => md.push(token),
+                            None if echo == Echo::Raw => {
+                                print!("{}", token);
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                            None => {}
                         }
                         if first_token {
                             first_token_ms = Some(asked_at.elapsed().as_millis());
@@ -1208,8 +1736,14 @@ async fn read_chat_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
-    if stream_to_stdout && !first_token {
+    if let Some(md) = &mut markdown {
+        md.finish();
+    } else if echo == Echo::Raw && !first_token {
         println!();
     }
 
@@ -1228,7 +1762,15 @@ async fn read_chat_stream(
         citation.cited = Some(referenced);
     }
 
-    Ok((answer, citations, model, first_token_ms))
+    Ok(StreamOutcome {
+        text: answer,
+        citations,
+        model,
+        first_token_ms,
+        total_ms,
+        conversation_id,
+        scope,
+    })
 }
 
 /// True when the deterministic mock wrote the answer.
@@ -1266,6 +1808,54 @@ pub fn print_answer_footer(target: &Target, answer: &ChatAnswer) {
     );
 }
 
+/// A wait worth explaining. Under this, the split is noise on an answer that
+/// arrived promptly; the same threshold the spinner counts from.
+const TIMING_SHOWN_AFTER: Duration = WAITED_AFTER;
+
+/// The two halves of a wait worth explaining, or `None` when it is not.
+///
+/// Separated from the printing so the thresholds and the subtraction can be
+/// tested without capturing stdout.
+fn timing_split(answer: &ChatAnswer) -> Option<(u128, u128)> {
+    let (first, total) = (answer.first_token_ms?, answer.total_ms?);
+    if total < TIMING_SHOWN_AFTER.as_millis() {
+        return None;
+    }
+    // Saturating because the two are sampled separately; a total below the
+    // first token would otherwise wrap into an enormous generation time.
+    Some((first, total.saturating_sub(first)))
+}
+
+/// The passage carrying a given `[n]` marker, if the last answer had one.
+fn find_source(citations: &[Citation], index: u32) -> Option<&Citation> {
+    citations.iter().find(|c| c.index == Some(index))
+}
+
+/// One dim line splitting a slow answer into finding and writing.
+///
+/// Both numbers are already measured on every answer and were read only by
+/// `knaix bench`. Everything before the first token is retrieval, reranking and
+/// prompt assembly; everything after it is the model. Someone whose answers are
+/// slow cannot act until they know which half to blame, and the whole point of
+/// bringing a model of your own is that both halves are yours to change.
+///
+/// Silent on a quick answer, and silent when nothing streamed, since there is
+/// then no first token to have timed.
+pub fn print_answer_timing(answer: &ChatAnswer) {
+    let Some((first, generating)) = timing_split(answer) else {
+        return;
+    };
+    println!(
+        "{}",
+        format!(
+            "{} to the first word, {} writing.",
+            format_duration_ms(first),
+            format_duration_ms(generating)
+        )
+        .dimmed()
+    );
+}
+
 /// The answer as one JSON object, for scripting. Citations carry their
 /// `cited` flag rather than being pre-filtered, so a consumer can choose
 /// between "what the answer used" and "what the node considered".
@@ -1276,6 +1866,18 @@ pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
             "answer": answer.text,
             "model": answer.model,
             "citations": answer.citations,
+            // Measured on every answer; absent when nothing streamed.
+            "firstTokenMs": answer.first_token_ms,
+            "totalMs": answer.total_ms,
+            // Present only for a document-scoped answer.
+            "scope": answer.scope.map(|(used, total)| serde_json::json!({
+                "chunksUsed": used,
+                "chunksTotal": total,
+            })),
+            // Null for a local node, and for a hosted one that could not open a
+            // thread. A script that wants a follow-up answered in context sends
+            // this back; there is nothing else to correlate two questions by.
+            "conversationId": answer.conversation_id,
         }))?
     );
     Ok(())
@@ -1302,6 +1904,52 @@ fn citation_source_name(citation: &Citation) -> String {
     }
 }
 
+/// How many source names the progress line lists before summarising the rest.
+/// Two fits a narrow terminal; past that the names stop being the useful part.
+const PROGRESS_SOURCES: usize = 2;
+
+/// The progress line shown once retrieval lands and generation begins.
+///
+/// Both answer streams send the citations before the first token, so the wait
+/// for the model is time we can already say something about. Naming the
+/// documents turns it into evidence that retrieval found the right ones.
+fn retrieval_progress(citations: &[Citation]) -> String {
+    if citations.is_empty() {
+        // Not a failure: the model is told to say it lacks the answer. Saying so
+        // now explains an "I don't have that" that is still seconds away.
+        return "No matching passages found; answering without context...".to_string();
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for citation in citations {
+        let name = citation_source_name(citation);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    let passages = if citations.len() == 1 {
+        "1 passage".to_string()
+    } else {
+        format!("{} passages", citations.len())
+    };
+
+    let shown = names
+        .iter()
+        .take(PROGRESS_SOURCES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = names.len().saturating_sub(PROGRESS_SOURCES);
+    let sources = if rest > 0 {
+        format!("{} and {} more", shown, rest)
+    } else {
+        shown
+    };
+
+    format!("Reading {} from {}...", passages, sources)
+}
+
 /// Render the passages an answer was grounded in, so a claim can be checked
 /// against the node's own corpus rather than taken on trust.
 pub fn print_citations(citations: &[Citation]) {
@@ -1326,6 +1974,54 @@ pub fn print_citations(citations: &[Citation]) {
         };
         println!("  {} {}", format!("[{}]", index).cyan(), name.dimmed());
         println!("      {}", snippet);
+    }
+    println!();
+}
+
+/// Print one retrieved passage whole.
+///
+/// The node returns the full passage and the citation list shows the first 160
+/// characters of it, so the evidence behind a claim was arriving and being
+/// thrown away at the point of display. A passage that was retrieved but never
+/// cited is worth reading too -- it is what the model saw and did not use --
+/// so it is reachable here and labelled rather than hidden.
+pub fn print_source(citations: &[Citation], index: u32) {
+    let Some(citation) = find_source(citations, index) else {
+        let known: Vec<String> = citations
+            .iter()
+            .filter_map(|c| c.index)
+            .map(|i| i.to_string())
+            .collect();
+        if known.is_empty() {
+            println!("{} That answer retrieved no passages.", "Info:".blue());
+        } else {
+            println!(
+                "{} No passage [{}] in the last answer. It retrieved {}.",
+                "Error:".red(),
+                index,
+                known.join(", ")
+            );
+        }
+        return;
+    };
+
+    println!(
+        "\n{} {}",
+        format!("[{}]", index).cyan(),
+        citation_source_name(citation).bold()
+    );
+    if !citation.cited.unwrap_or(false) {
+        println!(
+            "{}",
+            "Retrieved for this question, but the answer did not cite it.".dimmed()
+        );
+    }
+    println!();
+    match citation.content.as_deref() {
+        Some(content) if !content.trim().is_empty() => println!("{}", content.trim()),
+        // The node returns a passage without its text when the store holds only
+        // the vector; saying so beats printing a blank.
+        _ => println!("{}", "The node returned no text for this passage.".dimmed()),
     }
     println!();
 }
@@ -2378,13 +3074,18 @@ mod tests {
                 content: "Within 30 days [1].".into(),
             },
         ];
-        let body = build_local_answer_body("abc", "and cabin class?", &history, Verbosity::Normal);
+        let body = build_local_answer_body(
+            "abc",
+            "and cabin class?",
+            &history,
+            &AnswerOptions::default(),
+        );
         assert_eq!(body["instance_id"], "abc");
         assert_eq!(body["query"], "and cabin class?");
         let system = body["system"].as_str().unwrap();
         assert!(!system.is_empty(), "system prompt must not be empty");
         assert!(
-            system.contains("[n]"),
+            system.contains("cite"),
             "the prompt should ask the model to cite: {system}"
         );
         assert_eq!(body["history"].as_array().unwrap().len(), 2);
@@ -2446,8 +3147,11 @@ mod tests {
         // what this protects. A phrase match broke on the first rewording and
         // said nothing about the invariant.
         let shared = common_prefix(&common_prefix(&brief, &normal), &detailed);
+        // On the word rather than the marker format: the format is a detail the
+        // prompt is allowed to reword, and pinning it here is what broke when it
+        // was reworded to stop a real model citing section headings instead.
         assert!(
-            shared.contains("[n]"),
+            shared.contains("cite"),
             "every level must ask for citations: {shared}"
         );
         assert!(
@@ -2515,6 +3219,423 @@ mod tests {
         assert_eq!(cites[0].cited, Some(true));
         // Retrieved but never referenced: context, not a source.
         assert_eq!(cites[1].cited, Some(false));
+    }
+
+    /// The progress line is built from the `meta` frame, which lands before a
+    /// single token of the answer does. Nothing may be claimed there that is
+    /// only knowable afterwards -- above all not which passages were cited.
+    #[test]
+    fn sources_are_named_from_meta_before_the_answer_exists() {
+        let raw = serde_json::json!([
+            { "index": 1, "content": "p", "metadata": { "source": { "name": "a.md" } } },
+            { "index": 2, "content": "q", "metadata": { "source": { "name": "b.md" } } }
+        ]);
+        let parsed = parse_node_citations(&raw);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].source.as_ref().unwrap().name.as_deref(),
+            Some("a.md")
+        );
+        // Unknowable this early, so claimed for nothing.
+        assert!(parsed.iter().all(|c| c.cited == Some(false)));
+    }
+
+    /// Parsing early and stamping late has to land where parsing late did, or
+    /// the local path's citations would differ from the blocking path's.
+    #[test]
+    fn parsing_early_and_stamping_late_matches_doing_both_at_the_end() {
+        let raw = serde_json::json!([
+            { "index": 1, "content": "p", "metadata": { "source": { "name": "a.md" } } },
+            { "index": 2, "content": "q", "metadata": { "source": { "name": "b.md" } } }
+        ]);
+        let answer = "Grounded in [2].";
+
+        let mut split = parse_node_citations(&raw);
+        stamp_cited(&mut split, answer);
+        let at_once = node_citations(&raw, answer);
+
+        let flags = |cs: &[Citation]| cs.iter().map(|c| c.cited).collect::<Vec<_>>();
+        assert_eq!(flags(&split), flags(&at_once));
+        assert_eq!(flags(&split), vec![Some(false), Some(true)]);
+    }
+
+    /// The prompt asks for a shape; this is what makes the ask stick. Without a
+    /// cap, a detailed answer is cut off at the node's default.
+    #[test]
+    fn a_detailed_answer_is_given_more_room_than_a_brief_one() {
+        assert!(Verbosity::Brief.max_tokens() < Verbosity::Normal.max_tokens());
+        assert!(Verbosity::Detailed.max_tokens() > Verbosity::Normal.max_tokens());
+    }
+
+    /// Normal has to stay exactly the node's own default, so a user who passes
+    /// no flag gets the length they always got.
+    #[test]
+    fn normal_asks_for_the_nodes_own_ceiling() {
+        assert_eq!(Verbosity::Normal.max_tokens(), NODE_OUTPUT_CEILING);
+    }
+
+    /// The node clamps to the ceiling `local up` gives it, so a level asking for
+    /// more than that is clamped back and the flag does nothing. This is the
+    /// pairing that keeps detailed reachable.
+    #[test]
+    fn no_level_asks_for_more_than_the_node_is_started_with() {
+        for level in [Verbosity::Brief, Verbosity::Normal, Verbosity::Detailed] {
+            assert!(
+                level.max_tokens() <= MAX_ANSWER_TOKENS,
+                "{level:?} asks past the ceiling local up sets"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_body_carries_the_cap_alongside_the_prompt() {
+        let body = build_local_answer_body(
+            "abc",
+            "why?",
+            &[],
+            &AnswerOptions {
+                verbosity: Verbosity::Detailed,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(Verbosity::Detailed.max_tokens() as u64)
+        );
+        // Both halves travel: the cap does not replace the shape.
+        assert!(body["system"].as_str().unwrap().contains("thorough answer"));
+    }
+
+    /// The control plane matches on these exact strings, and anything it does
+    /// not recognise silently becomes normal, so a typo here is invisible.
+    #[test]
+    fn the_wire_names_are_the_ones_the_control_plane_reads() {
+        assert_eq!(Verbosity::Brief.as_str(), "brief");
+        assert_eq!(Verbosity::Normal.as_str(), "normal");
+        assert_eq!(Verbosity::Detailed.as_str(), "detailed");
+    }
+
+    fn timed(first: Option<u128>, total: Option<u128>) -> ChatAnswer {
+        ChatAnswer {
+            text: "a".into(),
+            citations: vec![],
+            model: None,
+            first_token_ms: first,
+            total_ms: total,
+            conversation_id: None,
+            scope: None,
+        }
+    }
+
+    /// The split is only worth printing once the wait was long enough to want
+    /// explaining, and only when there was a first token to have timed.
+    #[test]
+    fn timing_is_shown_for_a_slow_answer_and_not_a_quick_one() {
+        assert!(timing_split(&timed(Some(100), Some(900))).is_none());
+        assert!(timing_split(&timed(Some(2_000), Some(9_000))).is_some());
+        // Nothing streamed: no first token, so no split to report.
+        assert!(timing_split(&timed(None, Some(9_000))).is_none());
+        assert!(timing_split(&timed(Some(2_000), None)).is_none());
+    }
+
+    /// The two are sampled separately, so a total under the first token is
+    /// possible; subtracting must not wrap into an enormous generation time.
+    #[test]
+    fn a_total_below_the_first_token_does_not_wrap() {
+        let (_, generating) = timing_split(&timed(Some(9_000), Some(8_000))).unwrap();
+        assert_eq!(generating, 0);
+    }
+
+    #[test]
+    fn the_split_is_the_wait_before_and_after_the_first_word() {
+        let (first, generating) = timing_split(&timed(Some(2_000), Some(9_000))).unwrap();
+        assert_eq!(first, 2_000);
+        assert_eq!(generating, 7_000);
+    }
+
+    fn citation_at(index: u32, name: &str, cited: bool) -> Citation {
+        Citation {
+            index: Some(index),
+            content: Some(format!("full text of {name}")),
+            source: Some(DocumentSource {
+                r#type: None,
+                name: Some(name.to_string()),
+            }),
+            cited: Some(cited),
+        }
+    }
+
+    /// A passage the answer never cited is what the model saw and did not use,
+    /// which is worth reading; it must be reachable rather than hidden.
+    #[test]
+    fn a_source_is_found_whether_or_not_the_answer_cited_it() {
+        let cites = vec![citation_at(1, "a.md", true), citation_at(2, "b.md", false)];
+        assert!(find_source(&cites, 1).is_some());
+        assert!(find_source(&cites, 2).is_some());
+        assert!(find_source(&cites, 3).is_none());
+    }
+
+    fn doc(id: &str, source: &str) -> NodeDocument {
+        NodeDocument {
+            document_id: id.to_string(),
+            source: Some(source.to_string()),
+            chunks: Some(3),
+        }
+    }
+
+    #[test]
+    fn a_document_resolves_by_its_whole_name_whatever_the_case() {
+        let docs = vec![doc("id-1", "Handbook.md"), doc("id-2", "Refunds.md")];
+        assert_eq!(
+            resolve_document(&docs, "handbook.md").unwrap().document_id,
+            "id-1"
+        );
+        assert_eq!(
+            resolve_document(&docs, "Refunds.md").unwrap().document_id,
+            "id-2"
+        );
+        // The id itself works, for anything that already has one.
+        assert_eq!(resolve_document(&docs, "id-2").unwrap().document_id, "id-2");
+    }
+
+    /// People rarely type a whole filename.
+    #[test]
+    fn a_unique_partial_name_is_enough() {
+        let docs = vec![
+            doc("id-1", "Employee Handbook 2026.pdf"),
+            doc("id-2", "Refunds.md"),
+        ];
+        assert_eq!(
+            resolve_document(&docs, "handbook").unwrap().document_id,
+            "id-1"
+        );
+    }
+
+    /// Grounding an answer in the wrong document and saying nothing is the
+    /// failure this command exists to avoid, so ambiguity is refused.
+    #[test]
+    fn an_ambiguous_name_is_refused_with_the_candidates() {
+        let docs = vec![
+            doc("id-1", "Handbook 2025.pdf"),
+            doc("id-2", "Handbook 2026.pdf"),
+        ];
+        let err = resolve_document(&docs, "handbook").unwrap_err().to_string();
+        assert!(err.contains("Handbook 2025.pdf"), "{err}");
+        assert!(err.contains("Handbook 2026.pdf"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_name_lists_what_the_node_does_hold() {
+        let docs = vec![doc("id-1", "Handbook.md")];
+        let err = resolve_document(&docs, "invoices").unwrap_err().to_string();
+        assert!(err.contains("Handbook.md"), "{err}");
+    }
+
+    /// An ordinary question's body must be unchanged, so a node predating
+    /// document scoping sees exactly what it always did.
+    #[test]
+    fn an_unscoped_question_carries_no_document_ids() {
+        let body = build_local_answer_body("abc", "why?", &[], &AnswerOptions::default());
+        assert!(body["policy"].get("document_ids").is_none());
+    }
+
+    #[test]
+    fn a_scoped_question_names_its_documents() {
+        let options = AnswerOptions {
+            retrieval: Retrieval {
+                document_ids: vec!["id-1".into(), "id-2".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = build_local_answer_body("abc", "summarize", &[], &options);
+        assert_eq!(
+            body["policy"]["document_ids"],
+            serde_json::json!(["id-1", "id-2"])
+        );
+    }
+
+    /// A scoped answer that saw all of its documents has nothing to confess.
+    #[test]
+    fn the_scope_note_is_only_for_a_partial_answer() {
+        assert_eq!(read_scope(&serde_json::json!({})), None);
+        assert_eq!(
+            read_scope(&serde_json::json!({"scope": {"chunksUsed": 12, "chunksTotal": 40}})),
+            Some((12, 40))
+        );
+    }
+
+    /// The whole point of the change: a local node reranks every question.
+    #[test]
+    fn a_local_question_always_asks_for_the_reranker() {
+        let body = build_local_answer_body("abc", "why?", &[], &AnswerOptions::default());
+        assert_eq!(body["policy"]["rerank"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn the_depth_asked_for_is_the_depth_sent() {
+        let body = build_local_answer_body(
+            "abc",
+            "why?",
+            &[],
+            &AnswerOptions {
+                retrieval: Retrieval {
+                    k: 12,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["policy"]["k"].as_u64(), Some(12));
+    }
+
+    /// Unset means the node's own default, so a question asked without --k is
+    /// retrieved exactly as it was before the flag existed.
+    #[test]
+    fn no_flag_asks_for_the_nodes_own_depth() {
+        assert_eq!(checked_k(None).unwrap(), DEFAULT_K);
+        assert_eq!(AnswerOptions::default().retrieval.k, DEFAULT_K);
+    }
+
+    /// The node clamps silently, so an out-of-range depth would come back as an
+    /// answer built on something nobody asked for.
+    #[test]
+    fn an_impossible_depth_is_refused_rather_than_clamped() {
+        assert!(checked_k(Some(0)).is_err());
+        assert!(checked_k(Some(MAX_K + 1)).is_err());
+        assert_eq!(checked_k(Some(1)).unwrap(), 1);
+        assert_eq!(checked_k(Some(MAX_K)).unwrap(), MAX_K);
+    }
+
+    /// A fast answer must not pick up a counter it never needed.
+    #[test]
+    fn a_short_wait_is_not_counted() {
+        assert_eq!(waited_label(Duration::from_secs(0)), "");
+        assert_eq!(waited_label(Duration::from_millis(4_999)), "");
+    }
+
+    /// Past the threshold the wait is visibly moving, which is the difference
+    /// between a model working and a connection that has died.
+    #[test]
+    fn a_long_wait_is_counted_in_seconds() {
+        assert_eq!(waited_label(Duration::from_secs(5)), "5s ");
+        assert_eq!(waited_label(Duration::from_secs(59)), "59s ");
+    }
+
+    /// Three digits of seconds is a number the reader has to divide before they
+    /// can react to it.
+    #[test]
+    fn a_wait_past_a_minute_reads_as_minutes() {
+        assert_eq!(waited_label(Duration::from_secs(60)), "1m00s ");
+        assert_eq!(waited_label(Duration::from_secs(125)), "2m05s ");
+        assert_eq!(waited_label(Duration::from_secs(3_600)), "60m00s ");
+    }
+
+    #[test]
+    fn the_progress_line_names_the_documents_retrieval_found() {
+        let cites = vec![citation_named("Handbook.md"), citation_named("Refunds.md")];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 2 passages from Handbook.md, Refunds.md..."
+        );
+    }
+
+    #[test]
+    fn one_passage_is_not_pluralised() {
+        assert_eq!(
+            retrieval_progress(&[citation_named("Handbook.md")]),
+            "Reading 1 passage from Handbook.md..."
+        );
+    }
+
+    /// Several passages from one document are one source to a reader.
+    #[test]
+    fn repeated_sources_are_named_once() {
+        let cites = vec![citation_named("Handbook.md"), citation_named("Handbook.md")];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 2 passages from Handbook.md..."
+        );
+    }
+
+    /// A long list would push the spinner past the width of a terminal, and the
+    /// names stop being the useful part well before that.
+    #[test]
+    fn a_long_source_list_is_summarised() {
+        let cites = vec![
+            citation_named("a.md"),
+            citation_named("b.md"),
+            citation_named("c.md"),
+            citation_named("d.md"),
+        ];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 4 passages from a.md, b.md and 2 more..."
+        );
+    }
+
+    /// Retrieval finding nothing is not an error, but it does decide the answer
+    /// that is still seconds away; saying so early explains it.
+    #[test]
+    fn an_empty_retrieval_says_so_rather_than_naming_nothing() {
+        assert_eq!(
+            retrieval_progress(&[]),
+            "No matching passages found; answering without context..."
+        );
+    }
+
+    /// A thread deleted underneath a session must not end it. The question is
+    /// asked again without the id, and the control plane opens a new thread.
+    #[test]
+    fn a_vanished_conversation_is_asked_again_without_it() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        assert!(resend_without_conversation(404, &body, true));
+    }
+
+    /// A 404 for the node itself is the caller's real error. Retrying it would
+    /// spend a second request to arrive at the same failure.
+    #[test]
+    fn a_404_that_is_not_about_the_thread_is_not_retried() {
+        let body = serde_json::json!({ "error": "Node not found" });
+        assert!(!resend_without_conversation(404, &body, true));
+        assert!(!resend_without_conversation(
+            404,
+            &serde_json::json!({}),
+            true
+        ));
+    }
+
+    /// Nothing to drop, so nothing to retry: a second identical request would
+    /// only ask the same question twice.
+    #[test]
+    fn a_first_question_is_never_retried() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        assert!(!resend_without_conversation(404, &body, false));
+    }
+
+    /// Only 404 means the thread is gone. A 500 is the control plane's problem
+    /// and asking again would double a question that may already have run.
+    #[test]
+    fn other_statuses_are_left_alone() {
+        let body = serde_json::json!({ "error": "Conversation not found" });
+        for status in [400, 401, 403, 429, 500, 503] {
+            assert!(
+                !resend_without_conversation(status, &body, true),
+                "status {status}"
+            );
+        }
+    }
+
+    /// The progress line goes through the same naming as the citation list, so
+    /// a saved note is not shown by its internal filename here either.
+    #[test]
+    fn a_remember_note_is_named_the_same_way_in_progress() {
+        let cites = vec![citation_named(NOTES_FILE)];
+        assert_eq!(
+            retrieval_progress(&cites),
+            "Reading 1 passage from your saved note (/remember)..."
+        );
     }
 
     #[test]

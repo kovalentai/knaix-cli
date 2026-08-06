@@ -7,7 +7,6 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 use std::borrow::Cow::{self, Borrowed, Owned};
-use termimad::MadSkin;
 
 /// The prompt as rustyline is given it, with no escapes in it.
 ///
@@ -103,10 +102,25 @@ fn print_help() {
             "Save a fact to this node's notes and ingest it",
         ),
         ("/memory", "List the notes saved for this node"),
-        ("/reset", "Forget the conversation so far and start fresh"),
+        (
+            "/source <n>",
+            "Print passage [n] from the last answer in full",
+        ),
+        (
+            "/reset",
+            "Start a new conversation; earlier questions leave the context",
+        ),
         (
             "/brief, /normal, /detailed",
-            "Set how much detail answers carry (local node)",
+            "Set how much detail answers carry",
+        ),
+        (
+            "/k <n>",
+            "Set how many passages an answer is grounded in (local node)",
+        ),
+        (
+            "/doc <name>",
+            "Ground answers in one document; /doc alone clears it (local node)",
         ),
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
@@ -141,12 +155,15 @@ async fn remember(ctx: &KnaixContext, target: &crate::nodes::Target, fact: &str)
     }
 }
 
-pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()> {
+pub async fn run(
+    ctx: &KnaixContext,
+    target: &crate::nodes::Target,
+    start: crate::nodes::AnswerOptions,
+) -> Result<()> {
     let node_id = &target.label();
     let mut rl: Editor<ReplHelper, DefaultHistory> =
         Editor::new().context("Failed to initialize readline")?;
     rl.set_helper(Some(ReplHelper::new(node_id)));
-    let skin = MadSkin::default_dark();
 
     println!(
         "\n{} {} session with {}. {} lists commands; {} ends the session.",
@@ -163,7 +180,23 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     // not grow the request without bound.
     let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
     // How much detail answers carry, adjustable mid-session with /brief etc.
-    let mut verbosity = crate::nodes::Verbosity::Normal;
+    // Where the flags said to start; the session commands take it from here.
+    let mut options = start;
+    // The hosted thread this session is in, named by the control plane on the
+    // first answer and sent back with every question after it. Stays None for a
+    // local node, which is kept in context by `history` instead.
+    let mut conversation: Option<String> = None;
+    // Said once per session, so a hosted node that cannot keep a thread is not
+    // silently answering every question as though it were the first.
+    let mut warned_threadless = false;
+    // The passages behind the last answer, so /source can print one whole. The
+    // citation list only shows the first line or so of each.
+    let mut last_citations: Option<Vec<crate::nodes::Citation>> = None;
+    // Said once, the first time an answer cites something. The citation list
+    // shows a passage truncated with an ellipsis and nothing about it says the
+    // rest is a command away, so the feature would otherwise be found only by
+    // reading /help.
+    let mut pointed_at_source = false;
 
     // The node does not change mid-session, so the prompt is built once.
     let prompt = plain_prompt(node_id);
@@ -196,6 +229,83 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             }
                             continue;
                         }
+                        "/k" => {
+                            // Parsed before it is range-checked, so junk reads
+                            // as a usage mistake rather than silently becoming
+                            // the default.
+                            match args.trim().parse::<u32>() {
+                                Err(_) => println!(
+                                    "{} Usage: /k <n>, between 1 and {}.",
+                                    "Error:".red(),
+                                    crate::nodes::MAX_K
+                                ),
+                                // Confirming a depth a hosted node never
+                                // receives would be a worse answer than
+                                // refusing: the session would read as though
+                                // the setting had taken.
+                                Ok(_) if !target.is_local() => println!(
+                                    "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                                    "Note:".blue(),
+                                    "/k".cyan()
+                                ),
+                                Ok(n) => match crate::nodes::checked_k(Some(n)) {
+                                    Ok(k) => {
+                                        options.retrieval.k = k;
+                                        println!(
+                                            "{} Answers are now grounded in up to {} passages.",
+                                            "✓".green(),
+                                            k.to_string().cyan()
+                                        );
+                                    }
+                                    Err(e) => println!("{} {}", "Error:".red(), e),
+                                },
+                            }
+                            continue;
+                        }
+                        "/doc" => {
+                            let wanted = args.trim();
+                            if wanted.is_empty() {
+                                options.retrieval.document_ids.clear();
+                                println!(
+                                    "{} Answers are grounded in a search of the whole corpus again.",
+                                    "✓".green()
+                                );
+                                continue;
+                            }
+                            match crate::nodes::scope_to_documents(
+                                ctx,
+                                target,
+                                std::slice::from_ref(&wanted.to_string()),
+                            )
+                            .await
+                            {
+                                Ok(ids) => {
+                                    options.retrieval.document_ids = ids;
+                                    println!(
+                                        "{} Answers are now grounded in {}.",
+                                        "✓".green(),
+                                        wanted.cyan()
+                                    );
+                                }
+                                Err(e) => println!("{} {}", "Error:".red(), e),
+                            }
+                            continue;
+                        }
+                        "/source" => {
+                            match (args.trim().parse::<u32>(), &last_citations) {
+                                (Ok(n), Some(cites)) => crate::nodes::print_source(cites, n),
+                                (Ok(_), None) => println!(
+                                    "{} Nothing to show yet. Ask a question first.",
+                                    "Info:".blue()
+                                ),
+                                (Err(_), _) => println!(
+                                    "{} Usage: /source <n>, the number in a {} marker.",
+                                    "Error:".red(),
+                                    "[n]".cyan()
+                                ),
+                            }
+                            continue;
+                        }
                         "/memory" => {
                             let key = crate::nodes::memory_key(target);
                             if let Err(e) = crate::nodes::view_memory(ctx, &key, None).await {
@@ -204,11 +314,27 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             continue;
                         }
                         "/reset" => {
-                            let had = !history.is_empty();
+                            // Both kinds of context, since which one is in play
+                            // depends on the node and the user asked for neither
+                            // to carry forward. Dropping the id starts a new
+                            // thread; the old one is kept, not deleted.
+                            let had = !history.is_empty() || conversation.is_some();
+                            // A hosted thread is left behind, not deleted, so
+                            // say that rather than "cleared". Someone resetting
+                            // to drop a question would otherwise read this as
+                            // the transcript being gone.
+                            let kept = conversation.is_some();
                             history.clear();
-                            if had {
+                            conversation = None;
+                            last_citations = None;
+                            if had && kept {
                                 println!(
-                                    "{} Conversation cleared. The next question starts fresh.",
+                                    "{} Starting a new conversation. Earlier questions leave the context; the previous conversation is kept.",
+                                    "✓".green()
+                                );
+                            } else if had {
+                                println!(
+                                    "{} Starting fresh. Earlier questions leave the context.",
                                     "✓".green()
                                 );
                             } else {
@@ -217,7 +343,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             continue;
                         }
                         "/brief" | "/normal" | "/detailed" => {
-                            verbosity = match cmd {
+                            options.verbosity = match cmd {
                                 "/brief" => crate::nodes::Verbosity::Brief,
                                 "/detailed" => crate::nodes::Verbosity::Detailed,
                                 _ => crate::nodes::Verbosity::Normal,
@@ -243,15 +369,60 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
 
                 message_count += 1;
 
-                match crate::nodes::chat(ctx, target, &input, false, &history, verbosity).await {
+                // Printed before the request, because from here on the answer
+                // prints itself as it arrives.
+                println!();
+                // Markdown rather than raw: a hosted answer carries headings and
+                // bullets. Sources print inside, as they do for a one-shot
+                // question, so an ungrounded claim is as visible in a session.
+                match crate::nodes::chat(
+                    ctx,
+                    target,
+                    &input,
+                    crate::nodes::Echo::Markdown,
+                    &history,
+                    &options,
+                    conversation.as_deref(),
+                )
+                .await
+                {
+                    // An answer that streamed nothing printed nothing, so say so
+                    // rather than returning a bare prompt. Spaced like an answer
+                    // would have been, so the prompt does not jump up the screen
+                    // on the one turn that failed.
+                    Ok(Some(answer)) if answer.text.trim().is_empty() => {
+                        println!("{}", "Warning: Node returned an empty response.".yellow());
+                        println!();
+                    }
                     Ok(Some(answer)) => {
-                        println!();
-                        skin.print_text(&answer.text);
-                        // Show sources here too: an ungrounded claim should be
-                        // as visible in a session as in a one-shot command.
-                        crate::nodes::print_citations(&answer.citations);
+                        crate::nodes::print_scope_note(&answer);
+                        crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
+                        last_citations = Some(answer.citations.clone());
+                        let cited_any = answer.citations.iter().any(|c| c.cited.unwrap_or(false));
+                        if cited_any && !pointed_at_source {
+                            pointed_at_source = true;
+                            println!("{}", "Tip: /source <n> prints a passage in full.".dimmed());
+                        }
                         println!();
+                        // Follow the thread the control plane opened, so the
+                        // next question is answered in the context of this one.
+                        if answer.conversation_id.is_some() {
+                            conversation = answer.conversation_id.clone();
+                        // A turn the control plane could not store. The id in
+                        // hand is kept rather than dropped, because the failure
+                        // is often transient and the next turn resumes the
+                        // thread -- so this says what happened to this answer,
+                        // not that the node keeps no conversations at all.
+                        } else if !target.is_local() && !warned_threadless {
+                            warned_threadless = true;
+                            println!(
+                                "{}",
+                                "That answer was not added to the conversation, so it may not carry into the next question."
+                                    .dimmed()
+                            );
+                            println!();
+                        }
                         // Record the exchange only once it succeeded, so a
                         // failed turn does not poison the context of the next.
                         crate::nodes::record_turn(

@@ -6,6 +6,7 @@ mod doctor;
 mod exit;
 mod local;
 mod login;
+mod markdown;
 mod mcp;
 mod model_server;
 mod nodes;
@@ -100,13 +101,22 @@ enum Commands {
         /// The question to ask, or '-' to read it from standard input
         message: String,
 
-        /// Answer in one or two sentences (local node only)
+        /// Answer in one or two sentences
         #[clap(long, conflicts_with = "detailed")]
         brief: bool,
 
-        /// Answer thoroughly, with all relevant detail (local node only)
+        /// Answer thoroughly, with all relevant detail
         #[clap(long)]
         detailed: bool,
+
+        /// How many passages to ground the answer in (local node)
+        #[clap(long, value_name = "N")]
+        k: Option<u32>,
+
+        /// Ground the answer in this document rather than a search of the whole
+        /// corpus, by filename. Repeatable (local node)
+        #[clap(long = "doc", value_name = "NAME")]
+        doc: Vec<String>,
     },
 
     /// Ingest a file or directory into a node's knowledge base
@@ -189,6 +199,23 @@ enum Commands {
     },
 
     /// Start an interactive chat session with a node
+    ///
+    /// Answers stream as they are written, render as markdown, and list the
+    /// passages they were grounded in. The flags below set where the session
+    /// starts; the commands change it as you go.
+    ///
+    /// Session commands:
+    ///   /help              Show the commands
+    ///   /source <n>        Print passage [n] from the last answer in full
+    ///   /brief /normal /detailed
+    ///                      How much detail answers carry
+    ///   /k <n>             How many passages an answer is grounded in (local node)
+    ///   /doc <name>        Ground answers in one document; /doc alone clears it (local node)
+    ///   /remember <fact>   Save a fact to this node's notes and ingest it
+    ///   /memory            List the notes saved for this node
+    ///   /reset             Start a new conversation
+    ///   /exit /quit        End the session (Ctrl-D works too)
+    #[clap(verbatim_doc_comment)]
     Repl {
         /// The node to chat with (falls back to the default)
         node_id: Option<String>,
@@ -196,6 +223,23 @@ enum Commands {
         /// The node to chat with, as a flag for symmetry with chat and upload
         #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
         node: Option<String>,
+
+        /// Start the session answering in one or two sentences
+        #[clap(long, conflicts_with = "detailed")]
+        brief: bool,
+
+        /// Start the session answering thoroughly
+        #[clap(long)]
+        detailed: bool,
+
+        /// How many passages to ground answers in (local node)
+        #[clap(long, value_name = "N")]
+        k: Option<u32>,
+
+        /// Start the session grounded in this document, by filename.
+        /// Repeatable (local node)
+        #[clap(long = "doc", value_name = "NAME")]
+        doc: Vec<String>,
     },
 
     /// Provision a hosted node on your Kovalent account
@@ -662,6 +706,8 @@ async fn run() -> Result<()> {
             message,
             brief,
             detailed,
+            k,
+            doc,
         } => {
             let verbosity = if brief {
                 nodes::Verbosity::Brief
@@ -670,6 +716,13 @@ async fn run() -> Result<()> {
             } else {
                 nodes::Verbosity::Normal
             };
+            let mut options = nodes::AnswerOptions {
+                verbosity,
+                retrieval: nodes::Retrieval {
+                    k: nodes::checked_k(k)?,
+                    document_ids: Vec::new(),
+                },
+            };
             let message = if stdin_arg::is_stdin(&message) {
                 stdin_arg::read_text("the question")?
             } else {
@@ -677,25 +730,66 @@ async fn run() -> Result<()> {
             };
             let node_id = project_node(node_id, project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                // Verbosity shapes the local node's system prompt; a hosted node
-                // is prompted by the control plane, so say the flag had no effect
-                // rather than dropping it silently.
-                if verbosity != nodes::Verbosity::Normal && !target.is_local() {
+                // Retrieval depth is the CLI's to set only when it drives the
+                // node directly. A hosted node is policed by the control plane,
+                // so say the flag had no effect rather than dropping it in
+                // silence -- which is what --brief and --detailed used to do.
+                // Names are resolved against the node that will answer, so a
+                // typo is caught here with the candidates rather than becoming
+                // an answer grounded in nothing.
+                if !doc.is_empty() {
+                    match nodes::scope_to_documents(&ctx, &target, &doc).await {
+                        Ok(ids) => options.retrieval.document_ids = ids,
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Scoping reads the named documents whole, so depth has
+                // nothing to select from. Third time a flag would have gone
+                // quietly nowhere.
+                if k.is_some() && !doc.is_empty() {
                     println!(
-                        "{} {} apply to the local node; a hosted node is prompted by the control plane.",
+                        "{} {} has no effect with {}: a scoped answer reads the named documents rather than the closest passages.",
                         "Note:".blue(),
-                        "--brief/--detailed".cyan()
+                        "--k".cyan(),
+                        "--doc".cyan()
+                    );
+                }
+                if k.is_some() && !target.is_local() {
+                    println!(
+                        "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                        "Note:".blue(),
+                        "--k".cyan()
                     );
                 }
                 if ctx.output_format == "json" {
-                    if let Some(answer) =
-                        nodes::chat(&ctx, &target, &message, false, &[], verbosity).await?
+                    if let Some(answer) = nodes::chat(
+                        &ctx,
+                        &target,
+                        &message,
+                        nodes::Echo::Silent,
+                        &[],
+                        &options,
+                        None,
+                    )
+                    .await?
                     {
                         nodes::print_answer_json(&answer)?;
                     }
-                } else if let Some(answer) =
-                    nodes::chat(&ctx, &target, &message, true, &[], verbosity).await?
+                // Raw rather than markdown: this is the output people pipe, and
+                // it must stay the text the node sent.
+                } else if let Some(answer) = nodes::chat(
+                    &ctx,
+                    &target,
+                    &message,
+                    nodes::Echo::Raw,
+                    &[],
+                    &options,
+                    None,
+                )
+                .await?
                 {
+                    nodes::print_scope_note(&answer);
+                    nodes::print_answer_timing(&answer);
                     nodes::print_answer_footer(&target, &answer);
                 }
             }
@@ -906,10 +1000,44 @@ async fn run() -> Result<()> {
             )
             .await?;
         }
-        Commands::Repl { node_id, node } => {
+        Commands::Repl {
+            node_id,
+            node,
+            brief,
+            detailed,
+            k,
+            doc,
+        } => {
             let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                repl::run(&ctx, &target).await?;
+                // The same options `chat` takes, resolved once here so the
+                // session starts where it was asked to rather than needing a
+                // command typed before the first question.
+                let mut options = nodes::AnswerOptions {
+                    verbosity: if brief {
+                        nodes::Verbosity::Brief
+                    } else if detailed {
+                        nodes::Verbosity::Detailed
+                    } else {
+                        nodes::Verbosity::Normal
+                    },
+                    retrieval: nodes::Retrieval {
+                        k: nodes::checked_k(k)?,
+                        document_ids: Vec::new(),
+                    },
+                };
+                if !doc.is_empty() {
+                    options.retrieval.document_ids =
+                        nodes::scope_to_documents(&ctx, &target, &doc).await?;
+                }
+                if k.is_some() && !target.is_local() {
+                    println!(
+                        "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                        "Note:".blue(),
+                        "--k".cyan()
+                    );
+                }
+                repl::run(&ctx, &target, options).await?;
             }
         }
         Commands::Local { action } => match action {

@@ -712,6 +712,16 @@ pub async fn up(
         ));
     }
 
+    // The node clamps every answer to its own ceiling, and its default is the
+    // same 1024 the CLI treats as normal -- so asking for a detailed answer was
+    // clamped straight back to a normal one. Raise the ceiling to what the
+    // longest level asks for and let the per-question ask do the limiting.
+    args.push("-e".into());
+    args.push(format!(
+        "GENERATION_MAX_TOKENS={}",
+        crate::nodes::MAX_ANSWER_TOKENS
+    ));
+
     match &launch.model_url {
         // A real model, if one is being served on this machine.
         Some(url) => {
@@ -766,6 +776,7 @@ pub async fn up(
     save(&node)?;
 
     wait_until_ready(&node).await?;
+    warm_up(&node).await;
 
     println!(
         "\n{} Local node ready on {}.",
@@ -1149,6 +1160,107 @@ fn new_instance_id() -> String {
 }
 
 /// Poll until the node reports ready, or explain why it never did.
+/// How long a warm-up is allowed to run before `up` stops waiting on it.
+///
+/// Generous, because loading a model's weights is the slow part and is exactly
+/// what this exists to absorb, but bounded: the node already serves, so a
+/// warm-up that has not finished by now is better left to finish under the
+/// first question than to hold up the command.
+const WARM_TIMEOUT_SECS: u64 = 90;
+
+/// Output tokens the warm-up asks for. Small, because the answer is discarded,
+/// but not so small that the model can finish without saying anything.
+const WARM_TOKENS: u32 = 8;
+
+/// Ask the node one throwaway question, so the first real one does not pay for
+/// the cold start.
+///
+/// A cold node loads its query embedder on the first question it answers, and a
+/// model server loads its weights, which together are why the answer route is
+/// given five minutes rather than the client default. Paying that here, once,
+/// where it can be labelled, beats paying it invisibly under someone's first
+/// question and leaving them to conclude the product is slow.
+///
+/// Best effort throughout. The node is already serving by this point, so a
+/// warm-up that fails, times out, or hits a node with no model runtime is not a
+/// reason to fail `up`; it only means the saving is not collected.
+async fn warm(node: &LocalNode) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(WARM_TIMEOUT_SECS))
+        .build()
+    else {
+        return false;
+    };
+    let body = serde_json::json!({
+        "instance_id": node.instance_id,
+        "query": "warm up",
+        "system": "Reply with one word.",
+        // Enough tokens that the model reliably produces some. The answer is
+        // thrown away, so one was the obvious budget and the wrong one: a
+        // single token is sometimes spent on an end-of-sequence marker, the
+        // node reports a generation that returned no text, and the warm-up
+        // fails on a node that is working. Measured against a real model, one
+        // token failed once in five and eight never did.
+        "max_tokens": WARM_TOKENS,
+        // The same policy real questions ask for, so the reranker's model is
+        // loaded here too. Warming without it would leave the largest of the
+        // three cold starts to land on the first question after all.
+        "policy": { "k": crate::nodes::DEFAULT_K, "rerank": true },
+    });
+    matches!(
+        client
+            .post(format!("{}/api/query/answer", node.base_url()))
+            .json(&body)
+            .send()
+            .await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// Warm the node and say how long it took, or say nothing at all.
+///
+/// The timing is worth printing because it is the wait it just moved off the
+/// first question. A failure is not worth printing: nothing is wrong with the
+/// node, and an alarming line about an optimization would be worse than silence.
+/// A dot per second while the warm-up runs, matching how waiting for the store
+/// to open already reads. Loading a large model's weights is most of this wait,
+/// and it can run to the timeout; an unchanging line for ninety seconds is the
+/// exact thing this command is meant to stop doing.
+async fn warm_up(node: &LocalNode) {
+    print!("  Warming the store and model");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let started = std::time::Instant::now();
+
+    let mut warming = std::pin::pin!(warm(node));
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+    // The first tick resolves immediately, which would print a dot before any
+    // waiting has happened.
+    ticks.tick().await;
+
+    let warmed = loop {
+        tokio::select! {
+            done = &mut warming => break done,
+            _ = ticks.tick() => {
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    };
+
+    if warmed {
+        println!(" ({:.1}s)", started.elapsed().as_secs_f64());
+    } else {
+        // Said, not silent. The node is fine and the only cost is that the
+        // first question pays what this was meant to absorb -- but printing
+        // nothing meant a warm-up that never worked looked identical to one
+        // that did, which is how this stayed hidden.
+        println!(
+            " {}",
+            "skipped; the first question will be slower.".dimmed()
+        );
+    }
+}
+
 async fn wait_until_ready(node: &LocalNode) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
