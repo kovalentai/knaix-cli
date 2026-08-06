@@ -712,6 +712,16 @@ pub async fn up(
         ));
     }
 
+    // The node clamps every answer to its own ceiling, and its default is the
+    // same 1024 the CLI treats as normal -- so asking for a detailed answer was
+    // clamped straight back to a normal one. Raise the ceiling to what the
+    // longest level asks for and let the per-question ask do the limiting.
+    args.push("-e".into());
+    args.push(format!(
+        "GENERATION_MAX_TOKENS={}",
+        crate::nodes::MAX_ANSWER_TOKENS
+    ));
+
     match &launch.model_url {
         // A real model, if one is being served on this machine.
         Some(url) => {

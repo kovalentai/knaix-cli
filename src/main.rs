@@ -678,16 +678,6 @@ async fn run() -> Result<()> {
             };
             let node_id = project_node(node_id, project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                // Verbosity shapes the local node's system prompt; a hosted node
-                // is prompted by the control plane, so say the flag had no effect
-                // rather than dropping it silently.
-                if verbosity != nodes::Verbosity::Normal && !target.is_local() {
-                    println!(
-                        "{} {} apply to the local node; a hosted node is prompted by the control plane.",
-                        "Note:".blue(),
-                        "--brief/--detailed".cyan()
-                    );
-                }
                 if ctx.output_format == "json" {
                     if let Some(answer) = nodes::chat(
                         &ctx,

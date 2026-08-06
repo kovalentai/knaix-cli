@@ -108,7 +108,7 @@ fn print_help() {
         ),
         (
             "/brief, /normal, /detailed",
-            "Set how much detail answers carry (local node)",
+            "Set how much detail answers carry",
         ),
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
