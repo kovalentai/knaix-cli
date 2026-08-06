@@ -199,6 +199,23 @@ enum Commands {
     },
 
     /// Start an interactive chat session with a node
+    ///
+    /// Answers stream as they are written, render as markdown, and list the
+    /// passages they were grounded in. The flags below set where the session
+    /// starts; the commands change it as you go.
+    ///
+    /// Session commands:
+    ///   /help              Show the commands
+    ///   /source <n>        Print passage [n] from the last answer in full
+    ///   /brief /normal /detailed
+    ///                      How much detail answers carry
+    ///   /k <n>             How many passages an answer is grounded in (local node)
+    ///   /doc <name>        Ground answers in one document; /doc alone clears it (local node)
+    ///   /remember <fact>   Save a fact to this node's notes and ingest it
+    ///   /memory            List the notes saved for this node
+    ///   /reset             Start a new conversation
+    ///   /exit /quit        End the session (Ctrl-D works too)
+    #[clap(verbatim_doc_comment)]
     Repl {
         /// The node to chat with (falls back to the default)
         node_id: Option<String>,
@@ -206,6 +223,23 @@ enum Commands {
         /// The node to chat with, as a flag for symmetry with chat and upload
         #[clap(short = 'n', long = "node-id", conflicts_with = "node_id")]
         node: Option<String>,
+
+        /// Start the session answering in one or two sentences
+        #[clap(long, conflicts_with = "detailed")]
+        brief: bool,
+
+        /// Start the session answering thoroughly
+        #[clap(long)]
+        detailed: bool,
+
+        /// How many passages to ground answers in (local node)
+        #[clap(long, value_name = "N")]
+        k: Option<u32>,
+
+        /// Start the session grounded in this document, by filename.
+        /// Repeatable (local node)
+        #[clap(long = "doc", value_name = "NAME")]
+        doc: Vec<String>,
     },
 
     /// Provision a hosted node on your Kovalent account
@@ -966,10 +1000,44 @@ async fn run() -> Result<()> {
             )
             .await?;
         }
-        Commands::Repl { node_id, node } => {
+        Commands::Repl {
+            node_id,
+            node,
+            brief,
+            detailed,
+            k,
+            doc,
+        } => {
             let node_id = project_node(node.or(node_id), project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                repl::run(&ctx, &target).await?;
+                // The same options `chat` takes, resolved once here so the
+                // session starts where it was asked to rather than needing a
+                // command typed before the first question.
+                let mut options = nodes::AnswerOptions {
+                    verbosity: if brief {
+                        nodes::Verbosity::Brief
+                    } else if detailed {
+                        nodes::Verbosity::Detailed
+                    } else {
+                        nodes::Verbosity::Normal
+                    },
+                    retrieval: nodes::Retrieval {
+                        k: nodes::checked_k(k)?,
+                        document_ids: Vec::new(),
+                    },
+                };
+                if !doc.is_empty() {
+                    options.retrieval.document_ids =
+                        nodes::scope_to_documents(&ctx, &target, &doc).await?;
+                }
+                if k.is_some() && !target.is_local() {
+                    println!(
+                        "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                        "Note:".blue(),
+                        "--k".cyan()
+                    );
+                }
+                repl::run(&ctx, &target, options).await?;
             }
         }
         Commands::Local { action } => match action {
