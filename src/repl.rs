@@ -155,7 +155,11 @@ async fn remember(ctx: &KnaixContext, target: &crate::nodes::Target, fact: &str)
     }
 }
 
-pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()> {
+pub async fn run(
+    ctx: &KnaixContext,
+    target: &crate::nodes::Target,
+    start: crate::nodes::AnswerOptions,
+) -> Result<()> {
     let node_id = &target.label();
     let mut rl: Editor<ReplHelper, DefaultHistory> =
         Editor::new().context("Failed to initialize readline")?;
@@ -176,7 +180,8 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     // not grow the request without bound.
     let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
     // How much detail answers carry, adjustable mid-session with /brief etc.
-    let mut options = crate::nodes::AnswerOptions::default();
+    // Where the flags said to start; the session commands take it from here.
+    let mut options = start;
     // The hosted thread this session is in, named by the control plane on the
     // first answer and sent back with every question after it. Stays None for a
     // local node, which is kept in context by `history` instead.
