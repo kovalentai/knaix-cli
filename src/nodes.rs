@@ -80,6 +80,9 @@ pub struct ChatAnswer {
     /// local node, which has no control plane to keep the thread, and absent
     /// when the control plane could not open one.
     pub conversation_id: Option<String>,
+    /// For a document-scoped answer: how many of the named documents' passages
+    /// reached the model, against how many there were.
+    pub scope: Option<(u64, u64)>,
 }
 
 /// What one answer stream produced. A struct rather than a tuple because both
@@ -91,6 +94,7 @@ struct StreamOutcome {
     first_token_ms: Option<u128>,
     total_ms: Option<u128>,
     conversation_id: Option<String>,
+    scope: Option<(u64, u64)>,
 }
 
 /// What a caller wants done with the tokens as they arrive.
@@ -134,15 +138,21 @@ pub const DEFAULT_K: u32 = 5;
 pub const MAX_K: u32 = 50;
 
 /// How the node should retrieve for one question.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Retrieval {
     /// How many passages to admit as context.
     pub k: u32,
+    /// Ground the answer in these documents rather than in a search of the
+    /// whole corpus. Empty keeps the ordinary top-k path.
+    pub document_ids: Vec<String>,
 }
 
 impl Default for Retrieval {
     fn default() -> Self {
-        Self { k: DEFAULT_K }
+        Self {
+            k: DEFAULT_K,
+            document_ids: Vec::new(),
+        }
     }
 }
 
@@ -150,10 +160,143 @@ impl Default for Retrieval {
 ///
 /// Bundled because these travel together through every layer, and because a
 /// chat call taking eight positional arguments is one nobody can read.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AnswerOptions {
     pub verbosity: Verbosity,
     pub retrieval: Retrieval,
+}
+
+/// One document the node holds, as `/api/kb/documents` reports it.
+#[derive(Deserialize, Debug, Clone)]
+pub struct NodeDocument {
+    #[serde(rename = "document_id")]
+    pub document_id: String,
+    pub source: Option<String>,
+    /// Reported by the node. Not read yet; kept so the struct documents the
+    /// shape the route returns rather than half of it.
+    #[allow(dead_code)]
+    pub chunks: Option<u64>,
+}
+
+impl NodeDocument {
+    /// What a person would call this document.
+    pub fn label(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.document_id)
+    }
+}
+
+/// The documents a local node holds.
+pub async fn local_documents(
+    ctx: &KnaixContext,
+    base: &str,
+    instance_id: &str,
+) -> Result<Vec<NodeDocument>> {
+    let resp = ctx
+        .client
+        .post(format!("{}/api/kb/documents", base))
+        .json(&serde_json::json!({ "instance_id": instance_id }))
+        .send()
+        .await
+        .context("Could not reach the local node. Is it running? Try 'knaix local status'.")?;
+
+    if resp.status() == 404 {
+        return Err(anyhow!(
+            "This node is too old to list its documents, so {} cannot resolve a name. Update it with {}.",
+            "--doc",
+            crate::brand::cmd("local up --pull")
+        ))
+        .coded(Code::Precondition);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "Could not list the node's documents: HTTP {}",
+            resp.status()
+        ))
+        .coded(Code::for_status(resp.status().as_u16()));
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok(serde_json::from_value(body["documents"].clone()).unwrap_or_default())
+}
+
+/// Resolve what the user typed against the documents the node holds.
+///
+/// People name a document by its filename, and rarely the whole of it, so an
+/// exact match wins and a unique case-insensitive substring is accepted after
+/// it. An ambiguous name is refused with the candidates rather than resolved to
+/// whichever happened to be first: grounding an answer in the wrong document
+/// and saying nothing is the failure this command exists to avoid.
+pub fn resolve_document<'a>(
+    documents: &'a [NodeDocument],
+    wanted: &str,
+) -> Result<&'a NodeDocument> {
+    if documents.is_empty() {
+        return Err(anyhow!("This node holds no documents yet.")).coded(Code::Precondition);
+    }
+    if let Some(exact) = documents
+        .iter()
+        .find(|d| d.label().eq_ignore_ascii_case(wanted) || d.document_id == wanted)
+    {
+        return Ok(exact);
+    }
+
+    let needle = wanted.to_lowercase();
+    let matches: Vec<&NodeDocument> = documents
+        .iter()
+        .filter(|d| d.label().to_lowercase().contains(&needle))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(anyhow!(
+            "No document matching '{}'. This node holds: {}",
+            wanted,
+            documents
+                .iter()
+                .map(|d| d.label().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .coded(Code::Usage),
+        many => Err(anyhow!(
+            "'{}' matches {} documents: {}. Name one of them.",
+            wanted,
+            many.len(),
+            many.iter()
+                .map(|d| d.label().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .coded(Code::Usage),
+    }
+}
+
+/// Turn the document names a caller typed into ids the node will accept.
+///
+/// Local only: a hosted node's retrieval is the control plane's to decide, and
+/// there is no route there to resolve a name against. Saying so beats resolving
+/// names that would then be dropped from the request in silence.
+pub async fn scope_to_documents(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &[String],
+) -> Result<Vec<String>> {
+    let Target::Local { base, instance_id } = target else {
+        return Err(anyhow!(
+            "--doc applies to a local node; a hosted node's retrieval is set by the control plane."
+        ))
+        .coded(Code::Usage);
+    };
+
+    let documents = local_documents(ctx, base, instance_id).await?;
+    let mut ids = Vec::new();
+    for name in wanted {
+        let doc = resolve_document(&documents, name)?;
+        if !ids.contains(&doc.document_id) {
+            ids.push(doc.document_id.clone());
+        }
+    }
+    Ok(ids)
 }
 
 /// Validate a `--k`, or fall back to the node's own default.
@@ -205,12 +348,18 @@ const MIN_RERANK_SCORE: f64 = 0.0;
 /// every candidate per question. `knaix local up` warms it with the same policy
 /// for that reason, so the cost lands at startup rather than under the first
 /// question.
-fn local_policy(retrieval: Retrieval) -> serde_json::Value {
-    serde_json::json!({
+fn local_policy(retrieval: &Retrieval) -> serde_json::Value {
+    let mut policy = serde_json::json!({
         "k": retrieval.k,
         "rerank": true,
         "min_rerank_score": MIN_RERANK_SCORE,
-    })
+    });
+    // Only when scoping, so an ordinary question's body is unchanged and a node
+    // that predates document scoping sees exactly what it always did.
+    if !retrieval.document_ids.is_empty() {
+        policy["document_ids"] = serde_json::json!(retrieval.document_ids);
+    }
+    policy
 }
 
 /// How long an answer the local node is asked for. The difference is only in
@@ -334,7 +483,7 @@ fn build_local_answer_body(
     instance_id: &str,
     message: &str,
     history: &[ChatTurn],
-    options: AnswerOptions,
+    options: &AnswerOptions,
 ) -> serde_json::Value {
     serde_json::json!({
         "instance_id": instance_id,
@@ -342,7 +491,7 @@ fn build_local_answer_body(
         "system": answer_system(options.verbosity),
         "history": history,
         "max_tokens": options.verbosity.max_tokens(),
-        "policy": local_policy(options.retrieval),
+        "policy": local_policy(&options.retrieval),
     })
 }
 
@@ -987,7 +1136,7 @@ pub async fn chat(
     message: &str,
     echo: Echo,
     history: &[ChatTurn],
-    options: AnswerOptions,
+    options: &AnswerOptions,
     conversation: Option<&str>,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
@@ -1063,6 +1212,7 @@ pub async fn chat(
         first_token_ms,
         total_ms,
         conversation_id,
+        scope,
     } = read_chat_stream(resp, &pb, echo, asked_at).await?;
 
     if echo.prints() {
@@ -1076,6 +1226,7 @@ pub async fn chat(
         first_token_ms,
         total_ms,
         conversation_id,
+        scope,
     }))
 }
 
@@ -1092,7 +1243,7 @@ async fn chat_local(
     message: &str,
     echo: Echo,
     history: &[ChatTurn],
-    options: AnswerOptions,
+    options: &AnswerOptions,
 ) -> Result<Option<ChatAnswer>> {
     let pb = chat_spinner(ctx);
 
@@ -1146,6 +1297,7 @@ async fn chat_local(
         first_token_ms: outcome.first_token_ms,
         total_ms: outcome.total_ms,
         conversation_id: None,
+        scope: outcome.scope,
     }))
 }
 
@@ -1192,6 +1344,7 @@ async fn chat_local_blocking(
     let text = body["answer"].as_str().unwrap_or_default().to_string();
     let citations = node_citations(&body["citations"], &text);
     let model = body["model"].as_str().map(|s| s.to_string());
+    let scope = read_scope(&body);
 
     // Nothing streamed, so there is no progressive rendering to do; the answer
     // is printed the way this echo mode would have assembled it.
@@ -1218,6 +1371,7 @@ async fn chat_local_blocking(
         first_token_ms: None,
         total_ms: None,
         conversation_id: None,
+        scope,
     }))
 }
 
@@ -1242,6 +1396,7 @@ async fn read_local_answer_stream(
     let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
     let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
+    let mut scope: Option<(u64, u64)> = None;
     let mut event = String::new();
     let mut first_token = true;
     let mut first_token_ms: Option<u128> = None;
@@ -1274,6 +1429,7 @@ async fn read_local_answer_stream(
                     // named while the model is still generating; which of them
                     // the answer used is stamped on once it is complete.
                     citations = parse_node_citations(&parsed["citations"]);
+                    scope = read_scope(&parsed);
                     model = parsed["model"].as_str().map(|s| s.to_string());
                     pb.set_message(retrieval_progress(&citations));
                 }
@@ -1348,6 +1504,7 @@ async fn read_local_answer_stream(
         first_token_ms,
         total_ms,
         conversation_id: None,
+        scope,
     })
 }
 
@@ -1385,6 +1542,42 @@ fn parse_node_citations(raw: &serde_json::Value) -> Vec<Citation> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// How much of a scoped answer's documents reached the model.
+///
+/// Absent for an ordinary question, and absent from a node that predates
+/// document scoping, which is the same thing as far as the reader is concerned:
+/// nothing to say about a scope that was never asked for.
+fn read_scope(value: &serde_json::Value) -> Option<(u64, u64)> {
+    let scope = value.get("scope")?;
+    Some((
+        scope["chunksUsed"].as_u64()?,
+        scope["chunksTotal"].as_u64()?,
+    ))
+}
+
+/// One dim line when a scoped answer saw only part of what it was pointed at.
+///
+/// Silent when the whole of it fitted. The point of scoping is to stop a
+/// confident answer resting on an arbitrary sliver, so an answer that still
+/// rests on part of the material has to say which part it is missing, or the
+/// same failure returns wearing a different flag.
+pub fn print_scope_note(answer: &ChatAnswer) {
+    let Some((used, total)) = answer.scope else {
+        return;
+    };
+    if used >= total || total == 0 {
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "Grounded in the first {} of {} passages; the rest did not fit.",
+            used, total
+        )
+        .dimmed()
+    );
 }
 
 /// Mark the passages whose `[n]` markers appear in the finished answer.
@@ -1445,6 +1638,7 @@ async fn read_chat_stream(
     let mut citations: Vec<Citation> = Vec::new();
     let mut model: Option<String> = None;
     let mut markdown = (echo == Echo::Markdown).then(crate::markdown::MarkdownStream::new);
+    let mut scope: Option<(u64, u64)> = None;
     // Which citations the answer actually referenced. It arrives at the end, in
     // the `done` frame, rather than on the citations themselves.
     let mut cited_indexes: Vec<u32> = Vec::new();
@@ -1483,6 +1677,7 @@ async fn read_chat_stream(
                     // Null when the control plane could not open a thread, so a
                     // failure to persist is not read as a thread called "null".
                     conversation_id = parsed["conversationId"].as_str().map(|s| s.to_string());
+                    scope = read_scope(&parsed);
                     // Retrieval is done; the rest of the wait is the model. Say
                     // what it found rather than leaving "Thinking..." up.
                     pb.set_message(retrieval_progress(&citations));
@@ -1574,6 +1769,7 @@ async fn read_chat_stream(
         first_token_ms,
         total_ms,
         conversation_id,
+        scope,
     })
 }
 
@@ -1673,6 +1869,11 @@ pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
             // Measured on every answer; absent when nothing streamed.
             "firstTokenMs": answer.first_token_ms,
             "totalMs": answer.total_ms,
+            // Present only for a document-scoped answer.
+            "scope": answer.scope.map(|(used, total)| serde_json::json!({
+                "chunksUsed": used,
+                "chunksTotal": total,
+            })),
             // Null for a local node, and for a hosted one that could not open a
             // thread. A script that wants a follow-up answered in context sends
             // this back; there is nothing else to correlate two questions by.
@@ -2877,7 +3078,7 @@ mod tests {
             "abc",
             "and cabin class?",
             &history,
-            AnswerOptions::default(),
+            &AnswerOptions::default(),
         );
         assert_eq!(body["instance_id"], "abc");
         assert_eq!(body["query"], "and cabin class?");
@@ -3093,7 +3294,7 @@ mod tests {
             "abc",
             "why?",
             &[],
-            AnswerOptions {
+            &AnswerOptions {
                 verbosity: Verbosity::Detailed,
                 ..Default::default()
             },
@@ -3123,6 +3324,7 @@ mod tests {
             first_token_ms: first,
             total_ms: total,
             conversation_id: None,
+            scope: None,
         }
     }
 
@@ -3174,10 +3376,100 @@ mod tests {
         assert!(find_source(&cites, 3).is_none());
     }
 
+    fn doc(id: &str, source: &str) -> NodeDocument {
+        NodeDocument {
+            document_id: id.to_string(),
+            source: Some(source.to_string()),
+            chunks: Some(3),
+        }
+    }
+
+    #[test]
+    fn a_document_resolves_by_its_whole_name_whatever_the_case() {
+        let docs = vec![doc("id-1", "Handbook.md"), doc("id-2", "Refunds.md")];
+        assert_eq!(
+            resolve_document(&docs, "handbook.md").unwrap().document_id,
+            "id-1"
+        );
+        assert_eq!(
+            resolve_document(&docs, "Refunds.md").unwrap().document_id,
+            "id-2"
+        );
+        // The id itself works, for anything that already has one.
+        assert_eq!(resolve_document(&docs, "id-2").unwrap().document_id, "id-2");
+    }
+
+    /// People rarely type a whole filename.
+    #[test]
+    fn a_unique_partial_name_is_enough() {
+        let docs = vec![
+            doc("id-1", "Employee Handbook 2026.pdf"),
+            doc("id-2", "Refunds.md"),
+        ];
+        assert_eq!(
+            resolve_document(&docs, "handbook").unwrap().document_id,
+            "id-1"
+        );
+    }
+
+    /// Grounding an answer in the wrong document and saying nothing is the
+    /// failure this command exists to avoid, so ambiguity is refused.
+    #[test]
+    fn an_ambiguous_name_is_refused_with_the_candidates() {
+        let docs = vec![
+            doc("id-1", "Handbook 2025.pdf"),
+            doc("id-2", "Handbook 2026.pdf"),
+        ];
+        let err = resolve_document(&docs, "handbook").unwrap_err().to_string();
+        assert!(err.contains("Handbook 2025.pdf"), "{err}");
+        assert!(err.contains("Handbook 2026.pdf"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_name_lists_what_the_node_does_hold() {
+        let docs = vec![doc("id-1", "Handbook.md")];
+        let err = resolve_document(&docs, "invoices").unwrap_err().to_string();
+        assert!(err.contains("Handbook.md"), "{err}");
+    }
+
+    /// An ordinary question's body must be unchanged, so a node predating
+    /// document scoping sees exactly what it always did.
+    #[test]
+    fn an_unscoped_question_carries_no_document_ids() {
+        let body = build_local_answer_body("abc", "why?", &[], &AnswerOptions::default());
+        assert!(body["policy"].get("document_ids").is_none());
+    }
+
+    #[test]
+    fn a_scoped_question_names_its_documents() {
+        let options = AnswerOptions {
+            retrieval: Retrieval {
+                document_ids: vec!["id-1".into(), "id-2".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = build_local_answer_body("abc", "summarize", &[], &options);
+        assert_eq!(
+            body["policy"]["document_ids"],
+            serde_json::json!(["id-1", "id-2"])
+        );
+    }
+
+    /// A scoped answer that saw all of its documents has nothing to confess.
+    #[test]
+    fn the_scope_note_is_only_for_a_partial_answer() {
+        assert_eq!(read_scope(&serde_json::json!({})), None);
+        assert_eq!(
+            read_scope(&serde_json::json!({"scope": {"chunksUsed": 12, "chunksTotal": 40}})),
+            Some((12, 40))
+        );
+    }
+
     /// The whole point of the change: a local node reranks every question.
     #[test]
     fn a_local_question_always_asks_for_the_reranker() {
-        let body = build_local_answer_body("abc", "why?", &[], AnswerOptions::default());
+        let body = build_local_answer_body("abc", "why?", &[], &AnswerOptions::default());
         assert_eq!(body["policy"]["rerank"].as_bool(), Some(true));
     }
 
@@ -3187,8 +3479,11 @@ mod tests {
             "abc",
             "why?",
             &[],
-            AnswerOptions {
-                retrieval: Retrieval { k: 12 },
+            &AnswerOptions {
+                retrieval: Retrieval {
+                    k: 12,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );

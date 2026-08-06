@@ -112,6 +112,11 @@ enum Commands {
         /// How many passages to ground the answer in (local node)
         #[clap(long, value_name = "N")]
         k: Option<u32>,
+
+        /// Ground the answer in this document rather than a search of the whole
+        /// corpus, by filename. Repeatable (local node)
+        #[clap(long = "doc", value_name = "NAME")]
+        doc: Vec<String>,
     },
 
     /// Ingest a file or directory into a node's knowledge base
@@ -668,6 +673,7 @@ async fn run() -> Result<()> {
             brief,
             detailed,
             k,
+            doc,
         } => {
             let verbosity = if brief {
                 nodes::Verbosity::Brief
@@ -676,10 +682,11 @@ async fn run() -> Result<()> {
             } else {
                 nodes::Verbosity::Normal
             };
-            let options = nodes::AnswerOptions {
+            let mut options = nodes::AnswerOptions {
                 verbosity,
                 retrieval: nodes::Retrieval {
                     k: nodes::checked_k(k)?,
+                    document_ids: Vec::new(),
                 },
             };
             let message = if stdin_arg::is_stdin(&message) {
@@ -693,6 +700,26 @@ async fn run() -> Result<()> {
                 // node directly. A hosted node is policed by the control plane,
                 // so say the flag had no effect rather than dropping it in
                 // silence -- which is what --brief and --detailed used to do.
+                // Names are resolved against the node that will answer, so a
+                // typo is caught here with the candidates rather than becoming
+                // an answer grounded in nothing.
+                if !doc.is_empty() {
+                    match nodes::scope_to_documents(&ctx, &target, &doc).await {
+                        Ok(ids) => options.retrieval.document_ids = ids,
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Scoping reads the named documents whole, so depth has
+                // nothing to select from. Third time a flag would have gone
+                // quietly nowhere.
+                if k.is_some() && !doc.is_empty() {
+                    println!(
+                        "{} {} has no effect with {}: a scoped answer reads the named documents rather than the closest passages.",
+                        "Note:".blue(),
+                        "--k".cyan(),
+                        "--doc".cyan()
+                    );
+                }
                 if k.is_some() && !target.is_local() {
                     println!(
                         "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
@@ -707,7 +734,7 @@ async fn run() -> Result<()> {
                         &message,
                         nodes::Echo::Silent,
                         &[],
-                        options,
+                        &options,
                         None,
                     )
                     .await?
@@ -722,11 +749,12 @@ async fn run() -> Result<()> {
                     &message,
                     nodes::Echo::Raw,
                     &[],
-                    options,
+                    &options,
                     None,
                 )
                 .await?
                 {
+                    nodes::print_scope_note(&answer);
                     nodes::print_answer_timing(&answer);
                     nodes::print_answer_footer(&target, &answer);
                 }
