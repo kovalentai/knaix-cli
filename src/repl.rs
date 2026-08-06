@@ -178,7 +178,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     let mut warned_threadless = false;
     // The passages behind the last answer, so /source can print one whole. The
     // citation list only shows the first line or so of each.
-    let mut last_citations: Vec<crate::nodes::Citation> = Vec::new();
+    let mut last_citations: Option<Vec<crate::nodes::Citation>> = None;
     // Said once, the first time an answer cites something. The citation list
     // shows a passage truncated with an ellipsis and nothing about it says the
     // rest is a command away, so the feature would otherwise be found only by
@@ -217,16 +217,13 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             continue;
                         }
                         "/source" => {
-                            let arg = args.trim();
-                            match arg.parse::<u32>() {
-                                Ok(n) if !last_citations.is_empty() => {
-                                    crate::nodes::print_source(&last_citations, n)
-                                }
-                                Ok(_) => println!(
+                            match (args.trim().parse::<u32>(), &last_citations) {
+                                (Ok(n), Some(cites)) => crate::nodes::print_source(cites, n),
+                                (Ok(_), None) => println!(
                                     "{} Nothing to show yet. Ask a question first.",
                                     "Info:".blue()
                                 ),
-                                Err(_) => println!(
+                                (Err(_), _) => println!(
                                     "{} Usage: /source <n>, the number in a {} marker.",
                                     "Error:".red(),
                                     "[n]".cyan()
@@ -254,6 +251,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             let kept = conversation.is_some();
                             history.clear();
                             conversation = None;
+                            last_citations = None;
                             if had && kept {
                                 println!(
                                     "{} Starting a new conversation. Earlier questions leave the context; the previous conversation is kept.",
@@ -324,7 +322,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                     Ok(Some(answer)) => {
                         crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
-                        last_citations = answer.citations.clone();
+                        last_citations = Some(answer.citations.clone());
                         let cited_any = answer.citations.iter().any(|c| c.cited.unwrap_or(false));
                         if cited_any && !pointed_at_source {
                             pointed_at_source = true;

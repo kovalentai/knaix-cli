@@ -1224,6 +1224,10 @@ async fn read_local_answer_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
     if let Some(md) = &mut markdown {
         md.finish();
@@ -1244,9 +1248,7 @@ async fn read_local_answer_stream(
         citations,
         model,
         first_token_ms,
-        // Measured only when something streamed, so it stays alongside
-        // first_token_ms rather than reporting a wait for nothing.
-        total_ms: (!first_token).then(|| asked_at.elapsed().as_millis()),
+        total_ms,
         conversation_id: None,
     })
 }
@@ -1441,6 +1443,10 @@ async fn read_chat_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
     if let Some(md) = &mut markdown {
         md.finish();
@@ -1468,7 +1474,7 @@ async fn read_chat_stream(
         citations,
         model,
         first_token_ms,
-        total_ms: (!first_token).then(|| asked_at.elapsed().as_millis()),
+        total_ms,
         conversation_id,
     })
 }
