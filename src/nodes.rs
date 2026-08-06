@@ -124,6 +124,74 @@ pub struct ChatTurn {
     pub content: String,
 }
 
+/// The node's own default retrieval depth, mirrored so `--k` has a default to
+/// show and so an unset value asks for exactly what the node would have done.
+pub const DEFAULT_K: u32 = 5;
+
+/// The node clamps depth to this. Matched here so an impossible `--k` is
+/// refused with a number the user can act on, rather than silently clamped into
+/// something they did not ask for.
+pub const MAX_K: u32 = 50;
+
+/// How the node should retrieve for one question.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Retrieval {
+    /// How many passages to admit as context.
+    pub k: u32,
+}
+
+impl Default for Retrieval {
+    fn default() -> Self {
+        Self { k: DEFAULT_K }
+    }
+}
+
+/// Everything about one question other than the question.
+///
+/// Bundled because these travel together through every layer, and because a
+/// chat call taking eight positional arguments is one nobody can read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnswerOptions {
+    pub verbosity: Verbosity,
+    pub retrieval: Retrieval,
+}
+
+/// Validate a `--k`, or fall back to the node's own default.
+///
+/// The node clamps silently, so an out-of-range value would come back as an
+/// answer built on a depth nobody asked for. Refusing it here is the difference
+/// between a typo the user can see and one they cannot.
+pub fn checked_k(requested: Option<u32>) -> Result<u32> {
+    match requested {
+        None => Ok(DEFAULT_K),
+        Some(k) if (1..=MAX_K).contains(&k) => Ok(k),
+        Some(k) => Err(anyhow!(
+            "--k must be between 1 and {}; {} was asked for",
+            MAX_K,
+            k
+        ))
+        .coded(Code::Usage),
+    }
+}
+
+/// The retrieval policy the CLI asks a local node for.
+///
+/// `rerank` is always on. The cross-encoder runs on the node's own compute,
+/// behind the same boundary as everything else, so there is nothing to meter
+/// and no reason to withhold the largest quality lever the pipeline has. A
+/// hosted node is policed by the control plane, which decides rerank by tier.
+///
+/// It is not free: the reranker is a real model, so it loads once and re-reads
+/// every candidate per question. `knaix local up` warms it with the same policy
+/// for that reason, so the cost lands at startup rather than under the first
+/// question.
+fn local_policy(retrieval: Retrieval) -> serde_json::Value {
+    serde_json::json!({
+        "k": retrieval.k,
+        "rerank": true,
+    })
+}
+
 /// How long an answer the local node is asked for. The difference is only in
 /// the system prompt; retrieval and citations are the same at every level.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -237,14 +305,15 @@ fn build_local_answer_body(
     instance_id: &str,
     message: &str,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: AnswerOptions,
 ) -> serde_json::Value {
     serde_json::json!({
         "instance_id": instance_id,
         "query": message,
-        "system": answer_system(verbosity),
+        "system": answer_system(options.verbosity),
         "history": history,
-        "max_tokens": verbosity.max_tokens(),
+        "max_tokens": options.verbosity.max_tokens(),
+        "policy": local_policy(options.retrieval),
     })
 }
 
@@ -889,14 +958,14 @@ pub async fn chat(
     message: &str,
     echo: Echo,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: AnswerOptions,
     conversation: Option<&str>,
 ) -> Result<Option<ChatAnswer>> {
     if let Target::Local { base, instance_id } = target {
         // A local node has no control plane to hold a thread, so its context is
         // the history the caller replays.
         let _ = conversation;
-        return chat_local(ctx, base, instance_id, message, echo, history, verbosity).await;
+        return chat_local(ctx, base, instance_id, message, echo, history, options).await;
     }
     // The control plane holds the thread and replays it into the prompt, so the
     // hosted path sends the conversation id rather than the transcript.
@@ -921,7 +990,7 @@ pub async fn chat(
             "stream": true,
             // The level, not a prompt: a hosted node is prompted by the control
             // plane, which maps this to both a shape and a cap.
-            "verbosity": verbosity.as_str(),
+            "verbosity": options.verbosity.as_str(),
         });
         if let Some(id) = &thread {
             payload["conversationId"] = serde_json::json!(id);
@@ -994,11 +1063,11 @@ async fn chat_local(
     message: &str,
     echo: Echo,
     history: &[ChatTurn],
-    verbosity: Verbosity,
+    options: AnswerOptions,
 ) -> Result<Option<ChatAnswer>> {
     let pb = chat_spinner(ctx);
 
-    let body = build_local_answer_body(instance_id, message, history, verbosity);
+    let body = build_local_answer_body(instance_id, message, history, options);
 
     // Timed from before the request leaves, so time-to-first-token covers the
     // whole wait a person actually sits through, not just the node's share.
@@ -2775,7 +2844,12 @@ mod tests {
                 content: "Within 30 days [1].".into(),
             },
         ];
-        let body = build_local_answer_body("abc", "and cabin class?", &history, Verbosity::Normal);
+        let body = build_local_answer_body(
+            "abc",
+            "and cabin class?",
+            &history,
+            AnswerOptions::default(),
+        );
         assert_eq!(body["instance_id"], "abc");
         assert_eq!(body["query"], "and cabin class?");
         let system = body["system"].as_str().unwrap();
@@ -2983,7 +3057,15 @@ mod tests {
 
     #[test]
     fn the_local_body_carries_the_cap_alongside_the_prompt() {
-        let body = build_local_answer_body("abc", "why?", &[], Verbosity::Detailed);
+        let body = build_local_answer_body(
+            "abc",
+            "why?",
+            &[],
+            AnswerOptions {
+                verbosity: Verbosity::Detailed,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             body["max_tokens"].as_u64(),
             Some(Verbosity::Detailed.max_tokens() as u64)
@@ -3058,6 +3140,45 @@ mod tests {
         assert!(find_source(&cites, 1).is_some());
         assert!(find_source(&cites, 2).is_some());
         assert!(find_source(&cites, 3).is_none());
+    }
+
+    /// The whole point of the change: a local node reranks every question.
+    #[test]
+    fn a_local_question_always_asks_for_the_reranker() {
+        let body = build_local_answer_body("abc", "why?", &[], AnswerOptions::default());
+        assert_eq!(body["policy"]["rerank"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn the_depth_asked_for_is_the_depth_sent() {
+        let body = build_local_answer_body(
+            "abc",
+            "why?",
+            &[],
+            AnswerOptions {
+                retrieval: Retrieval { k: 12 },
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["policy"]["k"].as_u64(), Some(12));
+    }
+
+    /// Unset means the node's own default, so a question asked without --k is
+    /// retrieved exactly as it was before the flag existed.
+    #[test]
+    fn no_flag_asks_for_the_nodes_own_depth() {
+        assert_eq!(checked_k(None).unwrap(), DEFAULT_K);
+        assert_eq!(AnswerOptions::default().retrieval.k, DEFAULT_K);
+    }
+
+    /// The node clamps silently, so an out-of-range depth would come back as an
+    /// answer built on something nobody asked for.
+    #[test]
+    fn an_impossible_depth_is_refused_rather_than_clamped() {
+        assert!(checked_k(Some(0)).is_err());
+        assert!(checked_k(Some(MAX_K + 1)).is_err());
+        assert_eq!(checked_k(Some(1)).unwrap(), 1);
+        assert_eq!(checked_k(Some(MAX_K)).unwrap(), MAX_K);
     }
 
     /// A fast answer must not pick up a counter it never needed.

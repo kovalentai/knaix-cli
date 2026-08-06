@@ -1195,6 +1195,10 @@ async fn warm(node: &LocalNode) -> bool {
         // answer is thrown away. Retrieval runs either way, which is what loads
         // the embedder.
         "max_tokens": 1,
+        // The same policy real questions ask for, so the reranker's model is
+        // loaded here too. Warming without it would leave the largest of the
+        // three cold starts to land on the first question after all.
+        "policy": { "k": crate::nodes::DEFAULT_K, "rerank": true },
     });
     matches!(
         client

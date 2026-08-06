@@ -101,13 +101,17 @@ enum Commands {
         /// The question to ask, or '-' to read it from standard input
         message: String,
 
-        /// Answer in one or two sentences (local node only)
+        /// Answer in one or two sentences
         #[clap(long, conflicts_with = "detailed")]
         brief: bool,
 
-        /// Answer thoroughly, with all relevant detail (local node only)
+        /// Answer thoroughly, with all relevant detail
         #[clap(long)]
         detailed: bool,
+
+        /// How many passages to ground the answer in (local node)
+        #[clap(long, value_name = "N")]
+        k: Option<u32>,
     },
 
     /// Ingest a file or directory into a node's knowledge base
@@ -663,6 +667,7 @@ async fn run() -> Result<()> {
             message,
             brief,
             detailed,
+            k,
         } => {
             let verbosity = if brief {
                 nodes::Verbosity::Brief
@@ -670,6 +675,12 @@ async fn run() -> Result<()> {
                 nodes::Verbosity::Detailed
             } else {
                 nodes::Verbosity::Normal
+            };
+            let options = nodes::AnswerOptions {
+                verbosity,
+                retrieval: nodes::Retrieval {
+                    k: nodes::checked_k(k)?,
+                },
             };
             let message = if stdin_arg::is_stdin(&message) {
                 stdin_arg::read_text("the question")?
@@ -685,7 +696,7 @@ async fn run() -> Result<()> {
                         &message,
                         nodes::Echo::Silent,
                         &[],
-                        verbosity,
+                        options,
                         None,
                     )
                     .await?
@@ -700,7 +711,7 @@ async fn run() -> Result<()> {
                     &message,
                     nodes::Echo::Raw,
                     &[],
-                    verbosity,
+                    options,
                     None,
                 )
                 .await?
