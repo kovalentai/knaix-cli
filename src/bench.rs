@@ -23,7 +23,7 @@
 //! than exiting quietly; see `Ingested`.
 
 use crate::exit::{Code, WithCode};
-use crate::nodes::{format_duration_ms, KnaixContext, Target, Verbosity};
+use crate::nodes::{format_duration_ms, KnaixContext, Target};
 use crate::selftest::{delete_document, ingest_text, percentile};
 use anyhow::{anyhow, Context, Result};
 use colored::*;
@@ -393,7 +393,7 @@ async fn measure_answers(
             QUESTION,
             crate::nodes::Echo::Silent,
             &[],
-            Verbosity::Normal,
+            crate::nodes::AnswerOptions::default(),
             None,
         )
         .await

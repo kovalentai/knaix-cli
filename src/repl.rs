@@ -114,6 +114,10 @@ fn print_help() {
             "/brief, /normal, /detailed",
             "Set how much detail answers carry",
         ),
+        (
+            "/k <n>",
+            "Set how many passages an answer is grounded in (local node)",
+        ),
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
     for (cmd, what) in rows {
@@ -168,7 +172,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     // not grow the request without bound.
     let mut history: Vec<crate::nodes::ChatTurn> = Vec::new();
     // How much detail answers carry, adjustable mid-session with /brief etc.
-    let mut verbosity = crate::nodes::Verbosity::Normal;
+    let mut options = crate::nodes::AnswerOptions::default();
     // The hosted thread this session is in, named by the control plane on the
     // first answer and sent back with every question after it. Stays None for a
     // local node, which is kept in context by `history` instead.
@@ -213,6 +217,39 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                                 println!("{} Usage: /remember <fact>", "Error:".red());
                             } else {
                                 remember(ctx, target, fact).await;
+                            }
+                            continue;
+                        }
+                        "/k" => {
+                            // Parsed before it is range-checked, so junk reads
+                            // as a usage mistake rather than silently becoming
+                            // the default.
+                            match args.trim().parse::<u32>() {
+                                Err(_) => println!(
+                                    "{} Usage: /k <n>, between 1 and {}.",
+                                    "Error:".red(),
+                                    crate::nodes::MAX_K
+                                ),
+                                // Confirming a depth a hosted node never
+                                // receives would be a worse answer than
+                                // refusing: the session would read as though
+                                // the setting had taken.
+                                Ok(_) if !target.is_local() => println!(
+                                    "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                                    "Note:".blue(),
+                                    "/k".cyan()
+                                ),
+                                Ok(n) => match crate::nodes::checked_k(Some(n)) {
+                                    Ok(k) => {
+                                        options.retrieval.k = k;
+                                        println!(
+                                            "{} Answers are now grounded in up to {} passages.",
+                                            "✓".green(),
+                                            k.to_string().cyan()
+                                        );
+                                    }
+                                    Err(e) => println!("{} {}", "Error:".red(), e),
+                                },
                             }
                             continue;
                         }
@@ -268,7 +305,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             continue;
                         }
                         "/brief" | "/normal" | "/detailed" => {
-                            verbosity = match cmd {
+                            options.verbosity = match cmd {
                                 "/brief" => crate::nodes::Verbosity::Brief,
                                 "/detailed" => crate::nodes::Verbosity::Detailed,
                                 _ => crate::nodes::Verbosity::Normal,
@@ -306,7 +343,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                     &input,
                     crate::nodes::Echo::Markdown,
                     &history,
-                    verbosity,
+                    options,
                     conversation.as_deref(),
                 )
                 .await
