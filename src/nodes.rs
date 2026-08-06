@@ -174,6 +174,26 @@ pub fn checked_k(requested: Option<u32>) -> Result<u32> {
     }
 }
 
+/// The rerank score a passage must beat to be admitted as context.
+///
+/// Zero, which means the reranker orders the passages and `k` decides how many
+/// there are. Measured rather than guessed: the cross-encoder's scores are
+/// bimodal, not calibrated. On a real corpus the top passage scores 0.96 or
+/// 0.99 when the reranker is confident and 0.03 or 0.004 when it is not, with
+/// everything below it at 0.0007 or less.
+///
+/// Against the node's own default floor that produces the opposite of what a
+/// floor is for. A confident reranker admits exactly one passage, so the answer
+/// is thin and the model, handed a single passage numbered [1], numbers its own
+/// points [1] [2] [3] and cites passages that do not exist -- which leaves the
+/// Grounded in block empty. An unconfident one admits nothing, the starvation
+/// fallback re-admits on distance, and the answer gets all of them. The system
+/// answered better the less sure the reranker was.
+///
+/// No absolute threshold fixes that, because the scores are not on a scale a
+/// threshold can read. Ranking is what a cross-encoder is good for.
+const MIN_RERANK_SCORE: f64 = 0.0;
+
 /// The retrieval policy the CLI asks a local node for.
 ///
 /// `rerank` is always on. The cross-encoder runs on the node's own compute,
@@ -189,6 +209,7 @@ fn local_policy(retrieval: Retrieval) -> serde_json::Value {
     serde_json::json!({
         "k": retrieval.k,
         "rerank": true,
+        "min_rerank_score": MIN_RERANK_SCORE,
     })
 }
 
@@ -259,9 +280,17 @@ fn answer_system(verbosity: Verbosity) -> String {
     // nothing about administering quizzes, which is true and useless. Grounding
     // is about where the facts come from, not about what may be asked for, so
     // the two are stated separately now.
+    // "with their [n] markers" was not explicit enough: against a real model,
+    // half of all answers cited by section heading instead -- "[Section 3 --
+    // Damage claims]" -- which no bracketed-number parser can resolve, so every
+    // passage came back uncited and the Grounded in block silently vanished.
+    // Naming the format, forbidding the alternative, and saying what happens to
+    // a citation that is neither is what stopped it.
     let grounding = "You are a helpful assistant working from a private knowledge base. \
-Base everything you say on the provided context, and cite the passages you draw on with their \
-[n] markers. The request may ask you to do something with that material rather than look \
+Base everything you say on the provided context. The passages are numbered [1], [2] and so on; \
+cite each claim with that bracketed number and nothing else. Never cite a section heading, a \
+document name, or a title: a citation that is not a bracketed number cannot be matched to a \
+passage and is dropped, leaving the claim looking unsupported. The request may ask you to do something with that material rather than look \
 something up: summarize it, draw questions or exercises from it, outline it, compare parts of \
 it. Do what was asked, built only from what the context contains. When the context does not \
 hold enough to do it, say so plainly rather than guessing.";
@@ -2855,7 +2884,7 @@ mod tests {
         let system = body["system"].as_str().unwrap();
         assert!(!system.is_empty(), "system prompt must not be empty");
         assert!(
-            system.contains("[n]"),
+            system.contains("cite"),
             "the prompt should ask the model to cite: {system}"
         );
         assert_eq!(body["history"].as_array().unwrap().len(), 2);
@@ -2917,8 +2946,11 @@ mod tests {
         // what this protects. A phrase match broke on the first rewording and
         // said nothing about the invariant.
         let shared = common_prefix(&common_prefix(&brief, &normal), &detailed);
+        // On the word rather than the marker format: the format is a detail the
+        // prompt is allowed to reword, and pinning it here is what broke when it
+        // was reworded to stop a real model citing section headings instead.
         assert!(
-            shared.contains("[n]"),
+            shared.contains("cite"),
             "every level must ask for citations: {shared}"
         );
         assert!(
