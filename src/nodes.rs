@@ -69,6 +69,12 @@ pub struct ChatAnswer {
     /// only way to tell a slow knowledge base from a slow model, which is what
     /// `knaix bench` reports. Absent when the answer did not stream.
     pub first_token_ms: Option<u128>,
+    /// Milliseconds from sending the question to the last token arriving.
+    ///
+    /// With `first_token_ms` this splits the wait into the part spent finding
+    /// things and the part spent writing, which is the difference between a
+    /// slow knowledge base and a slow model.
+    pub total_ms: Option<u128>,
     /// The thread this answer belongs to, for a hosted node. Sent back with the
     /// next question so the control plane answers it in context. Absent for a
     /// local node, which has no control plane to keep the thread, and absent
@@ -83,6 +89,7 @@ struct StreamOutcome {
     citations: Vec<Citation>,
     model: Option<String>,
     first_token_ms: Option<u128>,
+    total_ms: Option<u128>,
     conversation_id: Option<String>,
 }
 
@@ -956,6 +963,7 @@ pub async fn chat(
         citations,
         model,
         first_token_ms,
+        total_ms,
         conversation_id,
     } = read_chat_stream(resp, &pb, echo, asked_at).await?;
 
@@ -968,6 +976,7 @@ pub async fn chat(
         citations,
         model,
         first_token_ms,
+        total_ms,
         conversation_id,
     }))
 }
@@ -1037,6 +1046,7 @@ async fn chat_local(
         citations: outcome.citations,
         model: outcome.model,
         first_token_ms: outcome.first_token_ms,
+        total_ms: outcome.total_ms,
         conversation_id: None,
     }))
 }
@@ -1108,6 +1118,7 @@ async fn chat_local_blocking(
         // whole wait here would read as an instant answer that then took
         // seconds to finish, which is the opposite of what happened.
         first_token_ms: None,
+        total_ms: None,
         conversation_id: None,
     }))
 }
@@ -1213,6 +1224,10 @@ async fn read_local_answer_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
     if let Some(md) = &mut markdown {
         md.finish();
@@ -1233,6 +1248,7 @@ async fn read_local_answer_stream(
         citations,
         model,
         first_token_ms,
+        total_ms,
         conversation_id: None,
     })
 }
@@ -1427,6 +1443,10 @@ async fn read_chat_stream(
         }
     }
 
+    // Sampled here, where the last token actually landed. Everything below is
+    // rendering, and billing that to the model would overstate what it spent.
+    let total_ms = (!first_token).then(|| asked_at.elapsed().as_millis());
+
     pb.finish_and_clear();
     if let Some(md) = &mut markdown {
         md.finish();
@@ -1454,6 +1474,7 @@ async fn read_chat_stream(
         citations,
         model,
         first_token_ms,
+        total_ms,
         conversation_id,
     })
 }
@@ -1493,6 +1514,54 @@ pub fn print_answer_footer(target: &Target, answer: &ChatAnswer) {
     );
 }
 
+/// A wait worth explaining. Under this, the split is noise on an answer that
+/// arrived promptly; the same threshold the spinner counts from.
+const TIMING_SHOWN_AFTER: Duration = WAITED_AFTER;
+
+/// The two halves of a wait worth explaining, or `None` when it is not.
+///
+/// Separated from the printing so the thresholds and the subtraction can be
+/// tested without capturing stdout.
+fn timing_split(answer: &ChatAnswer) -> Option<(u128, u128)> {
+    let (first, total) = (answer.first_token_ms?, answer.total_ms?);
+    if total < TIMING_SHOWN_AFTER.as_millis() {
+        return None;
+    }
+    // Saturating because the two are sampled separately; a total below the
+    // first token would otherwise wrap into an enormous generation time.
+    Some((first, total.saturating_sub(first)))
+}
+
+/// The passage carrying a given `[n]` marker, if the last answer had one.
+fn find_source(citations: &[Citation], index: u32) -> Option<&Citation> {
+    citations.iter().find(|c| c.index == Some(index))
+}
+
+/// One dim line splitting a slow answer into finding and writing.
+///
+/// Both numbers are already measured on every answer and were read only by
+/// `knaix bench`. Everything before the first token is retrieval, reranking and
+/// prompt assembly; everything after it is the model. Someone whose answers are
+/// slow cannot act until they know which half to blame, and the whole point of
+/// bringing a model of your own is that both halves are yours to change.
+///
+/// Silent on a quick answer, and silent when nothing streamed, since there is
+/// then no first token to have timed.
+pub fn print_answer_timing(answer: &ChatAnswer) {
+    let Some((first, generating)) = timing_split(answer) else {
+        return;
+    };
+    println!(
+        "{}",
+        format!(
+            "{} to the first word, {} writing.",
+            format_duration_ms(first),
+            format_duration_ms(generating)
+        )
+        .dimmed()
+    );
+}
+
 /// The answer as one JSON object, for scripting. Citations carry their
 /// `cited` flag rather than being pre-filtered, so a consumer can choose
 /// between "what the answer used" and "what the node considered".
@@ -1503,6 +1572,9 @@ pub fn print_answer_json(answer: &ChatAnswer) -> Result<()> {
             "answer": answer.text,
             "model": answer.model,
             "citations": answer.citations,
+            // Measured on every answer; absent when nothing streamed.
+            "firstTokenMs": answer.first_token_ms,
+            "totalMs": answer.total_ms,
             // Null for a local node, and for a hosted one that could not open a
             // thread. A script that wants a follow-up answered in context sends
             // this back; there is nothing else to correlate two questions by.
@@ -1603,6 +1675,54 @@ pub fn print_citations(citations: &[Citation]) {
         };
         println!("  {} {}", format!("[{}]", index).cyan(), name.dimmed());
         println!("      {}", snippet);
+    }
+    println!();
+}
+
+/// Print one retrieved passage whole.
+///
+/// The node returns the full passage and the citation list shows the first 160
+/// characters of it, so the evidence behind a claim was arriving and being
+/// thrown away at the point of display. A passage that was retrieved but never
+/// cited is worth reading too -- it is what the model saw and did not use --
+/// so it is reachable here and labelled rather than hidden.
+pub fn print_source(citations: &[Citation], index: u32) {
+    let Some(citation) = find_source(citations, index) else {
+        let known: Vec<String> = citations
+            .iter()
+            .filter_map(|c| c.index)
+            .map(|i| i.to_string())
+            .collect();
+        if known.is_empty() {
+            println!("{} That answer retrieved no passages.", "Info:".blue());
+        } else {
+            println!(
+                "{} No passage [{}] in the last answer. It retrieved {}.",
+                "Error:".red(),
+                index,
+                known.join(", ")
+            );
+        }
+        return;
+    };
+
+    println!(
+        "\n{} {}",
+        format!("[{}]", index).cyan(),
+        citation_source_name(citation).bold()
+    );
+    if !citation.cited.unwrap_or(false) {
+        println!(
+            "{}",
+            "Retrieved for this question, but the answer did not cite it.".dimmed()
+        );
+    }
+    println!();
+    match citation.content.as_deref() {
+        Some(content) if !content.trim().is_empty() => println!("{}", content.trim()),
+        // The node returns a passage without its text when the store holds only
+        // the vector; saying so beats printing a blank.
+        _ => println!("{}", "The node returned no text for this passage.".dimmed()),
     }
     println!();
 }
@@ -2879,6 +2999,65 @@ mod tests {
         assert_eq!(Verbosity::Brief.as_str(), "brief");
         assert_eq!(Verbosity::Normal.as_str(), "normal");
         assert_eq!(Verbosity::Detailed.as_str(), "detailed");
+    }
+
+    fn timed(first: Option<u128>, total: Option<u128>) -> ChatAnswer {
+        ChatAnswer {
+            text: "a".into(),
+            citations: vec![],
+            model: None,
+            first_token_ms: first,
+            total_ms: total,
+            conversation_id: None,
+        }
+    }
+
+    /// The split is only worth printing once the wait was long enough to want
+    /// explaining, and only when there was a first token to have timed.
+    #[test]
+    fn timing_is_shown_for_a_slow_answer_and_not_a_quick_one() {
+        assert!(timing_split(&timed(Some(100), Some(900))).is_none());
+        assert!(timing_split(&timed(Some(2_000), Some(9_000))).is_some());
+        // Nothing streamed: no first token, so no split to report.
+        assert!(timing_split(&timed(None, Some(9_000))).is_none());
+        assert!(timing_split(&timed(Some(2_000), None)).is_none());
+    }
+
+    /// The two are sampled separately, so a total under the first token is
+    /// possible; subtracting must not wrap into an enormous generation time.
+    #[test]
+    fn a_total_below_the_first_token_does_not_wrap() {
+        let (_, generating) = timing_split(&timed(Some(9_000), Some(8_000))).unwrap();
+        assert_eq!(generating, 0);
+    }
+
+    #[test]
+    fn the_split_is_the_wait_before_and_after_the_first_word() {
+        let (first, generating) = timing_split(&timed(Some(2_000), Some(9_000))).unwrap();
+        assert_eq!(first, 2_000);
+        assert_eq!(generating, 7_000);
+    }
+
+    fn citation_at(index: u32, name: &str, cited: bool) -> Citation {
+        Citation {
+            index: Some(index),
+            content: Some(format!("full text of {name}")),
+            source: Some(DocumentSource {
+                r#type: None,
+                name: Some(name.to_string()),
+            }),
+            cited: Some(cited),
+        }
+    }
+
+    /// A passage the answer never cited is what the model saw and did not use,
+    /// which is worth reading; it must be reachable rather than hidden.
+    #[test]
+    fn a_source_is_found_whether_or_not_the_answer_cited_it() {
+        let cites = vec![citation_at(1, "a.md", true), citation_at(2, "b.md", false)];
+        assert!(find_source(&cites, 1).is_some());
+        assert!(find_source(&cites, 2).is_some());
+        assert!(find_source(&cites, 3).is_none());
     }
 
     /// A fast answer must not pick up a counter it never needed.
