@@ -1168,6 +1168,10 @@ fn new_instance_id() -> String {
 /// first question than to hold up the command.
 const WARM_TIMEOUT_SECS: u64 = 90;
 
+/// Output tokens the warm-up asks for. Small, because the answer is discarded,
+/// but not so small that the model can finish without saying anything.
+const WARM_TOKENS: u32 = 8;
+
 /// Ask the node one throwaway question, so the first real one does not pay for
 /// the cold start.
 ///
@@ -1191,10 +1195,13 @@ async fn warm(node: &LocalNode) -> bool {
         "instance_id": node.instance_id,
         "query": "warm up",
         "system": "Reply with one word.",
-        // One token is enough to make a model server load its weights, and the
-        // answer is thrown away. Retrieval runs either way, which is what loads
-        // the embedder.
-        "max_tokens": 1,
+        // Enough tokens that the model reliably produces some. The answer is
+        // thrown away, so one was the obvious budget and the wrong one: a
+        // single token is sometimes spent on an end-of-sequence marker, the
+        // node reports a generation that returned no text, and the warm-up
+        // fails on a node that is working. Measured against a real model, one
+        // token failed once in five and eight never did.
+        "max_tokens": WARM_TOKENS,
         // The same policy real questions ask for, so the reranker's model is
         // loaded here too. Warming without it would leave the largest of the
         // three cold starts to land on the first question after all.
@@ -1243,7 +1250,14 @@ async fn warm_up(node: &LocalNode) {
     if warmed {
         println!(" ({:.1}s)", started.elapsed().as_secs_f64());
     } else {
-        println!();
+        // Said, not silent. The node is fine and the only cost is that the
+        // first question pays what this was meant to absorb -- but printing
+        // nothing meant a warm-up that never worked looked identical to one
+        // that did, which is how this stayed hidden.
+        println!(
+            " {}",
+            "skipped; the first question will be slower.".dimmed()
+        );
     }
 }
 
