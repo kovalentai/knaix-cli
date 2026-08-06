@@ -103,6 +103,10 @@ fn print_help() {
         ),
         ("/memory", "List the notes saved for this node"),
         (
+            "/source <n>",
+            "Print passage [n] from the last answer in full",
+        ),
+        (
             "/reset",
             "Start a new conversation; earlier questions leave the context",
         ),
@@ -172,6 +176,14 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
     // Said once per session, so a hosted node that cannot keep a thread is not
     // silently answering every question as though it were the first.
     let mut warned_threadless = false;
+    // The passages behind the last answer, so /source can print one whole. The
+    // citation list only shows the first line or so of each.
+    let mut last_citations: Vec<crate::nodes::Citation> = Vec::new();
+    // Said once, the first time an answer cites something. The citation list
+    // shows a passage truncated with an ellipsis and nothing about it says the
+    // rest is a command away, so the feature would otherwise be found only by
+    // reading /help.
+    let mut pointed_at_source = false;
 
     // The node does not change mid-session, so the prompt is built once.
     let prompt = plain_prompt(node_id);
@@ -201,6 +213,24 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                                 println!("{} Usage: /remember <fact>", "Error:".red());
                             } else {
                                 remember(ctx, target, fact).await;
+                            }
+                            continue;
+                        }
+                        "/source" => {
+                            let arg = args.trim();
+                            match arg.parse::<u32>() {
+                                Ok(n) if !last_citations.is_empty() => {
+                                    crate::nodes::print_source(&last_citations, n)
+                                }
+                                Ok(_) => println!(
+                                    "{} Nothing to show yet. Ask a question first.",
+                                    "Info:".blue()
+                                ),
+                                Err(_) => println!(
+                                    "{} Usage: /source <n>, the number in a {} marker.",
+                                    "Error:".red(),
+                                    "[n]".cyan()
+                                ),
                             }
                             continue;
                         }
@@ -292,7 +322,14 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                         println!();
                     }
                     Ok(Some(answer)) => {
+                        crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
+                        last_citations = answer.citations.clone();
+                        let cited_any = answer.citations.iter().any(|c| c.cited.unwrap_or(false));
+                        if cited_any && !pointed_at_source {
+                            pointed_at_source = true;
+                            println!("{}", "Tip: /source <n> prints a passage in full.".dimmed());
+                        }
                         println!();
                         // Follow the thread the control plane opened, so the
                         // next question is answered in the context of this one.

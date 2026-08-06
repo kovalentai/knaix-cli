@@ -705,6 +705,7 @@ async fn run() -> Result<()> {
                 )
                 .await?
                 {
+                    nodes::print_answer_timing(&answer);
                     nodes::print_answer_footer(&target, &answer);
                 }
             }
