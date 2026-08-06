@@ -242,3 +242,176 @@ jobs:
               --generate-notes \
               --verify-tag
           fi
+
+  # ---------------------------------------------------------------------------
+  # Publish to releases.knaix.com
+  #
+  # The GitHub Release is not the install path: install.sh, install.ps1, the
+  # Homebrew formula and `knaix verify` all read this bucket. While this was a
+  # manual step 0.4.0 stayed installable through two later releases.
+  #
+  # A separate job so a failed publish re-runs alone; re-running the signing job
+  # would mint a second signature and a duplicate attestation.
+  #
+  # Bytes come from the GitHub Release, so the bucket serves exactly what was
+  # signed and attested.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to releases.knaix.com
+    needs: [meta, release]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      RELEASES_BUCKET: knaix-releases
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Fetch the published binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p pub
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir pub \
+            --pattern 'knaix-darwin-*' \
+            --pattern 'knaix-linux-*' \
+            --pattern 'knaix-windows-*'
+          ls -l pub
+
+      # install.sh checks the download against this sidecar, so a mismatch here
+      # is one every user hits. Recomputed, not trusted.
+      - name: The checksums match the binaries
+        run: |
+          set -euo pipefail
+          for f in pub/knaix-*; do
+            case "$f" in *.sha256|*.cosign.bundle) continue ;; esac
+            EXPECTED="$(cat "${f}.sha256")"
+            ACTUAL="$(sha256sum "$f" | awk '{print $1}')"
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::${f} hashes to ${ACTUAL} but its sidecar says ${EXPECTED}."
+              exit 1
+            fi
+            echo "ok  $(basename "$f")  ${ACTUAL}"
+          done
+
+      # All three files per platform. install.sh treats a missing bundle as
+      # fatal, so a skipped upload breaks installs rather than losing a feature.
+      - name: All five platforms are complete
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for p in darwin-x86_64 darwin-arm64 linux-x86_64 linux-arm64 windows-x86_64.exe; do
+            for suffix in '' .sha256 .cosign.bundle; do
+              if [ ! -f "pub/knaix-${p}${suffix}" ]; then
+                echo "::error::pub/knaix-${p}${suffix} is missing from the release."
+                MISSING=1
+              fi
+            done
+          done
+          [ "$MISSING" -eq 0 ]
+
+      - name: Upload
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          for f in pub/knaix-*; do
+            aws s3api put-object \
+              --bucket "$RELEASES_BUCKET" \
+              --key "v${VERSION}/$(basename "$f")" \
+              --body "$f" \
+              --content-type binary/octet-stream \
+              --cache-control 'public, max-age=31536000, immutable' > /dev/null
+            echo "put v${VERSION}/$(basename "$f")"
+          done
+
+      # put-object exits 0 per object; the switch below is thrown once for all
+      # fifteen. So read them back.
+      - name: Read the objects back
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          for p in darwin-x86_64 darwin-arm64 linux-x86_64 linux-arm64 windows-x86_64.exe; do
+            for suffix in '' .sha256 .cosign.bundle; do
+              aws s3api head-object \
+                --bucket "$RELEASES_BUCKET" \
+                --key "v${VERSION}/knaix-${p}${suffix}" > /dev/null
+            done
+          done
+          echo "All fifteen objects are being served under v${VERSION}."
+
+      # workflow_dispatch can name an old tag. Rebuilding v0.4.9 to replace a
+      # corrupt asset is fine; moving every installer back to it is not. The
+      # upload is safe to repeat, so this is the only step that has to check.
+      - name: This release is not older than the one being served
+        id: newer
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          # To a file: get-object also prints its JSON response to stdout, so
+          # reading the value there returns the two mixed together.
+          if aws s3api get-object --bucket "$RELEASES_BUCKET" \
+               --key latest-version served.txt >/dev/null 2>&1; then
+            CURRENT="$(tr -d '[:space:]' < served.txt)"
+          else
+            CURRENT=''
+          fi
+
+          if [ -z "$CURRENT" ]; then
+            echo "Nothing is being served yet."
+            echo "flip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -1)"
+          if [ "$NEWEST" != "$VERSION" ]; then
+            echo "::warning::releases.knaix.com serves ${CURRENT}, which is newer than ${VERSION}. The binaries are published and verifiable, but latest-version is left alone so installs keep resolving to ${CURRENT}."
+            echo "flip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "flip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The switch. install.sh reads this to decide what to fetch, so a version
+      # named here whose binaries are absent fails every install. Written after
+      # all fifteen objects read back, so a half-finished publish leaves the
+      # previous release serving. No trailing newline: it is a bare string.
+      - name: Flip latest-version
+        if: steps.newer.outputs.flip == 'true'
+        env:
+          DISTRIBUTION_ID: ${{ vars.KNAIX_RELEASES_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          printf '%s' "$VERSION" > latest-version
+
+          aws s3api put-object \
+            --bucket "$RELEASES_BUCKET" \
+            --key latest-version \
+            --body latest-version \
+            --content-type text/plain \
+            --cache-control 'public, max-age=60' > /dev/null
+
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths /latest-version > /dev/null
+
+          echo "releases.knaix.com now serves ${VERSION}."
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          {
+            echo "## ${TAG} published"
+            echo
+            if [ "${{ steps.newer.outputs.flip }}" = "true" ]; then
+              echo "\`releases.knaix.com\` serves **${VERSION}**. \`curl -sSL https://knaix.com/install.sh | sh\` installs it now."
+            else
+              echo "Binaries are published under \`v${VERSION}\`, but \`latest-version\` was left pointing at a newer release."
+            fi
+            echo
+            echo "Homebrew follows on its own: \`kovalentai/homebrew-tap\` polls hourly and bumps once the bucket serves the new version. Nothing to push."
+          } >> "$GITHUB_STEP_SUMMARY"
