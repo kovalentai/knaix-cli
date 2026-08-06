@@ -709,6 +709,17 @@ async fn run() -> Result<()> {
                         Err(e) => return Err(e),
                     }
                 }
+                // Scoping reads the named documents whole, so depth has
+                // nothing to select from. Third time a flag would have gone
+                // quietly nowhere.
+                if k.is_some() && !doc.is_empty() {
+                    println!(
+                        "{} {} has no effect with {}: a scoped answer reads the named documents rather than the closest passages.",
+                        "Note:".blue(),
+                        "--k".cyan(),
+                        "--doc".cyan()
+                    );
+                }
                 if k.is_some() && !target.is_local() {
                     println!(
                         "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
