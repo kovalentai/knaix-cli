@@ -118,6 +118,10 @@ fn print_help() {
             "/k <n>",
             "Set how many passages an answer is grounded in (local node)",
         ),
+        (
+            "/doc <name>",
+            "Ground answers in one document; /doc alone clears it (local node)",
+        ),
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
     for (cmd, what) in rows {
@@ -253,6 +257,35 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                             }
                             continue;
                         }
+                        "/doc" => {
+                            let wanted = args.trim();
+                            if wanted.is_empty() {
+                                options.retrieval.document_ids.clear();
+                                println!(
+                                    "{} Answers are grounded in a search of the whole corpus again.",
+                                    "✓".green()
+                                );
+                                continue;
+                            }
+                            match crate::nodes::scope_to_documents(
+                                ctx,
+                                target,
+                                std::slice::from_ref(&wanted.to_string()),
+                            )
+                            .await
+                            {
+                                Ok(ids) => {
+                                    options.retrieval.document_ids = ids;
+                                    println!(
+                                        "{} Answers are now grounded in {}.",
+                                        "✓".green(),
+                                        wanted.cyan()
+                                    );
+                                }
+                                Err(e) => println!("{} {}", "Error:".red(), e),
+                            }
+                            continue;
+                        }
                         "/source" => {
                             match (args.trim().parse::<u32>(), &last_citations) {
                                 (Ok(n), Some(cites)) => crate::nodes::print_source(cites, n),
@@ -343,7 +376,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                     &input,
                     crate::nodes::Echo::Markdown,
                     &history,
-                    options,
+                    &options,
                     conversation.as_deref(),
                 )
                 .await
@@ -357,6 +390,7 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                         println!();
                     }
                     Ok(Some(answer)) => {
+                        crate::nodes::print_scope_note(&answer);
                         crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
                         last_citations = Some(answer.citations.clone());

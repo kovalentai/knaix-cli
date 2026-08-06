@@ -393,7 +393,7 @@ async fn measure_answers(
             QUESTION,
             crate::nodes::Echo::Silent,
             &[],
-            crate::nodes::AnswerOptions::default(),
+            &crate::nodes::AnswerOptions::default(),
             None,
         )
         .await
