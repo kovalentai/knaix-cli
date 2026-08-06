@@ -230,6 +230,15 @@ pub async fn run(ctx: &KnaixContext, target: &crate::nodes::Target) -> Result<()
                                     "Error:".red(),
                                     crate::nodes::MAX_K
                                 ),
+                                // Confirming a depth a hosted node never
+                                // receives would be a worse answer than
+                                // refusing: the session would read as though
+                                // the setting had taken.
+                                Ok(_) if !target.is_local() => println!(
+                                    "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                                    "Note:".blue(),
+                                    "/k".cyan()
+                                ),
                                 Ok(n) => match crate::nodes::checked_k(Some(n)) {
                                     Ok(k) => {
                                         options.retrieval.k = k;

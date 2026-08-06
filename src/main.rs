@@ -689,6 +689,17 @@ async fn run() -> Result<()> {
             };
             let node_id = project_node(node_id, project.as_ref());
             if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                // Retrieval depth is the CLI's to set only when it drives the
+                // node directly. A hosted node is policed by the control plane,
+                // so say the flag had no effect rather than dropping it in
+                // silence -- which is what --brief and --detailed used to do.
+                if k.is_some() && !target.is_local() {
+                    println!(
+                        "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                        "Note:".blue(),
+                        "--k".cyan()
+                    );
+                }
                 if ctx.output_format == "json" {
                     if let Some(answer) = nodes::chat(
                         &ctx,
