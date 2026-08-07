@@ -1,0 +1,67 @@
+name: Base branch
+
+# Work groups into a release rather than trickling onto main. See RELEASING.md.
+# A feat/fix aimed at main while a release branch is open is a habit mistake,
+# and invisible once merged.
+#
+# Narrow on purpose: feat/* and fix/* only, only while a release branch exists,
+# never for a fork.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Targets the release branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Branch names only, no history.
+          fetch-depth: 1
+
+      - name: Check
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Forks target main; that is how open source works. Retargeting is a
+          # maintainer's job, not a red check on a first contribution.
+          if [ "$IS_FORK" = "true" ]; then
+            echo "Fork pull request. Not enforced."
+            exit 0
+          fi
+
+          if [ "$BASE" != "main" ]; then
+            echo "Targets ${BASE}. Nothing to check."
+            exit 0
+          fi
+
+          case "$HEAD" in
+            feat/*|fix/*) ;;
+            *)
+              echo "${HEAD} is not a feature or fix branch. main is a fine target."
+              exit 0
+              ;;
+          esac
+
+          OPEN="$(git ls-remote --heads origin 'refs/heads/release/v*' \
+                  | sed 's|.*refs/heads/||' | sort -V)"
+
+          if [ -z "$OPEN" ]; then
+            echo "No release branch is open, so main is the only place to go."
+            echo "Consider opening one before the next change: see RELEASING.md."
+            exit 0
+          fi
+
+          NEWEST="$(printf '%s\n' "$OPEN" | tail -1)"
+
+          echo "::error::${HEAD} targets main while ${NEWEST} is open. Retarget this pull request at ${NEWEST} so the change ships in that release. See RELEASING.md."
+          exit 1

@@ -48,6 +48,22 @@ Use [Conventional Commits](https://www.conventionalcommits.org/)
 (`feat:`, `fix:`, `docs:`, `test:`, `chore:`). Keep messages factual and
 free of sensitive detail. Describe the change, not exploit specifics.
 
+The prefix decides two things later: which changelog section the change
+lands in, and whether the release takes a minor or a patch. Mark a
+breaking change with a `!` (`feat(chat)!:`) or a `BREAKING CHANGE:`
+footer, or it will be released as a patch.
+
+## Which branch to target
+
+Changes group into a release rather than landing on `main` one at a time.
+While a `release/vX.Y.Z` branch is open, base your branch on it and open
+your pull request against it. CI enforces this for `feat/*` and `fix/*`.
+
+[RELEASING.md](RELEASING.md) has the whole process.
+
+Do not edit `CHANGELOG.md` in a feature pull request. It is compiled once
+when the release is cut.
+
 ## Pull request checklist
 
 - [ ] `cargo fmt`, `clippy`, `build`, and `test` all pass locally.

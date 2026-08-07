@@ -1,0 +1,157 @@
+name: Cut a release
+
+# Works out the version, sets it in Cargo.toml and Cargo.lock, drafts the
+# CHANGELOG section from the branch's pull requests, and pushes. See RELEASING.md.
+#
+# It stops short of opening the pull request on purpose. A PR opened with the
+# GITHUB_TOKEN raises no pull_request event, so CI would never run and main's
+# required checks would never appear. A PAT would work around it and be one
+# more credential to hold, which is what the tap bump was moved out to avoid.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Release branch, e.g. release/v0.5.4'
+        required: true
+      version:
+        description: 'Version override, e.g. 0.6.0. Leave empty to let the commits decide.'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  cut:
+    name: Bump and draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          # Both scripts need a merge base, which a shallow clone does not have.
+          fetch-depth: 0
+
+      - name: The branch is a release branch
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in
+            release/v*) ;;
+            *)
+              echo "::error::'${BRANCH}' is not a release branch. Expected release/vX.Y.Z."
+              exit 1
+              ;;
+          esac
+
+      # bump-version.sh runs `cargo update -p knaix` to touch Cargo.lock.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Work out the version
+        id: version
+        env:
+          OVERRIDE: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          PROPOSED="$(scripts/propose-version.sh origin/main)"
+
+          if [ -n "$OVERRIDE" ]; then
+            if ! printf '%s' "$OVERRIDE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::'${OVERRIDE}' is not a semver version like 0.5.4."
+              exit 1
+            fi
+            echo "Proposed ${PROPOSED}, overridden to ${OVERRIDE}."
+            echo "version=${OVERRIDE}" >> "$GITHUB_OUTPUT"
+            echo "note=Proposed \`${PROPOSED}\` from the commits, overridden to \`${OVERRIDE}\`." >> "$GITHUB_OUTPUT"
+          else
+            echo "Proposed ${PROPOSED}."
+            echo "version=${PROPOSED}" >> "$GITHUB_OUTPUT"
+            echo "note=\`${PROPOSED}\`, proposed from the commits on the branch." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: The branch name agrees with the version
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A warning, not a failure: a branch that grew a breaking change
+          # should release as a minor, and renaming it would orphan its open
+          # pull requests. The tag follows Cargo.toml; the branch is a label.
+          if [ "$BRANCH" != "release/v${VERSION}" ]; then
+            echo "::warning::Branch ${BRANCH} but releasing v${VERSION}. That is allowed; the tag follows Cargo.toml, not the branch name. Check it is what you meant."
+          fi
+
+      - name: Bump
+        run: scripts/bump-version.sh "${{ steps.version.outputs.version }}"
+
+      - name: Draft the changelog
+        run: scripts/draft-changelog.sh "${{ steps.version.outputs.version }}" origin/main
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # Through the environment, never interpolated into the script. The
+          # release/v* check above is not a defence: release/v0.5.4"; cmd; "
+          # satisfies it and still reaches the shell.
+          BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md Cargo.toml Cargo.lock
+          git commit -m "chore(release): knaix CLI v${VERSION}"
+          git push origin HEAD:"$BRANCH"
+
+      # Prefixes the changelog does not carry. Usually right to omit,
+      # occasionally a user-facing change filed under chore.
+      - name: What the changelog left out
+        id: excluded
+        run: |
+          set -euo pipefail
+          LEFT="$(git log --reverse --format='%s' origin/main...HEAD \
+                  | grep -Ev '^(feat|fix|perf|refactor|change)(\([^)]*\))?!?:' \
+                  | grep -v '^chore(release):' \
+                  | sed 's/^/- /' || true)"
+          {
+            echo 'list<<EOF'
+            if [ -n "$LEFT" ]; then printf '%s\n' "$LEFT"; else echo '- Nothing.'; fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Every value arrives through the environment and is printed with printf
+      # rather than interpolated. Pasted into the script, a pull request title
+      # holding an apostrophe is a syntax error, and the backticks in NOTE run
+      # as command substitution.
+      - name: Next steps
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTE: ${{ steps.version.outputs.note }}
+          EXCLUDED: ${{ steps.excluded.outputs.list }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LINK="${SERVER_URL}/${REPO}/compare/main...${BRANCH}?quick_pull=1&title=chore(release):%20knaix%20CLI%20v${VERSION}"
+          {
+            echo "## v${VERSION} is ready to review"
+            echo
+            printf '%s\n' "$NOTE"
+            echo
+            echo "\`Cargo.toml\`, \`Cargo.lock\` and \`CHANGELOG.md\` are committed on \`${BRANCH}\`."
+            echo
+            echo "### Now"
+            echo
+            echo "1. **Rewrite the changelog draft.** It is pull request titles. It says what changed and not why it mattered, which is the part people read it for."
+            echo "2. [**Open the release pull request**](${LINK})."
+            echo "3. Merge it, then \`git tag v${VERSION} && git push origin v${VERSION}\`."
+            echo "4. Merge the paired \`${BRANCH}\` in \`knaix-docs\`."
+            echo
+            echo "### Left out of the changelog"
+            echo
+            echo "Check nothing user-facing is hiding here."
+            echo
+            printf '%s\n' "$EXCLUDED"
+          } >> "$GITHUB_STEP_SUMMARY"
