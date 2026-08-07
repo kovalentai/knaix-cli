@@ -4,11 +4,15 @@ All notable changes to the Knaix CLI will be documented in this file.
 
 ## [0.5.4] - 2026-08-07
 
-<!-- One paragraph on what this release is about. Delete this comment. -->
+One fix, for something every table in the CLI was quietly doing.
 
 ### Fixed
 
-- **output: line up the tables again**
+- **The tables line up again.** Every table here colours its cells, and comfy-table measures a cell over the raw string, escape sequences included. A coloured cell was therefore reckoned wider than it prints and padded short, so its row stopped well before the border while an uncoloured row in the same table reached it.
+
+  `knaix metrics` showed it worst. Its label column is dimmed and three of the six values are coloured, so three rows ended early and three did not, which reads less like a rendering bug than like the data is ragged. `doctor`, `config`, `local status`, `bench`, `selftest`, `list` and `top` all had it.
+
+  Columns come out narrower now too, because a width no longer counts bytes that never print.
 
 ## [0.5.3] - 2026-08-05
 
