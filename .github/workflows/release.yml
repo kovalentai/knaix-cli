@@ -1,10 +1,9 @@
 name: Release
 
-# Cut a release by pushing a semver tag that matches Cargo.toml, e.g.:
+# Cut a release by pushing a semver tag matching Cargo.toml:
 #   git tag v0.3.4 && git push origin v0.3.4
-# Builds static Linux (musl) and native macOS binaries for x86_64 and
-# arm64, then publishes a GitHub Release with the tarballs and SHA256SUMS.
-# workflow_dispatch can re-build an existing tag.
+# Builds five platform targets, signs them, publishes the GitHub Release, then
+# publishes to releases.knaix.com. See RELEASING.md.
 
 on:
   push:
@@ -14,12 +13,14 @@ on:
       tag:
         description: 'Existing tag to (re)build, e.g. v0.3.4'
         required: true
+      publish_only:
+        description: 'Publish the tag''s existing release assets. Skips the build, so the signed bytes are not replaced.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  # Signing and attestation are keyless: the workflow proves who it is with a
-  # short-lived OIDC token instead of a stored key, so there is no signing
-  # secret to leak, rotate or expire.
+  # Signing is keyless, via a short-lived OIDC token. No secret to leak.
   id-token: write
   attestations: write
 
@@ -29,8 +30,7 @@ env:
   CARGO_PROFILE_RELEASE_STRIP: "true"
 
 jobs:
-  # Resolve the tag once and refuse to release if it disagrees with the
-  # version in Cargo.toml, so a mistagged release cannot ship.
+  # Refuses a tag that disagrees with Cargo.toml, so a mistag cannot ship.
   meta:
     name: Resolve tag
     runs-on: ubuntu-latest
@@ -41,8 +41,8 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
       - id: resolve
-        # The dispatch input reaches the shell through the environment. Pasted
-        # into the script it runs before the check below can reject it.
+        # Through the environment: pasted into the script, the input runs
+        # before the check below can reject it.
         env:
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
@@ -63,12 +63,11 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: meta
-    # Every target, Linux musl and macOS alike, cross-compiles from one x86_64
-    # Linux runner via cargo-zigbuild, which uses zig as the C/C++ linker.
-    # macOS runners bill at 10x Linux, so building the Apple targets natively
-    # was by far the most expensive part of a release; zig links Mach-O just
-    # as well and ships the macOS libSystem stubs, so no Apple SDK is needed.
-    # This also drops the musl-tools install and the native arm64 runner.
+    # Only ever false on a dispatch that asked for it. Rebuilding would replace
+    # already-signed bytes, and stable Rust moves, so they would not even match.
+    if: ${{ github.event.inputs.publish_only != 'true' }}
+    # Every target cross-compiles from one Linux runner via cargo-zigbuild.
+    # macOS runners bill at 10x, and zig links Mach-O just as well.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -78,12 +77,8 @@ jobs:
           - aarch64-unknown-linux-musl
           - x86_64-apple-darwin
           - aarch64-apple-darwin
-          # Windows is the gnu target rather than msvc so it cross-compiles from
-          # this same Linux runner: zig supplies the C toolchain that ring needs,
-          # and msvc would mean either a Windows runner at 2x the billing or
-          # shipping Microsoft's CRT headers. Only x86_64 is built; arm64 Windows
-          # runs x86_64 binaries under emulation, and the aarch64 gnullvm target
-          # is not mature enough to hand to users.
+          # gnu, not msvc, so it cross-compiles from this same runner. x86_64
+          # only: arm64 Windows emulates it, and gnullvm is not mature enough.
           - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
@@ -112,8 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Windows builds knaix.exe, and the extension is not decoration: a
-          # file without it will not run.
+          # Windows needs the .exe; a file without it will not run.
           BIN=knaix
           case "${{ matrix.target }}" in *-windows-*) BIN=knaix.exe ;; esac
           tar -czf "dist/knaix-${{ needs.meta.outputs.tag }}-${{ matrix.target }}.tar.gz" \
@@ -128,6 +122,7 @@ jobs:
   release:
     name: Publish release
     needs: [meta, build]
+    if: ${{ github.event.inputs.publish_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,9 +135,8 @@ jobs:
           pattern: knaix-*
           merge-multiple: true
 
-      # No installer is attached. The public one lives in knaix-docs and is
-      # served from knaix.com/install.sh; shipping a copy here froze it at
-      # release time and let the two drift apart.
+      # No installer is attached. The public one is served from knaix-docs, and
+      # a copy here froze at release time and drifted.
       - name: Checksums
         run: |
           set -euo pipefail
@@ -150,11 +144,8 @@ jobs:
           sha256sum knaix-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      # The bucket serves raw, platform-named binaries, and those are the bytes
-      # the installer downloads and runs. They are unpacked here rather than
-      # during the manual publish step so that the signature and the attestation
-      # below cover exactly what a user ends up executing -- a signature over the
-      # tarball would say nothing about the file extracted from it.
+      # Unpacked before signing so the signature and attestation cover the exact
+      # bytes a user runs. A signature over the tarball would not.
       - name: Unpack the platform binaries
         env:
           TAG: ${{ needs.meta.outputs.tag }}
@@ -182,9 +173,8 @@ jobs:
 
       - uses: sigstore/cosign-installer@v3
 
-      # Keyless signing. The certificate records which workflow, in which
-      # repository, at which tag produced these bytes, and `knaix verify` pins
-      # all three -- so a signature made anywhere else does not satisfy it.
+      # The certificate records the workflow, repository and tag that produced
+      # these bytes, and `knaix verify` pins all three.
       - name: Sign the binaries
         run: |
           set -euo pipefail
@@ -194,12 +184,8 @@ jobs:
           done
           ls -l out
 
-      # Named one by one rather than globbed: the directory also holds the
-      # sidecars and bundles, and a pattern that tried to exclude them by suffix
-      # would either attest them too or, worse, quietly attest nothing. A listed
-      # path that does not exist fails the release. Note the converse is not
-      # true: adding a platform to the matrix without adding it here attests the
-      # other five and ships the new one unattested, so the check below counts.
+      # Named one by one, not globbed: the directory also holds sidecars and
+      # bundles, and a suffix pattern would attest them or quietly attest none.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -210,9 +196,8 @@ jobs:
             out/knaix-linux-arm64
             out/knaix-windows-x86_64.exe
 
-      # The step above attests what it is given, so a platform added to the
-      # matrix and not to that list ships unattested and nothing says so. This
-      # is what says so.
+      # A platform added to the matrix but not to that list ships unattested,
+      # and nothing else would say so.
       - name: Every binary is attested
         run: |
           set -euo pipefail
@@ -251,12 +236,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # Publish to releases.knaix.com
   #
-  # The GitHub Release is not the install path: install.sh, install.ps1, the
-  # Homebrew formula and `knaix verify` all read this bucket. While this was a
-  # manual step 0.4.0 stayed installable through two later releases.
+  # The GitHub Release is not the install path: the installers, the Homebrew
+  # formula and `knaix verify` all read this bucket. While this was manual,
+  # 0.4.0 stayed installable through two later releases.
   #
-  # A separate job so a failed publish re-runs alone; re-running the signing job
-  # would mint a second signature and a duplicate attestation.
+  # A separate job so a failed publish re-runs alone, rather than re-signing.
   #
   # Bytes come from the GitHub Release, so the bucket serves exactly what was
   # signed and attested.
@@ -264,6 +248,16 @@ jobs:
   publish:
     name: Publish to releases.knaix.com
     needs: [meta, release]
+    # always(), or the skipped release job would skip this one too.
+    #
+    # Not "success or skipped": a build that fails on a tag push also leaves
+    # release skipped, and that must not publish. Skipping is only acceptable
+    # when it was asked for.
+    if: >-
+      ${{ always()
+          && needs.meta.result == 'success'
+          && (needs.release.result == 'success'
+              || github.event.inputs.publish_only == 'true') }}
     runs-on: ubuntu-latest
     # One publish at a time. Two tags close together would both read the old
     # latest-version, both decide to flip, and the older could land last.
@@ -323,6 +317,34 @@ jobs:
             done
           done
           [ "$MISSING" -eq 0 ]
+
+      - uses: sigstore/cosign-installer@v3
+
+      # The checksum above only proves the sidecar matches the binary, and both
+      # arrive from the same release. On publish_only those bytes may have been
+      # edited since the tag, and most users have no cosign, so for them the
+      # checksum is the only control and an editor controls both halves of it.
+      #
+      # The identity is the one install.sh pins, character for character, so
+      # this refuses exactly what a client would refuse.
+      - name: The signature covers these bytes
+        run: |
+          set -euo pipefail
+          IDENTITY='^https://github\.com/kovalentai/knaix-cli/\.github/workflows/release\.yml@refs/tags/v.+$'
+          ISSUER='https://token.actions.githubusercontent.com'
+
+          for f in pub/knaix-*; do
+            case "$f" in *.sha256|*.cosign.bundle) continue ;; esac
+            if ! cosign verify-blob \
+                --bundle "${f}.cosign.bundle" \
+                --certificate-identity-regexp "$IDENTITY" \
+                --certificate-oidc-issuer "$ISSUER" \
+                "$f" >/dev/null 2>&1; then
+              echo "::error::$(basename "$f") is not signed by this repository's release workflow. Refusing to publish it."
+              exit 1
+            fi
+            echo "signed  $(basename "$f")"
+          done
 
       - name: Upload
         run: |
