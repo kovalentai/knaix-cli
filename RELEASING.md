@@ -126,6 +126,16 @@ people rather than sitting behind a year-long cache. `latest-version` still only
 lands if every binary is present, so a re-run either completes the publish or
 leaves it where it was.
 
+**A tag was built but never published.** Run **Release** from the Actions tab
+with the tag and **publish_only** ticked. It skips the build and uploads the
+release's existing assets, so the bytes that reach the bucket are the ones that
+were signed and attested at the time.
+
+Do not re-run the whole workflow to fix this. It rebuilds and replaces the
+release's assets, and since the toolchain moves, the new binaries will not match
+the old ones. Anyone who already downloaded that version and verifies later gets
+a mismatch that looks exactly like tampering.
+
 **A release shipped and should not have.** Do not delete the binaries; anyone who
 already installed will be verifying against them. Publish the fix as the next
 patch and point `latest-version` at it.

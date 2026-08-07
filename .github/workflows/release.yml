@@ -4,7 +4,8 @@ name: Release
 #   git tag v0.3.4 && git push origin v0.3.4
 # Builds static Linux (musl) and native macOS binaries for x86_64 and
 # arm64, then publishes a GitHub Release with the tarballs and SHA256SUMS.
-# workflow_dispatch can re-build an existing tag.
+# workflow_dispatch can re-build an existing tag, or publish one that was built
+# but never reached the bucket.
 
 on:
   push:
@@ -14,6 +15,10 @@ on:
       tag:
         description: 'Existing tag to (re)build, e.g. v0.3.4'
         required: true
+      publish_only:
+        description: 'Publish the tag''s existing release assets. Skips the build, so the signed bytes are not replaced.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -63,6 +68,10 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: meta
+    # A tag push has no inputs, so this is only ever false on a dispatch that
+    # asked for it. Rebuilding would replace bytes that are already signed and
+    # attested, and stable Rust moves, so the new ones would not even match.
+    if: ${{ github.event.inputs.publish_only != 'true' }}
     # Every target, Linux musl and macOS alike, cross-compiles from one x86_64
     # Linux runner via cargo-zigbuild, which uses zig as the C/C++ linker.
     # macOS runners bill at 10x Linux, so building the Apple targets natively
@@ -128,6 +137,7 @@ jobs:
   release:
     name: Publish release
     needs: [meta, build]
+    if: ${{ github.event.inputs.publish_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -264,6 +274,16 @@ jobs:
   publish:
     name: Publish to releases.knaix.com
     needs: [meta, release]
+    # always(), or the skipped release job would skip this one too.
+    #
+    # Not "success or skipped": a build that fails on a tag push also leaves
+    # release skipped, and that must not publish. Skipping is only acceptable
+    # when it was asked for.
+    if: >-
+      ${{ always()
+          && needs.meta.result == 'success'
+          && (needs.release.result == 'success'
+              || github.event.inputs.publish_only == 'true') }}
     runs-on: ubuntu-latest
     # One publish at a time. Two tags close together would both read the old
     # latest-version, both decide to flip, and the older could land last.
