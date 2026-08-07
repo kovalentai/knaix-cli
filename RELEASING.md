@@ -88,8 +88,13 @@ required checks would never appear.
 
 ```bash
 git checkout main && git pull
-git tag v0.5.4 && git push origin v0.5.4
+git tag -m "v0.5.4" v0.5.4 && git push origin v0.5.4
 ```
+
+The message is not optional here. This repository signs its tags, which
+makes them annotated, and an annotated tag with no message aborts with
+`fatal: no tag message?`. The version on its own is the message every
+release so far has used.
 
 The tag must match `Cargo.toml`; `release.yml` refuses one that does not.
 
@@ -110,9 +115,16 @@ there whose binaries are missing is an install that fails for everyone. Writing
 it last means a publish that dies halfway leaves the previous release serving
 rather than a broken new one.
 
-The Homebrew formula follows on its own. `kovalentai/homebrew-tap` polls hourly
-and bumps itself once the bucket serves the new version, so brew is current
-within the hour with nothing pushed from here.
+The Homebrew formula follows on its own. `kovalentai/homebrew-tap` polls and
+bumps itself once the bucket serves the new version, with nothing pushed from
+here. Its schedule reads as hourly and does not behave that way: GitHub delays
+and drops cron on a quiet repository, and runs land two or three hours apart. So
+brew trails a release by a few hours rather than an hour, and the tap's **Bump
+the formula** workflow takes a `workflow_dispatch` when that matters.
+
+The tap renders whatever `latest-version` serves when it polls, not each version
+in turn, so a release published before the next poll is simply skipped. That is
+not a fault: the newer release contains the older one.
 
 ## When something goes wrong
 
