@@ -318,6 +318,34 @@ jobs:
           done
           [ "$MISSING" -eq 0 ]
 
+      - uses: sigstore/cosign-installer@v3
+
+      # The checksum above only proves the sidecar matches the binary, and both
+      # arrive from the same release. On publish_only those bytes may have been
+      # edited since the tag, and most users have no cosign, so for them the
+      # checksum is the only control and an editor controls both halves of it.
+      #
+      # The identity is the one install.sh pins, character for character, so
+      # this refuses exactly what a client would refuse.
+      - name: The signature covers these bytes
+        run: |
+          set -euo pipefail
+          IDENTITY='^https://github\.com/kovalentai/knaix-cli/\.github/workflows/release\.yml@refs/tags/v.+$'
+          ISSUER='https://token.actions.githubusercontent.com'
+
+          for f in pub/knaix-*; do
+            case "$f" in *.sha256|*.cosign.bundle) continue ;; esac
+            if ! cosign verify-blob \
+                --bundle "${f}.cosign.bundle" \
+                --certificate-identity-regexp "$IDENTITY" \
+                --certificate-oidc-issuer "$ISSUER" \
+                "$f" >/dev/null 2>&1; then
+              echo "::error::$(basename "$f") is not signed by this repository's release workflow. Refusing to publish it."
+              exit 1
+            fi
+            echo "signed  $(basename "$f")"
+          done
+
       - name: Upload
         run: |
           set -euo pipefail
