@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::header::AUTHORIZATION;
 use reqwest::multipart;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -167,15 +167,17 @@ pub struct AnswerOptions {
 }
 
 /// One document the node holds, as `/api/kb/documents` reports it.
-#[derive(Deserialize, Debug, Clone)]
+///
+/// Serialized back out under the same names for `-o json`, so a script reads
+/// the node's own field names rather than a second spelling of them.
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NodeDocument {
     #[serde(rename = "document_id")]
     pub document_id: String,
     pub source: Option<String>,
-    /// Reported by the node. Not read yet; kept so the struct documents the
-    /// shape the route returns rather than half of it.
-    #[allow(dead_code)]
     pub chunks: Option<u64>,
+    #[serde(rename = "created_at")]
+    pub created_at: Option<String>,
 }
 
 impl NodeDocument {
@@ -201,8 +203,7 @@ pub async fn local_documents(
 
     if resp.status() == 404 {
         return Err(anyhow!(
-            "This node is too old to list its documents, so {} cannot resolve a name. Update it with {}.",
-            "--doc",
+            "This node is too old to list its documents. Update it with {}.",
             crate::brand::cmd("local up --pull")
         ))
         .coded(Code::Precondition);
@@ -743,17 +744,66 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
+/// The documents a local node holds, as a table.
+///
+/// No account and no control plane are involved: the node on this machine is
+/// asked directly. That is the whole point of the command on a machine that
+/// cannot reach the API, so nothing here may reach for a token.
+///
+/// The table omits the Type column a hosted node's listing carries. The node
+/// records a document's source name, not a type, and inferring one from the
+/// extension would put a guess in a column the hosted listing fills with fact.
+async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
+    let Target::Local { base, instance_id } = local_target()? else {
+        unreachable!("local_target only builds a local target");
+    };
+
+    let documents = local_documents(ctx, &base, &instance_id).await?;
+
+    if ctx.output_format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&documents).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    if documents.is_empty() {
+        println!(
+            "{} The local node holds no documents yet. {} ingests one.",
+            "Info:".blue(),
+            crate::brand::cmd("upload -n local <path>")
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{}",
+        "Knowledge Base for the local node:".bold().underline()
+    );
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Name", "Chunks", "Ingested"]);
+
+    for doc in &documents {
+        table.add_row(vec![
+            doc.label().to_string(),
+            doc.chunks.unwrap_or(0).to_string(),
+            doc.created_at.clone().unwrap_or_else(|| "N/A".to_string()),
+        ]);
+    }
+    println!("{table}\n");
+
+    Ok(())
+}
+
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
     // Answered before the token is read, because neither a session nor the
     // control plane has anything to do with it. Reaching for them first is what
     // made this report a DNS failure on a machine that was working fine.
     if node_id == Some(crate::local::LOCAL_NODE_ID) {
-        return Err(anyhow!(
-            "The local node keeps chunks and no document registry, so its documents cannot be listed.\n  {} retrieves from them and cites what it used; {} empties the store.",
-            crate::brand::cmd("chat -n local"),
-            crate::brand::cmd("local reset")
-        ))
-        .coded(Code::Error);
+        return list_local_documents(ctx).await;
     }
 
     let token = ctx.get_token()?;
@@ -3381,6 +3431,7 @@ mod tests {
             document_id: id.to_string(),
             source: Some(source.to_string()),
             chunks: Some(3),
+            created_at: Some("2026-08-07T00:00:00.000Z".to_string()),
         }
     }
 

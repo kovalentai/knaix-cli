@@ -55,7 +55,7 @@ enum Commands {
     /// Log out, removing the saved session from this machine
     Logout,
 
-    /// List your hosted nodes, or the documents on one node
+    /// List your hosted nodes, or the documents on one node ('local' works)
     #[clap(alias = "ls")]
     List {
         /// A node to list the documents of, instead of listing nodes
@@ -501,9 +501,8 @@ async fn main() -> std::process::ExitCode {
             // the problem, and pointing at another command would be noise. And
             // never to someone who just ran the diagnosis: doctor and report
             // both end in the checks this would be suggesting they run.
-            let already_diagnosed = std::env::args()
-                .nth(1)
-                .is_some_and(|a| a == "doctor" || a == "report");
+            let subcommand = std::env::args().nth(1).unwrap_or_default();
+            let already_diagnosed = subcommand == "doctor" || subcommand == "report";
             if !already_diagnosed
                 && matches!(
                     code,
@@ -524,11 +523,19 @@ async fn main() -> std::process::ExitCode {
                         "\n  {} A local node is running on this machine.",
                         "Note:".blue()
                     );
-                    eprintln!(
-                        "        Add {} to reach it, or run {} to make it the default.",
-                        "-n local".cyan(),
-                        brand::cmd("use local")
-                    );
+                    // `list` names what to list rather than acting on a default,
+                    // so offering `use local` here sent people to a command that
+                    // changes nothing about the one that just failed, and left
+                    // them running it again to the same error and the same note.
+                    if subcommand == "list" || subcommand == "ls" {
+                        eprintln!("        Add {} to list its documents.", "-n local".cyan());
+                    } else {
+                        eprintln!(
+                            "        Add {} to reach it, or run {} to make it the default.",
+                            "-n local".cyan(),
+                            brand::cmd("use local")
+                        );
+                    }
                 }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",

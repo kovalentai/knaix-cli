@@ -163,7 +163,18 @@ pub async fn run(
     // A run interrupted before cleanup leaves its document behind, where it
     // becomes part of the corpus and can be retrieved and cited in real
     // answers. Report that before measuring anything, and offer to clear it.
-    let leftovers = crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX).await?;
+    //
+    // On a normal run the scan is a courtesy, and it now costs a request, so a
+    // node that cannot answer it must not fail the command here: reachability is
+    // measured below and is the check that exists to report exactly that. Under
+    // --sweep the listing is the whole job, so there the failure is the answer.
+    let leftovers = if sweep {
+        crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX).await?
+    } else {
+        crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX)
+            .await
+            .unwrap_or_default()
+    };
     if sweep {
         let removed = sweep_previous(ctx, target, &leftovers).await;
         if human {
@@ -449,22 +460,13 @@ async fn sweep_previous(ctx: &KnaixContext, target: &Target, stale: &[String]) -
 }
 
 /// The sentence to print when a document is on the node and cannot be removed
-/// by id. Hosted nodes can find it again by name; a local node cannot, because
-/// it keeps chunks and no document registry.
-fn orphan_remedy(target: &Target) -> String {
-    if target.is_local() {
-        format!(
-            "It is named '{}*'. A local node has no document registry to find it in, so clearing it means {}.",
-            DOC_PREFIX,
-            crate::brand::cmd("local reset")
-        )
-    } else {
-        format!(
-            "It is named '{}*'. Remove it with {}.",
-            DOC_PREFIX,
-            crate::brand::cmd("bench --sweep")
-        )
-    }
+/// by id. Both node shapes can find it again by name, so both get the sweep.
+fn orphan_remedy() -> String {
+    format!(
+        "It is named '{}*'. Remove it with {}.",
+        DOC_PREFIX,
+        crate::brand::cmd("bench --sweep")
+    )
 }
 
 /// Remove what this run created. Reports rather than throws: the measurement is
@@ -490,7 +492,7 @@ async fn cleanup(
                     println!(
                         "{} Keeping the benchmark document on the node (--keep). {}",
                         "Info:".blue(),
-                        orphan_remedy(target)
+                        orphan_remedy()
                     );
                 }
                 return;
@@ -499,7 +501,7 @@ async fn cleanup(
                 eprintln!(
                     "{} Could not remove the benchmark document from the node. {}",
                     "Warning:".yellow(),
-                    orphan_remedy(target)
+                    orphan_remedy()
                 );
             }
         }
@@ -508,14 +510,14 @@ async fn cleanup(
             "{} The node stored {} without returning an id, so it could not be removed. {}",
             "Warning:".yellow(),
             name,
-            orphan_remedy(target)
+            orphan_remedy()
         ),
 
         Ingested::Uncertain(name) => eprintln!(
             "{} The ingest failed, but the node may have stored {} before it did. {}",
             "Warning:".yellow(),
             name,
-            orphan_remedy(target)
+            orphan_remedy()
         ),
     }
 }
@@ -634,23 +636,14 @@ mod tests {
     }
 
     /// A hosted node can be searched by filename, so the remedy is the sweep.
-    /// A local node keeps chunks and no registry, so pointing someone at a
-    /// sweep that cannot find anything would be worse than saying so.
+    /// The remedy has to be one the sweep can carry out. It used to send a local
+    /// node to `local reset`, which empties the store: everything the user
+    /// ingested, to remove one synthetic handbook. Both shapes enumerate by name
+    /// now, so both get the sweep, and neither is told to start over.
     #[test]
-    fn the_remedy_matches_what_the_target_can_actually_do() {
-        let hosted = Target::Remote {
-            uuid: "u".to_string(),
-        };
-        let local = Target::Local {
-            base: "http://127.0.0.1:8090".to_string(),
-            instance_id: "i".to_string(),
-        };
-
-        assert!(orphan_remedy(&hosted).contains("bench --sweep"));
-        assert!(orphan_remedy(&local).contains("local reset"));
-        assert!(!orphan_remedy(&local).contains("--sweep"));
-        // Both name the prefix, which is how it is found by eye either way.
-        assert!(orphan_remedy(&hosted).contains(DOC_PREFIX));
-        assert!(orphan_remedy(&local).contains(DOC_PREFIX));
+    fn the_remedy_is_the_sweep_and_names_the_prefix() {
+        assert!(orphan_remedy().contains("bench --sweep"));
+        assert!(orphan_remedy().contains(DOC_PREFIX));
+        assert!(!orphan_remedy().contains("local reset"));
     }
 }
