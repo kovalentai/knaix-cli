@@ -2,6 +2,14 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.5.4] - 2026-08-07
+
+<!-- One paragraph on what this release is about. Delete this comment. -->
+
+### Fixed
+
+- **output: line up the tables again**
+
 ## [0.5.3] - 2026-08-05
 
 Answers arrive as they are written, say where they came from, and can be asked to be longer, shorter, or about one document. Most of this release is about the wait and the evidence rather than the model.
