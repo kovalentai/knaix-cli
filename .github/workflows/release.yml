@@ -41,10 +41,15 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
       - id: resolve
+        # The dispatch input reaches the shell through the environment. Pasted
+        # into the script it runs before the check below can reject it.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -260,6 +265,12 @@ jobs:
     name: Publish to releases.knaix.com
     needs: [meta, release]
     runs-on: ubuntu-latest
+    # One publish at a time. Two tags close together would both read the old
+    # latest-version, both decide to flip, and the older could land last.
+    # Queued rather than cancelled: a half-published release is the bad case.
+    concurrency:
+      group: publish-releases
+      cancel-in-progress: false
     env:
       TAG: ${{ needs.meta.outputs.tag }}
       RELEASES_BUCKET: knaix-releases
@@ -318,13 +329,21 @@ jobs:
           set -euo pipefail
           VERSION="${TAG#v}"
           for f in pub/knaix-*; do
+            # Checksums are served as text, matching every release since 0.5.0.
+            # As binary/octet-stream, install.ps1 reads the body as a Byte[]
+            # and reports a working checksum as a failed download.
+            case "$f" in
+              *.sha256) CONTENT_TYPE=text/plain ;;
+              *)        CONTENT_TYPE=binary/octet-stream ;;
+            esac
+
             aws s3api put-object \
               --bucket "$RELEASES_BUCKET" \
               --key "v${VERSION}/$(basename "$f")" \
               --body "$f" \
-              --content-type binary/octet-stream \
+              --content-type "$CONTENT_TYPE" \
               --cache-control 'public, max-age=31536000, immutable' > /dev/null
-            echo "put v${VERSION}/$(basename "$f")"
+            echo "put v${VERSION}/$(basename "$f")  ${CONTENT_TYPE}"
           done
 
       # put-object exits 0 per object; the switch below is thrown once for all
@@ -341,6 +360,19 @@ jobs:
             done
           done
           echo "All fifteen objects are being served under v${VERSION}."
+
+      # Artifacts are cached immutable for a year, so re-publishing a version to
+      # replace bad bytes would change S3 and nothing a user sees. A no-op on a
+      # first publish, and the only way to repair a release on a later one.
+      - name: Invalidate the release prefix
+        env:
+          DISTRIBUTION_ID: ${{ vars.KNAIX_RELEASES_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/v${VERSION}/*" > /dev/null
 
       # workflow_dispatch can name an old tag. Rebuilding v0.4.9 to replace a
       # corrupt asset is fine; moving every installer back to it is not. The

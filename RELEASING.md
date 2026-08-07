@@ -120,9 +120,11 @@ within the hour with nothing pushed from here.
 is published until the workflow finishes, and the GitHub Release step re-runs
 cleanly over an existing tag via `workflow_dispatch`.
 
-**The publish failed partway.** Re-run the failed job. Uploads overwrite, and
-`latest-version` still only lands if every binary is present, so a re-run either
-completes the publish or leaves it where it was.
+**The publish failed partway.** Re-run the failed job. Uploads overwrite and the
+release prefix is invalidated afterwards, so replaced bytes actually reach
+people rather than sitting behind a year-long cache. `latest-version` still only
+lands if every binary is present, so a re-run either completes the publish or
+leaves it where it was.
 
 **A release shipped and should not have.** Do not delete the binaries; anyone who
 already installed will be verifying against them. Publish the fix as the next

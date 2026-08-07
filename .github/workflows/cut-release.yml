@@ -92,13 +92,17 @@ jobs:
       - name: Commit and push
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          # Through the environment, never interpolated into the script. The
+          # release/v* check above is not a defence: release/v0.5.4"; cmd; "
+          # satisfies it and still reaches the shell.
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add CHANGELOG.md Cargo.toml Cargo.lock
           git commit -m "chore(release): knaix CLI v${VERSION}"
-          git push origin HEAD:"${{ github.event.inputs.branch }}"
+          git push origin HEAD:"$BRANCH"
 
       # Prefixes the changelog does not carry. Usually right to omit,
       # occasionally a user-facing change filed under chore.
@@ -116,17 +120,25 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # Every value arrives through the environment and is printed with printf
+      # rather than interpolated. Pasted into the script, a pull request title
+      # holding an apostrophe is a syntax error, and the backticks in NOTE run
+      # as command substitution.
       - name: Next steps
         env:
           BRANCH: ${{ github.event.inputs.branch }}
           VERSION: ${{ steps.version.outputs.version }}
+          NOTE: ${{ steps.version.outputs.note }}
+          EXCLUDED: ${{ steps.excluded.outputs.list }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          LINK="${{ github.server_url }}/${{ github.repository }}/compare/main...${BRANCH}?quick_pull=1&title=chore(release):%20knaix%20CLI%20v${VERSION}"
+          LINK="${SERVER_URL}/${REPO}/compare/main...${BRANCH}?quick_pull=1&title=chore(release):%20knaix%20CLI%20v${VERSION}"
           {
             echo "## v${VERSION} is ready to review"
             echo
-            echo "${{ steps.version.outputs.note }}"
+            printf '%s\n' "$NOTE"
             echo
             echo "\`Cargo.toml\`, \`Cargo.lock\` and \`CHANGELOG.md\` are committed on \`${BRANCH}\`."
             echo
@@ -141,5 +153,5 @@ jobs:
             echo
             echo "Check nothing user-facing is hiding here."
             echo
-            echo '${{ steps.excluded.outputs.list }}'
+            printf '%s\n' "$EXCLUDED"
           } >> "$GITHUB_STEP_SUMMARY"
