@@ -48,6 +48,11 @@ fn scratch_home(name: &str) -> PathBuf {
 ///
 /// The dead API is deliberate: it is the situation the command has to work in.
 fn record_local_node(home: &Path, port: u16) {
+    record_local_node_with_default(home, port, None)
+}
+
+/// The same, with a saved default node.
+fn record_local_node_with_default(home: &Path, port: u16, default: Option<&str>) {
     let dir = home.join(".knaix");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
@@ -58,9 +63,13 @@ fn record_local_node(home: &Path, port: u16) {
     )
     .unwrap();
     // Port 9 is discard: any reach for the control plane is refused at once.
+    let default = match default {
+        Some(d) => format!(r#","default_node_id":"{d}""#),
+        None => String::new(),
+    };
     fs::write(
         dir.join("config.json"),
-        r#"{"api_url":"http://127.0.0.1:9"}"#,
+        format!(r#"{{"api_url":"http://127.0.0.1:9"{default}}}"#),
     )
     .unwrap();
 }
@@ -153,6 +162,116 @@ fn a_node_holding_nothing_says_so_and_succeeds() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("no documents yet"), "printed: {stdout}");
     assert!(stdout.contains("upload"), "printed: {stdout}");
+}
+
+/// `knaix use local` makes every other command address the local node. `list`
+/// was the one that never read the default, so the note on a failed run told
+/// people to set it and setting it changed nothing.
+#[test]
+fn a_local_default_makes_the_bare_command_list_documents() {
+    let home = scratch_home("bare");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("local"));
+
+    let out = knaix(&home).arg("list").output().expect("failed to run");
+
+    assert!(
+        out.status.success(),
+        "exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Handbook.md"));
+}
+
+/// Only the reserved name. A hosted default still lists nodes, because that is
+/// what the bare form has always meant, and a script parsing it must not change
+/// shape under a setting that has nothing to do with the script.
+#[test]
+fn a_hosted_default_still_lists_nodes() {
+    let home = scratch_home("hosteddefault");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("acme-prod"));
+
+    let out = knaix(&home)
+        .arg("list")
+        .env("KNAIX_TOKEN", "test-token")
+        .output()
+        .expect("failed to run");
+
+    // The API is a dead port, so reaching for it at all is the assertion: the
+    // command went to the control plane rather than to the node on this machine.
+    assert_eq!(out.status.code(), Some(4), "expected Unavailable");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Handbook.md"),
+        "a hosted default listed the local node's documents"
+    );
+}
+
+/// The escape hatch. Without it a local default would leave no way to see the
+/// hosted nodes, and no way to pick one to switch to either.
+#[test]
+fn nodes_forces_the_node_list_past_a_local_default() {
+    let home = scratch_home("forcenodes");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("local"));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .output()
+        .expect("failed to run");
+
+    assert_eq!(out.status.code(), Some(4), "expected Unavailable");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Handbook.md"));
+}
+
+/// `--docs` says what is wanted rather than inferring it from a default, so it
+/// takes the default node whatever it is rather than only the reserved name.
+#[test]
+fn docs_lists_the_default_nodes_documents() {
+    let home = scratch_home("docsflag");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("local"));
+
+    let out = knaix(&home)
+        .args(["list", "--docs"])
+        .output()
+        .expect("failed to run");
+
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Handbook.md"));
+}
+
+/// Asking for documents with nothing to ask is a usage error, not a node list:
+/// answering a different question quietly is what this whole change is undoing.
+#[test]
+fn docs_without_a_default_is_a_usage_error() {
+    let home = scratch_home("docsnodefault");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "--docs"])
+        .output()
+        .expect("failed to run");
+
+    assert_eq!(out.status.code(), Some(2), "expected a usage error");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no default is set"),
+        "did not say why: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The two mode flags contradict each other, so clap refuses rather than letting
+/// one silently win.
+#[test]
+fn the_two_mode_flags_cannot_be_combined() {
+    let home = scratch_home("bothflags");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes", "--docs"])
+        .output()
+        .expect("failed to run");
+
+    assert_eq!(out.status.code(), Some(2));
 }
 
 /// Enumerating by name is what `--sweep` is built on, and on a local node it

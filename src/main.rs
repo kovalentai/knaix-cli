@@ -22,9 +22,10 @@ mod update;
 mod upload_filter;
 mod verify;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
+use exit::WithCode;
 use nodes::KnaixContext;
 
 #[derive(Parser)]
@@ -56,6 +57,10 @@ enum Commands {
     Logout,
 
     /// List your hosted nodes, or the documents on one node ('local' works)
+    ///
+    /// With no node named, lists your hosted nodes. Where the default node is
+    /// 'local', lists what that node holds instead: a machine set up for local
+    /// work should not have to name it every time.
     #[clap(alias = "ls")]
     List {
         /// A node to list the documents of, instead of listing nodes
@@ -65,6 +70,14 @@ enum Commands {
         /// The node to list, as a flag for symmetry with chat and upload
         #[clap(short = 'n', long = "node-id", conflicts_with = "NODE_ID")]
         node: Option<String>,
+
+        /// List your hosted nodes, whatever the default node is
+        #[clap(long, conflicts_with_all = ["NODE_ID", "node", "docs"])]
+        nodes: bool,
+
+        /// List documents rather than nodes, on the default node if none is named
+        #[clap(long)]
+        docs: bool,
     },
 
     /// Set the default node for later commands ('local' for the local node)
@@ -695,8 +708,52 @@ async fn run() -> Result<()> {
                 );
             }
         }
-        Commands::List { node_id, node } => {
-            nodes::list_nodes(&ctx, node.or(node_id).as_deref()).await?;
+        Commands::List {
+            node_id,
+            node,
+            nodes: only_nodes,
+            docs,
+        } => {
+            // One command, two kinds of result, and until now the only way to
+            // say which was whether an argument happened to be present. The two
+            // flags make it sayable; the fallbacks keep the bare form working as
+            // it always has.
+            let named = if only_nodes {
+                None
+            } else if let Some(named) = node.or(node_id) {
+                Some(named)
+            } else if docs {
+                // Asked for documents without naming a node, so the default is
+                // the node meant, hosted or local. Listing nodes here would
+                // answer a question that was not the one put.
+                Some(
+                    ctx.config
+                        .default_node_id
+                        .clone()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "--docs lists the documents on the default node, and no default is set.\n  Name one, or run {} to set it.",
+                                brand::cmd("use <node-id>")
+                            )
+                        })
+                        .coded(exit::Code::Usage)?,
+                )
+            } else {
+                // `use local` makes every other command address the local node,
+                // and list was the one that did not read the default at all: the
+                // note on a failed run told people to set it, and setting it
+                // changed nothing.
+                //
+                // Only the reserved name is honoured here. A hosted default
+                // still lists nodes, because that is what the bare form has
+                // always meant and a script parsing it would otherwise change
+                // shape under a setting that has nothing to do with the script.
+                ctx.config
+                    .default_node_id
+                    .clone()
+                    .filter(|d| d == local::LOCAL_NODE_ID)
+            };
+            nodes::list_nodes(&ctx, named.as_deref()).await?;
         }
         Commands::Use { node_id } => {
             let mut config = config::load_stored_config();

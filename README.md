@@ -128,7 +128,7 @@ up in the dashboard alongside hosted ones.
 | `knaix login`    | Sign in through your browser, following your configured API URL. |
 | `knaix logout`   | Remove the saved session token from this machine.     |
 | `knaix up`       | Provision a hosted node on your Kovalent account.     |
-| `knaix list`     | List your hosted nodes, or the documents on one node, including the local one with `-n local`. |
+| `knaix list`     | List your hosted nodes, or a node's documents with `--docs`. Where the default node is `local`, the bare command lists what that node holds. |
 | `knaix use`      | Set the default node for later commands.              |
 | `knaix init`     | Write a `.knaix.toml` so a repository remembers its node and what to ingest. |
 | `knaix repl`     | Start an interactive chat session with a node.        |
