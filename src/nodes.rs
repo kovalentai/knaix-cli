@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::header::AUTHORIZATION;
 use reqwest::multipart;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,17 +35,18 @@ pub struct Node {
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, serde::Serialize, Debug, Clone)]
+/// A document as the control plane reports it, and the shape `-o json` emits
+/// for every kind of node. Serialized as well as deserialized, so a local
+/// node's records can be rendered into it rather than into a second spelling.
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct DocumentSource {
     pub r#type: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct Document {
     pub id: String,
     pub source: Option<DocumentSource>,
@@ -167,21 +168,50 @@ pub struct AnswerOptions {
 }
 
 /// One document the node holds, as `/api/kb/documents` reports it.
+///
+/// The node's own wire shape, which is not what `-o json` emits: a caller
+/// listing documents gets the same records whichever kind of node answered.
+/// See `Document::from`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct NodeDocument {
     #[serde(rename = "document_id")]
     pub document_id: String,
     pub source: Option<String>,
-    /// Reported by the node. Not read yet; kept so the struct documents the
-    /// shape the route returns rather than half of it.
-    #[allow(dead_code)]
     pub chunks: Option<u64>,
+    #[serde(rename = "created_at")]
+    pub created_at: Option<String>,
 }
 
 impl NodeDocument {
     /// What a person would call this document.
+    ///
+    /// For display only. Matching on this would compare against the document id
+    /// wherever a source name is missing, which is not a name anyone typed.
     pub fn label(&self) -> &str {
         self.source.as_deref().unwrap_or(&self.document_id)
+    }
+}
+
+/// A local node's record in the shape the control plane reports.
+///
+/// `-o json` is an interface, and it had come to mean two different things:
+/// `id` against `document_id`, a source object against a bare string, camelCase
+/// against snake_case, decided by which kind of node happened to answer. A
+/// script written against one node silently read nothing from the other. The
+/// hosted shape wins because it is the one already published.
+///
+/// `type` has no local equivalent, so it is null rather than guessed at.
+impl From<&NodeDocument> for Document {
+    fn from(doc: &NodeDocument) -> Self {
+        Document {
+            id: doc.document_id.clone(),
+            source: Some(DocumentSource {
+                r#type: None,
+                name: doc.source.clone(),
+            }),
+            chunk_count: doc.chunks,
+            created_at: doc.created_at.clone(),
+        }
     }
 }
 
@@ -201,8 +231,7 @@ pub async fn local_documents(
 
     if resp.status() == 404 {
         return Err(anyhow!(
-            "This node is too old to list its documents, so {} cannot resolve a name. Update it with {}.",
-            "--doc",
+            "This node is too old to list its documents. Update it with {}.",
             crate::brand::cmd("local up --pull")
         ))
         .coded(Code::Precondition);
@@ -743,17 +772,67 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
+/// The documents a local node holds, as a table.
+///
+/// No account and no control plane are involved: the node on this machine is
+/// asked directly. That is the whole point of the command on a machine that
+/// cannot reach the API, so nothing here may reach for a token.
+///
+/// The table omits the Type column a hosted node's listing carries. The node
+/// records a document's source name, not a type, and inferring one from the
+/// extension would put a guess in a column the hosted listing fills with fact.
+async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
+    let Target::Local { base, instance_id } = local_target()? else {
+        unreachable!("local_target only builds a local target");
+    };
+
+    let documents = local_documents(ctx, &base, &instance_id).await?;
+
+    if ctx.output_format == "json" {
+        let records: Vec<Document> = documents.iter().map(Document::from).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&records).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    if documents.is_empty() {
+        println!(
+            "{} The local node holds no documents yet. {} ingests one.",
+            "Info:".blue(),
+            crate::brand::cmd("upload -n local <path>")
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{}",
+        "Knowledge Base for the local node:".bold().underline()
+    );
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Name", "Chunks", "Ingested"]);
+
+    for doc in &documents {
+        table.add_row(vec![
+            doc.label().to_string(),
+            doc.chunks.unwrap_or(0).to_string(),
+            doc.created_at.clone().unwrap_or_else(|| "N/A".to_string()),
+        ]);
+    }
+    println!("{table}\n");
+
+    Ok(())
+}
+
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
     // Answered before the token is read, because neither a session nor the
     // control plane has anything to do with it. Reaching for them first is what
     // made this report a DNS failure on a machine that was working fine.
     if node_id == Some(crate::local::LOCAL_NODE_ID) {
-        return Err(anyhow!(
-            "The local node keeps chunks and no document registry, so its documents cannot be listed.\n  {} retrieves from them and cites what it used; {} empties the store.",
-            crate::brand::cmd("chat -n local"),
-            crate::brand::cmd("local reset")
-        ))
-        .coded(Code::Error);
+        return list_local_documents(ctx).await;
     }
 
     let token = ctx.get_token()?;
@@ -3381,6 +3460,7 @@ mod tests {
             document_id: id.to_string(),
             source: Some(source.to_string()),
             chunks: Some(3),
+            created_at: Some("2026-08-07T00:00:00.000Z".to_string()),
         }
     }
 

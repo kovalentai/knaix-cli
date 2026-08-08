@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "knaix"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
