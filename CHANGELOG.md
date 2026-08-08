@@ -2,6 +2,10 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.6.0] - 2026-08-08
+
+<!-- One paragraph on what this release is about. Delete this comment. -->
+
 ## [0.5.4] - 2026-08-07
 
 One fix, for something every table in the CLI was quietly doing.
