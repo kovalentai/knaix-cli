@@ -16,22 +16,60 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// A node that answers every request with the same JSON body.
 fn serve_node(body: &'static str) -> u16 {
+    serve_node_recording(body).0
+}
+
+/// The same, keeping every request body it was sent.
+///
+/// A stub that only answers can show that a command did something; it cannot
+/// show *what*. The sweep hands ids to a delete, so which ids were sent is the
+/// part worth asserting, and it is invisible without this.
+fn serve_node_recording(body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
     let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            record.lock().unwrap().push(request);
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
+        }
+    });
+    (port, seen)
+}
+
+/// A node that is up, and fails the documents route.
+///
+/// Health answers, so reachability passes and the run continues: the partial
+/// failure is the case a blanket "treat any error as no leftovers" hides.
+fn serve_node_with_broken_documents() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let response = if request.starts_with("GET") {
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}"
+            } else {
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"error\":\"documents failed\"}"
+            };
+            let _ = write!(stream, "{}", response);
         }
     });
     port
@@ -125,9 +163,13 @@ fn local_works_as_a_positional_argument_too() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("Handbook.md"));
 }
 
-/// A script reads the node's own field names, not a second spelling of them.
+/// `-o json` is an interface, and it must not mean two different things
+/// depending on which kind of node answered. This asserts the control plane's
+/// shape, which is the one already published: `id`, a `source` object, and
+/// camelCase throughout. A script written against a hosted node reads a local
+/// one with the same accessors.
 #[test]
-fn json_output_carries_the_nodes_field_names() {
+fn json_output_matches_the_shape_a_hosted_node_returns() {
     let home = scratch_home("json");
     record_local_node(&home, serve_node(TWO_DOCUMENTS));
 
@@ -141,10 +183,19 @@ fn json_output_carries_the_nodes_field_names() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("not valid JSON");
     let docs = parsed.as_array().expect("expected an array");
     assert_eq!(docs.len(), 2);
-    assert_eq!(docs[0]["document_id"], "d-1");
-    assert_eq!(docs[0]["source"], "Handbook.md");
-    assert_eq!(docs[0]["chunks"], 12);
-    assert_eq!(docs[0]["created_at"], "2026-08-06T03:03:56.140Z");
+    assert_eq!(docs[0]["id"], "d-1");
+    assert_eq!(docs[0]["source"]["name"], "Handbook.md");
+    assert_eq!(docs[0]["chunkCount"], 12);
+    assert_eq!(docs[0]["createdAt"], "2026-08-06T03:03:56.140Z");
+    // A local node records no type, and a guess in a field the hosted listing
+    // fills with fact would be worse than the absence.
+    assert!(docs[0]["source"]["type"].is_null());
+    // The node's own spellings must not leak through alongside the published
+    // ones, which is what a struct serialized straight back out would do.
+    assert!(
+        docs[0].get("document_id").is_none() && docs[0].get("chunks").is_none(),
+        "the node's wire names leaked into the output: {stdout}"
+    );
 }
 
 /// An empty node is not an error, and says what to do about it.
@@ -242,7 +293,7 @@ fn docs_lists_the_default_nodes_documents() {
 /// Asking for documents with nothing to ask is a usage error, not a node list:
 /// answering a different question quietly is what this whole change is undoing.
 #[test]
-fn docs_without_a_default_is_a_usage_error() {
+fn docs_without_a_default_is_a_precondition() {
     let home = scratch_home("docsnodefault");
     record_local_node(&home, serve_node(TWO_DOCUMENTS));
 
@@ -251,10 +302,42 @@ fn docs_without_a_default_is_a_usage_error() {
         .output()
         .expect("failed to run");
 
-    assert_eq!(out.status.code(), Some(2), "expected a usage error");
+    // Precondition, not usage: the command line is well formed and the machine
+    // is what is not ready, which is how naming an unstarted local node already
+    // reports. A published exit code moving is a silent break for callers, so
+    // this is the contract rather than an implementation detail.
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "expected a precondition, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no default is set"),
         "did not say why: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--docs` takes the default node whatever it is, so the hosted case needs its
+/// own cover: the local one passes on a code path that never reaches the
+/// control plane and so proves nothing about the other.
+#[test]
+fn docs_follows_a_hosted_default_to_the_control_plane() {
+    let home = scratch_home("docshosted");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("acme-prod"));
+
+    let out = knaix(&home)
+        .args(["list", "--docs"])
+        .env("KNAIX_TOKEN", "test-token")
+        .output()
+        .expect("failed to run");
+
+    // The API is a dead port, so reaching it at all is the assertion.
+    assert_eq!(out.status.code(), Some(4), "expected Unavailable");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Kovalent API"),
+        "did not reach for the control plane: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -274,6 +357,71 @@ fn the_two_mode_flags_cannot_be_combined() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// The leftover scan costs a request now, so it must not fail a normal run:
+/// reachability is measured just after and reports an unreachable node properly.
+/// But a node that is up and fails this one route would otherwise take the
+/// warning with it, and the run would measure against a corpus that may hold
+/// leftovers while saying nothing. Non-fatal, and said out loud.
+#[test]
+fn a_failed_leftover_scan_is_reported_rather_than_swallowed() {
+    let home = scratch_home("scanfailed");
+    record_local_node_with_default(&home, serve_node_with_broken_documents(), Some("local"));
+
+    let out = knaix(&home)
+        .args(["bench", "--no-ingest", "--runs", "1"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Could not check for documents left by an earlier run"),
+        "the failed scan was silent: {stderr}"
+    );
+}
+
+/// Under --sweep the listing is the whole job, so there the failure is the
+/// answer rather than a warning to carry on past.
+#[test]
+fn a_sweep_against_the_same_node_fails_outright() {
+    let home = scratch_home("sweepfailed");
+    record_local_node_with_default(&home, serve_node_with_broken_documents(), Some("local"));
+
+    let out = knaix(&home)
+        .args(["bench", "--sweep"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert!(!out.status.success(), "a broken sweep reported success");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Could not list the node's documents"),
+        "did not say what failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `status` tells the user how to check their session. With a local default a
+/// bare `list` never reaches the control plane, so it would answer without the
+/// token being offered to anyone and a revoked one would read as verified.
+#[test]
+fn status_names_a_command_that_actually_verifies_the_session() {
+    let home = scratch_home("statushint");
+    record_local_node_with_default(&home, serve_node(TWO_DOCUMENTS), Some("local"));
+    let dir = home.join(".knaix");
+    fs::write(
+        dir.join("config.json"),
+        r#"{"api_url":"http://127.0.0.1:9","default_node_id":"local","token":"stale","username":"diego"}"#,
+    )
+    .unwrap();
+
+    let out = knaix(&home).arg("status").output().expect("failed to run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("knaix list --nodes"),
+        "status points at a command that cannot verify anything: {stdout}"
+    );
+}
+
 /// Enumerating by name is what `--sweep` is built on, and on a local node it
 /// used to return nothing: the sweep reported removing zero and the only remedy
 /// left on offer was `local reset`, which empties the store. Everything the user
@@ -284,16 +432,18 @@ fn the_two_mode_flags_cannot_be_combined() {
 #[test]
 fn a_local_sweep_finds_the_generated_documents_and_leaves_the_rest() {
     let home = scratch_home("sweep");
-    record_local_node(
-        &home,
-        serve_node(
-            r#"{"documents":[
-              {"document_id":"b-1","source":"knaix-bench-a1.md","chunks":4,"created_at":"2026-08-06T03:03:56.140Z"},
-              {"document_id":"b-2","source":"knaix-bench-b2.md","chunks":4,"created_at":"2026-08-06T03:03:56.140Z"},
-              {"document_id":"real","source":"Handbook.md","chunks":9,"created_at":"2026-08-05T00:45:03.286Z"}
-            ]}"#,
-        ),
+    // The unnamed document is the one that matters. `label()` falls back to the
+    // document id, so filtering on it would test a UUID against the prefix and
+    // hand whatever matched to a delete.
+    let (port, seen) = serve_node_recording(
+        r#"{"documents":[
+          {"document_id":"b-1","source":"knaix-bench-a1.md","chunks":4,"created_at":"2026-08-06T03:03:56.140Z"},
+          {"document_id":"b-2","source":"knaix-bench-b2.md","chunks":4,"created_at":"2026-08-06T03:03:56.140Z"},
+          {"document_id":"real","source":"Handbook.md","chunks":9,"created_at":"2026-08-05T00:45:03.286Z"},
+          {"document_id":"knaix-bench-looks-like-one","source":null,"chunks":1,"created_at":"2026-08-05T00:45:03.286Z"}
+        ]}"#,
     );
+    record_local_node(&home, port);
 
     let out = knaix(&home)
         .args(["bench", "-n", "local", "--sweep"])
@@ -310,33 +460,86 @@ fn a_local_sweep_finds_the_generated_documents_and_leaves_the_rest() {
         !stdout.contains("local reset"),
         "the sweep still points at emptying the whole store: {stdout}"
     );
+
+    // Which ids went, not just how many. The stub accepts every delete, so the
+    // count alone would pass with the wrong documents removed.
+    let requests = seen.lock().unwrap().join("\n");
+    let deletes: Vec<&str> = requests
+        .lines()
+        .filter(|l| l.contains("document_id"))
+        .collect();
+    for id in ["b-1", "b-2"] {
+        assert!(
+            deletes.iter().any(|d| d.contains(&format!("\"{id}\""))),
+            "the sweep did not delete {id}: {requests}"
+        );
+    }
+    for id in ["real", "knaix-bench-looks-like-one"] {
+        assert!(
+            !deletes.iter().any(|d| d.contains(&format!("\"{id}\""))),
+            "the sweep deleted {id}, which it did not generate: {requests}"
+        );
+    }
 }
 
 /// The note printed when the control plane is unreachable has to name a remedy
 /// that works. It used to offer `use local`, which `list` does not read: the
 /// user ran it, ran `list` again, and got the same error and the same note.
+/// Every spelling, because the note is chosen by the subcommand and the
+/// subcommand is not at a fixed position: `-o` and `-q` are global and may come
+/// first. Reading it off the argument list put `knaix -o json ls` on the branch
+/// meant for other commands, so the removed advice came back in the form a
+/// script is most likely to use and least likely to read.
 #[test]
 fn the_failure_note_for_list_offers_only_the_flag_that_works() {
     let home = scratch_home("note");
     record_local_node(&home, serve_node(TWO_DOCUMENTS));
 
+    for args in [
+        vec!["list"],
+        vec!["ls"],
+        vec!["-o", "json", "ls"],
+        vec!["--quiet", "list"],
+        vec!["-o", "json", "list", "--nodes"],
+    ] {
+        let out = knaix(&home)
+            .args(&args)
+            .env("KNAIX_TOKEN", "test-token")
+            .output()
+            .expect("failed to run knaix");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("A local node is running"),
+            "no note for {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("-n local"),
+            "no flag offered for {args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("use local"),
+            "{args:?} still offers a default that list does not read: {stderr}"
+        );
+    }
+}
+
+/// The same note, for a command that does read the default. The narrowing must
+/// not have swallowed the advice everywhere else.
+#[test]
+fn other_commands_keep_the_full_note() {
+    let home = scratch_home("othernote");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
     let out = knaix(&home)
-        .args(["list"])
+        .args(["-o", "json", "metrics", "-n", "acme-prod"])
         .env("KNAIX_TOKEN", "test-token")
         .output()
         .expect("failed to run knaix");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("A local node is running"),
-        "the note did not appear: {stderr}"
-    );
-    assert!(
-        stderr.contains("-n local"),
-        "the note did not offer the flag: {stderr}"
-    );
-    assert!(
-        !stderr.contains("use local"),
-        "the note still offers a default that list does not read: {stderr}"
+        stderr.contains("use local"),
+        "a command that reads the default lost the advice: {stderr}"
     );
 }

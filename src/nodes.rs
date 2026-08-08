@@ -35,17 +35,18 @@ pub struct Node {
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, serde::Serialize, Debug, Clone)]
+/// A document as the control plane reports it, and the shape `-o json` emits
+/// for every kind of node. Serialized as well as deserialized, so a local
+/// node's records can be rendered into it rather than into a second spelling.
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct DocumentSource {
     pub r#type: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct Document {
     pub id: String,
     pub source: Option<DocumentSource>,
@@ -168,9 +169,10 @@ pub struct AnswerOptions {
 
 /// One document the node holds, as `/api/kb/documents` reports it.
 ///
-/// Serialized back out under the same names for `-o json`, so a script reads
-/// the node's own field names rather than a second spelling of them.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// The node's own wire shape, which is not what `-o json` emits: a caller
+/// listing documents gets the same records whichever kind of node answered.
+/// See `Document::from`.
+#[derive(Deserialize, Debug, Clone)]
 pub struct NodeDocument {
     #[serde(rename = "document_id")]
     pub document_id: String,
@@ -182,8 +184,34 @@ pub struct NodeDocument {
 
 impl NodeDocument {
     /// What a person would call this document.
+    ///
+    /// For display only. Matching on this would compare against the document id
+    /// wherever a source name is missing, which is not a name anyone typed.
     pub fn label(&self) -> &str {
         self.source.as_deref().unwrap_or(&self.document_id)
+    }
+}
+
+/// A local node's record in the shape the control plane reports.
+///
+/// `-o json` is an interface, and it had come to mean two different things:
+/// `id` against `document_id`, a source object against a bare string, camelCase
+/// against snake_case, decided by which kind of node happened to answer. A
+/// script written against one node silently read nothing from the other. The
+/// hosted shape wins because it is the one already published.
+///
+/// `type` has no local equivalent, so it is null rather than guessed at.
+impl From<&NodeDocument> for Document {
+    fn from(doc: &NodeDocument) -> Self {
+        Document {
+            id: doc.document_id.clone(),
+            source: Some(DocumentSource {
+                r#type: None,
+                name: doc.source.clone(),
+            }),
+            chunk_count: doc.chunks,
+            created_at: doc.created_at.clone(),
+        }
     }
 }
 
@@ -761,9 +789,10 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
     let documents = local_documents(ctx, &base, &instance_id).await?;
 
     if ctx.output_format == "json" {
+        let records: Vec<Document> = documents.iter().map(Document::from).collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&documents).unwrap_or_default()
+            serde_json::to_string_pretty(&records).unwrap_or_default()
         );
         return Ok(());
     }

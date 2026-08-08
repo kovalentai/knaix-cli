@@ -23,10 +23,17 @@ mod upload_filter;
 mod verify;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use colored::*;
 use exit::WithCode;
 use nodes::KnaixContext;
+use std::sync::OnceLock;
+
+/// The subcommand this process is running, by its canonical name.
+///
+/// Recorded once the command line is parsed, so the failure note in `main` can
+/// tell which command failed without guessing at an argument position.
+static SUBCOMMAND: OnceLock<String> = OnceLock::new();
 
 #[derive(Parser)]
 #[clap(name = "knaix")]
@@ -514,7 +521,7 @@ async fn main() -> std::process::ExitCode {
             // the problem, and pointing at another command would be noise. And
             // never to someone who just ran the diagnosis: doctor and report
             // both end in the checks this would be suggesting they run.
-            let subcommand = std::env::args().nth(1).unwrap_or_default();
+            let subcommand = SUBCOMMAND.get().map(String::as_str).unwrap_or_default();
             let already_diagnosed = subcommand == "doctor" || subcommand == "report";
             if !already_diagnosed
                 && matches!(
@@ -540,7 +547,7 @@ async fn main() -> std::process::ExitCode {
                     // so offering `use local` here sent people to a command that
                     // changes nothing about the one that just failed, and left
                     // them running it again to the same error and the same note.
-                    if subcommand == "list" || subcommand == "ls" {
+                    if subcommand == "list" {
                         eprintln!("        Add {} to list its documents.", "-n local".cyan());
                     } else {
                         eprintln!(
@@ -633,7 +640,17 @@ async fn run() -> Result<()> {
         update::check_for_update_async().await;
     });
 
-    let cli = Cli::parse();
+    // Parsed through the matches rather than `Cli::parse()` so the subcommand
+    // can be recorded for the failure note below. Reading it off `args()` put
+    // the name at a fixed position, which a global flag moves: `knaix -o json
+    // ls` reported its subcommand as `-o` and got advice meant for other
+    // commands. The matches also resolve aliases, so `ls` is recorded as
+    // `list` and only the canonical name has to be matched on.
+    let matches = Cli::command().get_matches();
+    if let Some(name) = matches.subcommand_name() {
+        let _ = SUBCOMMAND.set(name.to_string());
+    }
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     if cli.version {
         println!("{} {}", brand::wordmark(), env!("CARGO_PKG_VERSION"));
@@ -736,7 +753,11 @@ async fn run() -> Result<()> {
                                 brand::cmd("use <node-id>")
                             )
                         })
-                        .coded(exit::Code::Usage)?,
+                        // Not a usage error: the command line is well formed and
+                        // the machine is the thing that is not ready, which is
+                        // what the precondition code is for and what naming a
+                        // local node that was never started already reports.
+                        .coded(exit::Code::Precondition)?,
                 )
             } else {
                 // `use local` makes every other command address the local node,
@@ -1000,10 +1021,15 @@ async fn run() -> Result<()> {
 
             // A stored token is all this command can vouch for; whether the
             // control plane still honours it is only knowable by asking it.
+            //
+            // Named with the flag: a bare `knaix list` where the default node is
+            // local never reaches the control plane, so it would answer without
+            // the token being offered to anyone, and a revoked one would read
+            // here as verified.
             if config.token.is_some() {
                 table.add_row(vec![
                     "Auth".dimmed().to_string(),
-                    "Session token saved ('knaix list' verifies it)"
+                    "Session token saved ('knaix list --nodes' verifies it)"
                         .green()
                         .to_string(),
                 ]);

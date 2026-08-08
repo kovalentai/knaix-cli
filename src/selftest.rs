@@ -675,9 +675,17 @@ pub(crate) async fn list_documents_with_prefix(
 ) -> Result<Vec<String>> {
     if let Target::Local { base, instance_id } = target {
         let documents = crate::nodes::local_documents(ctx, base, instance_id).await?;
+        // The source name, never the display label: the label falls back to the
+        // document id, and these ids are handed to a delete. A document with no
+        // recorded name is not one this generated, and the hosted branch below
+        // declines it for the same reason.
         return Ok(documents
             .into_iter()
-            .filter(|d| d.label().starts_with(prefix))
+            .filter(|d| {
+                d.source
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
             .map(|d| d.document_id)
             .collect());
     }

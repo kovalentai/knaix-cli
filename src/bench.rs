@@ -168,12 +168,27 @@ pub async fn run(
     // node that cannot answer it must not fail the command here: reachability is
     // measured below and is the check that exists to report exactly that. Under
     // --sweep the listing is the whole job, so there the failure is the answer.
+    //
+    // Said rather than swallowed. An unreachable node is about to be reported
+    // properly, but a node that is up and fails this one route would otherwise
+    // take the warning with it, and the run would measure against a corpus with
+    // leftovers in it while saying nothing.
     let leftovers = if sweep {
         crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX).await?
     } else {
-        crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX)
-            .await
-            .unwrap_or_default()
+        match crate::selftest::list_documents_with_prefix(ctx, target, DOC_PREFIX).await {
+            Ok(found) => found,
+            Err(e) => {
+                if human {
+                    eprintln!(
+                        "{} Could not check for documents left by an earlier run: {}",
+                        "Warning:".yellow(),
+                        e
+                    );
+                }
+                Vec::new()
+            }
+        }
     };
     if sweep {
         let removed = sweep_previous(ctx, target, &leftovers).await;
