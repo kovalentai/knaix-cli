@@ -665,18 +665,31 @@ async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<
 /// Shared with `knaix bench`: both commands generate documents under a prefix
 /// of their own and both need to find the ones an interrupted run left behind.
 ///
-/// Hosted only, and the empty result for a local node is a limitation rather
-/// than a finding: the node keeps chunks and no document registry, so there is
-/// nothing to enumerate. A local run has to clean up by the ids it collected as
-/// it went, and cannot discover another run's leftovers.
+/// A local node answers this from its own store. It used to return nothing here
+/// and the sweep quietly did nothing, which left the only remedy on offer being
+/// to empty the whole store over one synthetic document.
 pub(crate) async fn list_documents_with_prefix(
     ctx: &KnaixContext,
     target: &Target,
     prefix: &str,
 ) -> Result<Vec<String>> {
-    if target.is_local() {
-        return Ok(Vec::new());
+    if let Target::Local { base, instance_id } = target {
+        let documents = crate::nodes::local_documents(ctx, base, instance_id).await?;
+        // The source name, never the display label: the label falls back to the
+        // document id, and these ids are handed to a delete. A document with no
+        // recorded name is not one this generated, and the hosted branch below
+        // declines it for the same reason.
+        return Ok(documents
+            .into_iter()
+            .filter(|d| {
+                d.source
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .map(|d| d.document_id)
+            .collect());
     }
+
     let node_uuid = target.label();
     let token = ctx.get_token()?;
     let url = format!(
