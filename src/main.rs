@@ -35,6 +35,33 @@ use std::sync::OnceLock;
 /// tell which command failed without guessing at an argument position.
 static SUBCOMMAND: OnceLock<String> = OnceLock::new();
 
+/// The canonical subcommand on a command line, aliases resolved.
+///
+/// Asked of clap rather than read off a position, because `-o` and `-q` are
+/// global and may come first: taking the second argument reported `knaix -o
+/// json ls` as `-o`, which then took the branch meant for other commands.
+fn subcommand_of(matches: &clap::ArgMatches) -> Option<String> {
+    matches.subcommand_name().map(str::to_string)
+}
+
+/// What to suggest when the control plane is out of reach and a local node is up.
+///
+/// `list` names what to list rather than acting on a default, so offering `use
+/// local` there sent people to a command that changes nothing about the one
+/// that just failed, and left them running it again to the same error and the
+/// same note.
+fn local_node_remedy(subcommand: &str) -> String {
+    if subcommand == "list" {
+        format!("Add {} to list its documents.", "-n local".cyan())
+    } else {
+        format!(
+            "Add {} to reach it, or run {} to make it the default.",
+            "-n local".cyan(),
+            brand::cmd("use local")
+        )
+    }
+}
+
 #[derive(Parser)]
 #[clap(name = "knaix")]
 #[clap(about = "The Kovalent command line: ingest documents into a private AI node and ask questions of them, locally or hosted", long_about = None)]
@@ -543,19 +570,7 @@ async fn main() -> std::process::ExitCode {
                         "\n  {} A local node is running on this machine.",
                         "Note:".blue()
                     );
-                    // `list` names what to list rather than acting on a default,
-                    // so offering `use local` here sent people to a command that
-                    // changes nothing about the one that just failed, and left
-                    // them running it again to the same error and the same note.
-                    if subcommand == "list" {
-                        eprintln!("        Add {} to list its documents.", "-n local".cyan());
-                    } else {
-                        eprintln!(
-                            "        Add {} to reach it, or run {} to make it the default.",
-                            "-n local".cyan(),
-                            brand::cmd("use local")
-                        );
-                    }
+                    eprintln!("        {}", local_node_remedy(subcommand));
                 }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",
@@ -647,8 +662,8 @@ async fn run() -> Result<()> {
     // commands. The matches also resolve aliases, so `ls` is recorded as
     // `list` and only the canonical name has to be matched on.
     let matches = Cli::command().get_matches();
-    if let Some(name) = matches.subcommand_name() {
-        let _ = SUBCOMMAND.set(name.to_string());
+    if let Some(name) = subcommand_of(&matches) {
+        let _ = SUBCOMMAND.set(name);
     }
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
@@ -1283,4 +1298,74 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{local_node_remedy, subcommand_of, Cli};
+    use clap::CommandFactory;
+
+    /// Parse a command line the way `run` does, and name its subcommand.
+    fn subcommand_from(args: &[&str]) -> Option<String> {
+        let matches = Cli::command().try_get_matches_from(args).ok()?;
+        subcommand_of(&matches)
+    }
+
+    /// The note is chosen by the command that failed, and the command is not at
+    /// a fixed position: `-o` and `-q` are global. Reading it off the argument
+    /// list put `knaix -o json ls` on the branch meant for other commands, so
+    /// the advice this release removed came back in the form a script uses.
+    ///
+    /// Covered here rather than end to end because the note itself only prints
+    /// when Docker reports a running container, so an end-to-end test of it
+    /// passes or fails on whether the machine happens to have one.
+    #[test]
+    fn the_subcommand_is_found_whatever_the_argument_order() {
+        for args in [
+            vec!["knaix", "list"],
+            vec!["knaix", "ls"],
+            vec!["knaix", "-o", "json", "ls"],
+            vec!["knaix", "--output", "json", "list"],
+            vec!["knaix", "--quiet", "ls"],
+            vec!["knaix", "-o", "json", "list", "--nodes"],
+        ] {
+            assert_eq!(
+                subcommand_from(&args).as_deref(),
+                Some("list"),
+                "{args:?} did not resolve to the list command"
+            );
+        }
+    }
+
+    /// Aliases resolve to the canonical name, so only one has to be matched on.
+    #[test]
+    fn other_commands_keep_their_own_names() {
+        assert_eq!(
+            subcommand_from(&["knaix", "doctor"]).as_deref(),
+            Some("doctor")
+        );
+        assert_eq!(
+            subcommand_from(&["knaix", "-q", "metrics"]).as_deref(),
+            Some("metrics")
+        );
+        assert_eq!(subcommand_from(&["knaix"]), None);
+        assert_eq!(subcommand_from(&["knaix", "--no-such-flag"]), None);
+    }
+
+    #[test]
+    fn the_remedy_matches_the_command_that_failed() {
+        let listing = local_node_remedy("list");
+        assert!(listing.contains("-n local"), "{listing}");
+        assert!(
+            !listing.contains("use local"),
+            "list was offered a default it does not read: {listing}"
+        );
+
+        // Everything else does read the default, so it keeps both remedies.
+        for other in ["chat", "upload", "metrics", "doctor", ""] {
+            let remedy = local_node_remedy(other);
+            assert!(remedy.contains("-n local"), "{other}: {remedy}");
+            assert!(remedy.contains("use local"), "{other}: {remedy}");
+        }
+    }
 }
