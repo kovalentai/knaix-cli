@@ -40,6 +40,31 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  windows:
+    name: Windows build and test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # A release publishes a Windows binary, but nothing compiled for Windows
+      # until the tag was already cut. Code that only fails there -- a Unix-only
+      # helper, a path assumption -- reached main and surfaced at release, which
+      # is the worst place to find it. Formatting is not repeated here: it is
+      # platform independent and the Linux job already gates it.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
   audit:
     name: Dependency advisories
     runs-on: ubuntu-latest

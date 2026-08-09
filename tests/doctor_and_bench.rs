@@ -55,6 +55,9 @@ fn run(cmd: &mut Command) -> Run {
 ///
 /// Returns a directory to put at the front of PATH. The binary is invoked by
 /// absolute path, so this hides docker without hiding knaix.
+///
+/// Unix only, like its one caller: what it writes is a `/bin/sh` script.
+#[cfg(unix)]
 fn fake_docker(home: &Path, script: &str) -> PathBuf {
     let bin = home.join("fakebin");
     fs::create_dir_all(&bin).unwrap();
