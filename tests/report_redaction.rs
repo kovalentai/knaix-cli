@@ -51,6 +51,7 @@ fn furnish(home: &Path) {
 fn run_report(home: &Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_knaix"))
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .current_dir(home)
         .args(["-o", "json", "report"])
@@ -177,6 +178,7 @@ fn a_report_is_still_written_when_nothing_is_reachable() {
     // command needed the network it would fail or hang; it must do neither.
     let out = Command::new(env!("CARGO_BIN_EXE_knaix"))
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .env("KNAIX_API_URL", "http://127.0.0.1:9")
         .current_dir(&home)
@@ -208,6 +210,7 @@ fn the_bundle_is_not_world_readable() {
 
     let status = Command::new(env!("CARGO_BIN_EXE_knaix"))
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .current_dir(&home)
         .args(["report", "--out", out.to_str().unwrap()])
@@ -231,6 +234,7 @@ fn an_existing_file_is_not_overwritten() {
 
     let status = Command::new(env!("CARGO_BIN_EXE_knaix"))
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .current_dir(&home)
         .args(["report", "--out", target.to_str().unwrap()])

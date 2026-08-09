@@ -938,6 +938,10 @@ pub async fn setup() -> Result<()> {
         return offer_start_or_restart(&node).await;
     }
 
+    // Set where the server is known not to be running: the choice was already
+    // confirmed once on that basis, and asking a model there to answer can only
+    // fail for the reason already accepted.
+    let mut server_absent = false;
     let (url, models) = if pick == manual_idx {
         let raw: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Server URL (the base, e.g. http://192.168.1.50:11434)")
@@ -958,6 +962,7 @@ pub async fn setup() -> Result<()> {
                     println!("{} Nothing changed.", "Info:".blue());
                     return Ok(());
                 }
+                server_absent = true;
                 (url, Vec::new())
             }
         }
@@ -1054,15 +1059,18 @@ pub async fn setup() -> Result<()> {
     // Ask for one token before saving. A model that cannot answer is worth
     // finding here, where there is still a picker to go back to, rather than
     // at the first question.
-    println!("{} Checking that it answers...", "Info:".blue());
-    if let crate::model_server::GenerationCheck::Failed(why) =
+    let verdict = if server_absent {
+        crate::model_server::GenerationCheck::Works
+    } else {
+        println!("{} Checking that it answers...", "Info:".blue());
         crate::model_server::check_generation(
             &url,
             model.as_deref(),
             std::time::Duration::from_secs(20),
         )
         .await
-    {
+    };
+    if let crate::model_server::GenerationCheck::Failed(why) = verdict {
         println!("\n{} That model did not answer: {}", "✗".red(), why);
         let keep = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt("Remember it anyway?")

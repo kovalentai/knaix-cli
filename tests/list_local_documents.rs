@@ -114,7 +114,9 @@ fn record_local_node_with_default(home: &Path, port: u16, default: Option<&str>)
 
 fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
-    cmd.env("HOME", home).env("KNAIX_NO_UPDATE_CHECK", "1");
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("KNAIX_NO_UPDATE_CHECK", "1");
     cmd
 }
 
