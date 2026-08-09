@@ -1320,12 +1320,23 @@ const WARM_TOKENS: u32 = 8;
 /// Best effort throughout. The node is already serving by this point, so a
 /// warm-up that fails, times out, or hits a node with no model runtime is not a
 /// reason to fail `up`; it only means the saving is not collected.
-async fn warm(node: &LocalNode) -> bool {
+/// How a warm-up ended. A model that refused is worth telling apart from one
+/// that was merely slow: the first is a setup that will never answer, and
+/// reporting it as slowness is what let a broken model look like a warm cache.
+enum Warmth {
+    Warmed,
+    /// The node answered, but generation did not. Carries the node's own words.
+    Refused(String),
+    /// No verdict: too slow, or the node could not be reached.
+    Unknown,
+}
+
+async fn warm(node: &LocalNode) -> Warmth {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(WARM_TIMEOUT_SECS))
         .build()
     else {
-        return false;
+        return Warmth::Unknown;
     };
     let body = serde_json::json!({
         "instance_id": node.instance_id,
@@ -1343,14 +1354,38 @@ async fn warm(node: &LocalNode) -> bool {
         // three cold starts to land on the first question after all.
         "policy": { "k": crate::nodes::DEFAULT_K, "rerank": true },
     });
-    matches!(
-        client
-            .post(format!("{}/api/query/answer", node.base_url()))
-            .json(&body)
-            .send()
-            .await,
-        Ok(resp) if resp.status().is_success()
-    )
+    let resp = client
+        .post(format!("{}/api/query/answer", node.base_url()))
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => Warmth::Warmed,
+        // The node fails closed on generation and says why. A 5xx here is the
+        // model refusing, not the node being slow to wake.
+        Ok(r) if r.status().is_server_error() => {
+            let detail = r
+                .text()
+                .await
+                .ok()
+                .and_then(|b| generation_error_message(&b))
+                .unwrap_or_else(|| "the model did not answer".to_string());
+            Warmth::Refused(detail)
+        }
+        _ => Warmth::Unknown,
+    }
+}
+
+/// The message out of the node's generation error body.
+fn generation_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = v
+        .get("message")
+        .or_else(|| v.get("error"))
+        .and_then(|m| m.as_str())?
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Warm the node and say how long it took, or say nothing at all.
@@ -1383,17 +1418,30 @@ async fn warm_up(node: &LocalNode) {
         }
     };
 
-    if warmed {
-        println!(" ({:.1}s)", started.elapsed().as_secs_f64());
-    } else {
+    match warmed {
+        Warmth::Warmed => println!(" ({:.1}s)", started.elapsed().as_secs_f64()),
+        // Not slowness. Every question will fail the same way, so say that here
+        // rather than letting the first one deliver the news.
+        Warmth::Refused(why) => {
+            println!();
+            println!(
+                "\n{} The model did not answer: {}",
+                "Warning:".yellow(),
+                why
+            );
+            println!(
+                "  Questions will fail until this is fixed. {} picks another model.",
+                "knaix local setup".cyan()
+            );
+        }
         // Said, not silent. The node is fine and the only cost is that the
         // first question pays what this was meant to absorb -- but printing
         // nothing meant a warm-up that never worked looked identical to one
         // that did, which is how this stayed hidden.
-        println!(
+        Warmth::Unknown => println!(
             " {}",
             "skipped; the first question will be slower.".dimmed()
-        );
+        ),
     }
 }
 
@@ -2295,6 +2343,25 @@ mod tests {
     fn the_image_can_be_overridden_for_local_builds() {
         // Default points at the published image; developers run their own tag.
         assert!(image().contains("node-runtime") || !image().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_from_the_node_is_quoted_back() {
+        // The node fails closed on generation and says why; that sentence is
+        // the only thing that tells a broken model from a slow one.
+        assert_eq!(
+            generation_error_message(
+                r#"{"message":"The local model runtime is not reachable.","code":"generation_unavailable"}"#
+            )
+            .unwrap(),
+            "The local model runtime is not reachable."
+        );
+        assert_eq!(
+            generation_error_message(r#"{"error":"Local generation failed."}"#).unwrap(),
+            "Local generation failed."
+        );
+        assert!(generation_error_message("<html>502</html>").is_none());
+        assert!(generation_error_message(r#"{"message":"   "}"#).is_none());
     }
 
     #[test]
