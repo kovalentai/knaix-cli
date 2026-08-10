@@ -649,3 +649,83 @@ fn listing_nodes_without_a_session_or_a_local_node_is_still_an_auth_error() {
         "the remedy should still be named"
     );
 }
+
+const ONE_HOSTED_NODE: &str = r#"{"data":[
+  {"id":"aaaaaaaa-1111-2222-3333-444444444444","name":"acme-prod","state":"running",
+   "instanceId":"acme-prod-01","privateIp":"100.64.0.7","model":"Standard","config":null}
+]}"#;
+
+/// The local node joins the list last. This list has always meant the hosted
+/// nodes, and a script reading `.[0]` to pick one would otherwise start getting
+/// the local node instead of the hosted one it has always got.
+#[test]
+fn the_local_node_joins_the_hosted_list_last() {
+    let home = scratch_home("nodesorder");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+
+    assert_eq!(nodes.len(), 2, "expected the hosted node and the local one");
+    assert_eq!(
+        nodes[0]["name"], "acme-prod",
+        "the hosted node must stay first: {stdout}"
+    );
+    assert_eq!(nodes[1]["name"], "local");
+    assert_eq!(nodes[1]["local"], true);
+
+    // Same spelling as the hosted node beside it. `-o json` is an interface,
+    // and a local node shaped differently is a script that reads one and
+    // silently reads nothing from the other.
+    let hosted = nodes[0].as_object().unwrap();
+    let local = nodes[1].as_object().unwrap();
+    for field in [
+        "id",
+        "name",
+        "state",
+        "instanceId",
+        "privateIp",
+        "model",
+        "config",
+    ] {
+        assert!(
+            local.contains_key(field),
+            "the local node is missing {field}, which a hosted node carries: {stdout}"
+        );
+        assert!(hosted.contains_key(field), "fixture lost {field}");
+    }
+    // `id` routes and `instanceId` is what a person types, on both.
+    assert_eq!(nodes[1]["id"], "11111111-2222-3333-4444-555555555555");
+    assert_eq!(nodes[1]["instanceId"], "local");
+}
+
+/// The table reads in the same order, so the two output modes do not disagree
+/// about which node is which.
+#[test]
+fn the_table_lists_the_local_node_last_too() {
+    let home = scratch_home("nodesordertable");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hosted = stdout.find("acme-prod").expect("hosted node missing");
+    let local = stdout.rfind("local").expect("local node missing");
+    assert!(hosted < local, "local should come last: {stdout}");
+}

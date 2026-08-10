@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use walkdir::WalkDir;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Node {
@@ -911,19 +911,46 @@ fn local_node_row() -> Option<Vec<String>> {
     ])
 }
 
-/// The same row as `-o json`, in the shape the control plane uses for a node.
+/// The local node in the shape the control plane reports a hosted one.
+///
+/// Built through `Node` rather than written out by hand, for the same reason
+/// the document records above are: `-o json` is an interface, and a local node
+/// spelled differently from a hosted one is a script that reads one and
+/// silently reads nothing from the other. Going through the struct means the
+/// two cannot drift apart later.
+///
+/// `id` carries the UUID every route is keyed by and `instanceId` the name a
+/// person passes to `-n`, which is how the hosted shape uses the two. Writing
+/// the UUID into `instanceId` would put a routing key where a script expects a
+/// handle.
 fn local_node_json() -> Option<serde_json::Value> {
     let node = crate::local::load()?;
     let summary = crate::local::summarize();
-    Some(serde_json::json!({
-        "name": crate::local::LOCAL_NODE_ID,
-        "instanceId": node.instance_id,
-        "state": if summary.state == "none" { "stopped" } else { &summary.state },
-        "privateIp": null,
-        "url": node.base_url(),
-        "local": true,
-        "model": node.model,
-    }))
+    let shaped = Node {
+        id: Some(node.instance_id.clone()),
+        name: crate::local::LOCAL_NODE_ID.to_string(),
+        state: if summary.state == "none" {
+            "stopped".to_string()
+        } else {
+            summary.state
+        },
+        instance_id: Some(crate::local::LOCAL_NODE_ID.to_string()),
+        // A hosted node is reached on a mesh address; this one is on loopback.
+        private_ip: None,
+        model: node.model.clone(),
+        config: None,
+    };
+    let mut value = serde_json::to_value(&shaped).ok()?;
+    // Additive, and meaningful only here: nothing else in the list is on this
+    // machine, and a hosted node has no loopback URL to give.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("local".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "url".to_string(),
+            serde_json::Value::String(node.base_url()),
+        );
+    }
+    Some(value)
 }
 
 fn print_node_table(rows: Vec<Vec<String>>) {
@@ -1058,9 +1085,13 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         if ctx.output_format == "json" {
             // The local node joins the hosted ones here too. A script asking
             // what nodes exist gets the same answer the table shows.
+            //
+            // Last, not first. This list has always been the hosted nodes, and
+            // a script reading `.[0]` to pick one would otherwise start getting
+            // the local node instead of the hosted one it has always got.
             let mut all = nodes_val.as_array().cloned().unwrap_or_default();
             if let Some(local) = local_node_json() {
-                all.insert(0, local);
+                all.push(local);
             }
             println!(
                 "{}",
@@ -1080,11 +1111,6 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
             );
         } else {
             let mut rows: Vec<Vec<String>> = Vec::new();
-            // First, because it is the one on the machine the command is being
-            // run from.
-            if let Some(local) = local {
-                rows.push(local);
-            }
             for node in nodes {
                 let status = if node.state == "running" {
                     node.state.green()
@@ -1118,6 +1144,10 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     node_type.to_string(),
                     model.to_string(),
                 ]);
+            }
+            // Last, so the table reads in the same order as `-o json`.
+            if let Some(local) = local {
+                rows.push(local);
             }
             print_node_table(rows);
         }
