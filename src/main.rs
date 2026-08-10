@@ -202,6 +202,36 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Print a document's contents
+    ///
+    /// Takes the name shown by 'knaix ls', or a document id. The text is
+    /// written as it was ingested, so it pipes into anything.
+    #[clap(alias = "show")]
+    Cat {
+        /// The node to read from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to print, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+    },
+
+    /// Write a document out to a file
+    Export {
+        /// The node to read from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to export, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+
+        /// Where to write it (default: standard output)
+        #[clap(long, value_name = "PATH")]
+        out: Option<String>,
+    },
+
     /// Remove a document from a node's knowledge base
     ///
     /// Takes the name shown by 'knaix ls', or a document id. A name that was
@@ -1022,6 +1052,22 @@ async fn run() -> Result<()> {
                     "  No node recorded. Set one with {}, or edit the file.",
                     brand::cmd("init --node-id <NODE>").as_str()
                 )),
+            }
+        }
+        Commands::Cat { node_id, document } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::cat_document(&ctx, &target, &document).await?;
+            }
+        }
+        Commands::Export {
+            node_id,
+            document,
+            out,
+        } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::export_document(&ctx, &target, &document, out.as_deref()).await?;
             }
         }
         Commands::Rm {

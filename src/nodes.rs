@@ -694,10 +694,8 @@ pub async fn resolve_target(
         .map(|uuid| Target::Remote { uuid }))
 }
 
-/// Every document a node holds, in one shape whichever kind answered.
-///
-/// The two listings already agree on the wire; this is what lets the commands
-/// that act on a document be written once.
+/// Every document a node holds, in one shape whichever kind answered, so the
+/// commands acting on a document are written once.
 pub async fn documents_of(ctx: &KnaixContext, target: &Target) -> Result<Vec<Document>> {
     match target {
         Target::Local { base, instance_id } => Ok(local_documents(ctx, base, instance_id)
@@ -873,12 +871,162 @@ fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
 }
 
+/// One document's text, as the node that holds it reassembles it.
+///
+/// The node does the reassembly because it owns the chunks, and the rule for
+/// consuming their overlap belongs beside the chunking.
+pub async fn document_content(
+    ctx: &KnaixContext,
+    target: &Target,
+    document_id: &str,
+) -> Result<String> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/document", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "document_id": document_id,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node. Is it running?")?;
+            if resp.status() == 404 {
+                return Err(anyhow!(
+                    "This node is too old to read a document back. Update it with {}.",
+                    crate::brand::cmd("local up --pull")
+                ))
+                .coded(Code::Precondition);
+            }
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["content"].as_str().unwrap_or_default().to_string())
+        }
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!(
+                "{}/api/knowledge/{}/documents/{}/content",
+                ctx.config.api_url, uuid, document_id
+            );
+            let resp = ctx
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
+        }
+    }
+}
+
+/// The one document a name picks out, or an error naming the ambiguity.
+///
+/// Ambiguous for reading where it is not for removing: `rm` was asked for every
+/// copy, but printing one of several would guess at which version was wanted.
+fn one_document<'a>(documents: &'a [Document], wanted: &str) -> Result<&'a Document> {
+    let matches = documents_named(documents, wanted);
+    match matches.len() {
+        0 => Err(anyhow!(
+            "No document named {}. {} lists what is there.",
+            wanted,
+            crate::brand::cmd("ls")
+        ))
+        .coded(Code::NotFound),
+        1 => Ok(matches[0]),
+        n => {
+            let mut lines = format!("{} copies of {} are filed here:\n", n, wanted);
+            for d in &matches {
+                lines.push_str(&format!(
+                    "  {}  ingested {}\n",
+                    d.id,
+                    d.created_at.as_deref().unwrap_or("unknown")
+                ));
+            }
+            lines.push_str("Name one by its id, or remove the copies you do not want.");
+            Err(anyhow!("{}", lines)).coded(Code::Usage)
+        }
+    }
+}
+
+/// Print a document's text.
+pub async fn cat_document(ctx: &KnaixContext, target: &Target, wanted: &str) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+    // Raw, not rendered: a file's contents are worth more piped than prettied.
+    print!("{}", content);
+    if !content.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// Write a document out to a file, or to stdout where none is named.
+pub async fn export_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &str,
+    out: Option<&str>,
+) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+
+    let Some(out) = out else {
+        print!("{}", content);
+        if !content.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    };
+
+    let path = Path::new(out);
+    // The named file is one the user already has, and cannot be got back.
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists. Move it, or pass a different --out.",
+            path.display()
+        ))
+        .coded(Code::Denied);
+    }
+    std::fs::write(path, &content)
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    ctx.info(&format!(
+        "{} Wrote {} ({} bytes) to {}",
+        "✓".green(),
+        doc.source
+            .as_ref()
+            .and_then(|s| s.name.as_deref())
+            .unwrap_or(&doc.id),
+        content.len(),
+        path.display().to_string().bold()
+    ));
+    Ok(())
+}
+
 /// Remove a document from a node's knowledge base, by name or by id.
 ///
-/// Deleting is not undoable and the corpus is the point of the node, so it
-/// confirms unless told not to. Where a name picks out more than one document
-/// the count is stated before the prompt, because "remove widget.md" reading as
-/// three removals is the surprise worth spending a line on.
+/// Not undoable, so it confirms unless told not to, and states the count first:
+/// "remove widget.md" meaning three removals is the surprise worth a line.
 pub async fn remove_document(
     ctx: &KnaixContext,
     target: &Target,
@@ -940,8 +1088,8 @@ pub async fn remove_document(
         }
     }
 
-    // One failure must not hide the rest: the corpus is left in a state the
-    // command has to be able to describe, not stopped wherever it got to.
+    // One failure must not hide the rest, or the corpus ends in a state the
+    // command cannot describe.
     let mut removed = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
     for d in &matches {
