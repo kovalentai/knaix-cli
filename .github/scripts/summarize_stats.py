@@ -29,7 +29,7 @@ def main():
         "",
         f"- Downloads: **{d['unique30d']}** unique in the last 30 days "
         f"(the badge figure), {d['last7d']} fetches in the last 7",
-        f"- Since logging began ({d['since'] or 'unknown'}): {d['total']} fetches, {d['unique']} unique",
+        f"- Since {d['since'] or 'unknown'}: {d['total']} fetches, {d['unique']} unique",
         f"- Active installs: **{a['month']}** monthly, {a['week']} weekly, {a['day']} daily",
         f"- Install failures: {i['failures7d']} of {i['attempts7d']} attempts "
         f"in 7 days ({i['failureRate7d']:.1%})",
@@ -42,7 +42,8 @@ def main():
 
     lines += [
         "Published to `releases.knaix.com/stats.json` (public) and "
-        "`/metrics/{metrics,history}.json` (key required).",
+        "`/metrics/metrics.json`, `/metrics/history{,-recent,-monthly}.json` "
+        "(key required).",
     ]
 
     print("\n".join(lines))
