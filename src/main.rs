@@ -563,15 +563,32 @@ async fn main() -> std::process::ExitCode {
                 // plane would have worked against the node on this machine.
                 // Probed with a short deadline, since this is the error path and
                 // nothing here is worth hanging on.
-                let local_up = code == exit::Code::Unavailable
-                    && local::summarize_within(std::time::Duration::from_millis(400)).state
-                        == "running";
+                //
+                // Auth as well as Unavailable: a machine with a node already
+                // running was being told to go and make an account.
+                let worth_pointing_local =
+                    matches!(code, exit::Code::Unavailable | exit::Code::Auth)
+                        && subcommand != "login";
+                // The URL, not just the state: the container is machine-wide but
+                // the record addressing it is per-user, so a home that lost its
+                // record was pointed at `-n local`, which then refuses.
+                let local = local::summarize_within(std::time::Duration::from_millis(400));
+                let local_up =
+                    worth_pointing_local && local.state == "running" && local.url.is_some();
                 if local_up {
                     eprintln!(
                         "\n  {} A local node is running on this machine.",
                         "Note:".blue()
                     );
                     eprintln!("        {}", local_node_remedy(subcommand));
+                } else if worth_pointing_local && code == exit::Code::Auth {
+                    // The first run. Being told only to log in sent people off
+                    // to make an account for a product that does not need one.
+                    eprintln!("\n  {} Kovalent runs without an account.", "Note:".blue());
+                    eprintln!(
+                        "        {} starts a node on this machine, with nothing to sign up for.",
+                        brand::cmd("local up")
+                    );
                 }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",

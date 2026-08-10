@@ -550,3 +550,174 @@ fn other_commands_keep_the_full_note() {
         );
     }
 }
+
+/// The table printed alone, so the node it came from and what was answering on
+/// it were a separate command away.
+#[test]
+fn the_listing_names_the_node_it_came_from() {
+    let home = scratch_home("summary");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "-n", "local"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exited {:?}", out.status.code());
+    // The node, and the totals the table would otherwise have to be added up by
+    // hand to get.
+    for expected in ["local", "2 documents", "15 chunks"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+}
+
+/// Listing nodes answered "not logged in" on a machine that had one running:
+/// an account problem reported in place of an answer that needed no account.
+#[test]
+fn listing_nodes_without_a_session_still_reports_the_local_one() {
+    let home = scratch_home("nodeslocal");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("local"), "no local node listed: {stdout}");
+    // Said, not silently omitted: hosted nodes are missing for a reason the
+    // user can act on.
+    assert!(
+        stdout.contains("login"),
+        "no word on why hosted nodes are absent: {stdout}"
+    );
+}
+
+/// The no-session path is the one that prints something extra, and a table
+/// there is the one shape a script cannot read.
+#[test]
+fn listing_nodes_as_json_without_a_session_stays_machine_readable() {
+    let home = scratch_home("nodesjson");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+    assert_eq!(nodes.len(), 1, "expected only the local node: {stdout}");
+    assert_eq!(nodes[0]["name"], "local");
+    assert_eq!(nodes[0]["local"], true);
+}
+
+/// Swallowing the account error would leave a machine with nothing set up
+/// looking like one with nothing to show.
+#[test]
+fn listing_nodes_without_a_session_or_a_local_node_is_still_an_auth_error() {
+    let home = scratch_home("nodesneither");
+    let dir = home.join(".knaix");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{"api_url":"http://127.0.0.1:9"}"#,
+    )
+    .unwrap();
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(3), "expected the auth code");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("login"),
+        "the remedy should still be named"
+    );
+}
+
+const ONE_HOSTED_NODE: &str = r#"{"data":[
+  {"id":"aaaaaaaa-1111-2222-3333-444444444444","name":"acme-prod","state":"running",
+   "instanceId":"acme-prod-01","privateIp":"100.64.0.7","model":"Standard","config":null}
+]}"#;
+
+/// This list has always meant the hosted nodes, so a script reading `.[0]`
+/// must keep getting the one it has always got.
+#[test]
+fn the_local_node_joins_the_hosted_list_last() {
+    let home = scratch_home("nodesorder");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+
+    assert_eq!(nodes.len(), 2, "expected the hosted node and the local one");
+    assert_eq!(
+        nodes[0]["name"], "acme-prod",
+        "the hosted node must stay first: {stdout}"
+    );
+    assert_eq!(nodes[1]["name"], "local");
+    assert_eq!(nodes[1]["local"], true);
+
+    // Same spelling as the hosted node beside it: one shape, either kind.
+    let hosted = nodes[0].as_object().unwrap();
+    let local = nodes[1].as_object().unwrap();
+    for field in [
+        "id",
+        "name",
+        "state",
+        "instanceId",
+        "privateIp",
+        "model",
+        "config",
+    ] {
+        assert!(
+            local.contains_key(field),
+            "the local node is missing {field}, which a hosted node carries: {stdout}"
+        );
+        assert!(hosted.contains_key(field), "fixture lost {field}");
+    }
+    // `id` routes and `instanceId` is what a person types, on both.
+    assert_eq!(nodes[1]["id"], "11111111-2222-3333-4444-555555555555");
+    assert_eq!(nodes[1]["instanceId"], "local");
+}
+
+/// The table reads in the same order, so the two output modes agree.
+#[test]
+fn the_table_lists_the_local_node_last_too() {
+    let home = scratch_home("nodesordertable");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hosted = stdout.find("acme-prod").expect("hosted node missing");
+    let local = stdout.rfind("local").expect("local node missing");
+    assert!(hosted < local, "local should come last: {stdout}");
+}

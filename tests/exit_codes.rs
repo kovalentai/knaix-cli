@@ -346,3 +346,43 @@ fn completions_fall_back_to_powershell_where_a_shell_is_always_detectable() {
         "expected PowerShell completions: {stdout}"
     );
 }
+
+/// The first thing someone runs after downloading this is not `login`, and
+/// being told they were not logged in left the local half unmentioned.
+///
+/// The scratch home records no local node, so the addressable-node note cannot
+/// fire and the assertion holds whether or not a container is running here.
+#[test]
+fn a_first_run_is_told_that_no_account_is_needed() {
+    let home = scratch_home("firstrun");
+
+    let out = knaix(&home)
+        .args(["chat", "what do my documents say?"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "expected the auth code");
+    assert!(
+        stderr.contains("without an account"),
+        "the no-account path went unmentioned: {stderr}"
+    );
+    assert!(
+        stderr.contains("local up"),
+        "the note named no command to run: {stderr}"
+    );
+}
+
+/// The note belongs to the auth failure, not to one command.
+#[test]
+fn the_no_account_note_is_not_particular_to_one_command() {
+    let home = scratch_home("firstrunlist");
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("without an account"),
+        "listing nodes lost the note"
+    );
+}

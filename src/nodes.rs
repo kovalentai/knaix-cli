@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use walkdir::WalkDir;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Node {
@@ -810,6 +810,7 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
         "\n{}",
         "Knowledge Base for the local node:".bold().underline()
     );
+    print_local_node_summary(&documents);
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
@@ -827,6 +828,134 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
     Ok(())
 }
 
+/// The node the listing came from, above the listing itself.
+///
+/// The table printed alone, so which node it came from and what was answering
+/// on it were a `local status` away.
+fn print_local_node_summary(documents: &[NodeDocument]) {
+    let node = crate::local::load();
+    let summary = crate::local::summarize();
+    let chunks: u64 = documents.iter().map(|d| d.chunks.unwrap_or(0)).sum();
+
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.yellow(),
+    };
+    let where_ = summary
+        .url
+        .or_else(|| node.as_ref().map(|n| n.base_url()))
+        .unwrap_or_else(|| "not started".to_string());
+
+    println!("  {}  {}  {}", "local".bold(), state, where_.dimmed());
+    println!(
+        "  {}",
+        format!(
+            "{} {}, {} {}, answered by {}",
+            documents.len(),
+            plural(documents.len(), "document", "documents"),
+            chunks,
+            plural(chunks as usize, "chunk", "chunks"),
+            answering(node.as_ref())
+        )
+        .dimmed()
+    );
+    println!();
+}
+
+/// What the node answers with, in the words `local status` uses.
+fn answering(node: Option<&crate::local::LocalNode>) -> String {
+    match node {
+        Some(n) => match (&n.model, &n.model_url) {
+            (Some(model), Some(url)) => format!("{model} at {url}"),
+            (None, Some(url)) => format!("the model at {url}"),
+            _ => "the deterministic mock".to_string(),
+        },
+        None => "the deterministic mock".to_string(),
+    }
+}
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// The local node as a row in the nodes table, or None where none was started.
+///
+/// Built from the saved record rather than the container: a stopped node is
+/// still a node worth listing.
+fn local_node_row() -> Option<Vec<String>> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.to_string().yellow(),
+    };
+    Some(vec![
+        crate::local::LOCAL_NODE_ID.bold().white().to_string(),
+        node.instance_id.cyan().to_string(),
+        state.to_string(),
+        node.base_url().blue().to_string(),
+        "LOCAL".green().to_string(),
+        match &node.model {
+            Some(m) => m.clone().magenta().to_string(),
+            None => "mock".magenta().to_string(),
+        },
+    ])
+}
+
+/// The local node in the shape the control plane reports a hosted one.
+///
+/// Built through `Node` for the same reason the document records above are:
+/// one shape whichever node answered, and going through the struct means the
+/// two cannot drift.
+///
+/// `id` is the UUID routes are keyed by, `instanceId` the name passed to `-n`.
+fn local_node_json() -> Option<serde_json::Value> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    let shaped = Node {
+        id: Some(node.instance_id.clone()),
+        name: crate::local::LOCAL_NODE_ID.to_string(),
+        state: if summary.state == "none" {
+            "stopped".to_string()
+        } else {
+            summary.state
+        },
+        instance_id: Some(crate::local::LOCAL_NODE_ID.to_string()),
+        // A hosted node is reached on a mesh address; this one is on loopback.
+        private_ip: None,
+        model: node.model.clone(),
+        config: None,
+    };
+    let mut value = serde_json::to_value(&shaped).ok()?;
+    // Additive: a hosted node has neither.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("local".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "url".to_string(),
+            serde_json::Value::String(node.base_url()),
+        );
+    }
+    Some(value)
+}
+
+fn print_node_table(rows: Vec<Vec<String>>) {
+    println!("\n{}", "Your Kovalent Nodes:".bold().underline());
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
+    for row in rows {
+        table.add_row(row);
+    }
+    println!("{table}\n");
+}
+
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
     // Answered before the token is read, because neither a session nor the
     // control plane has anything to do with it. Reaching for them first is what
@@ -835,9 +964,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return list_local_documents(ctx).await;
     }
 
-    let token = ctx.get_token()?;
-
     if let Some(nid) = node_id {
+        let token = ctx.get_token()?;
         // The knowledge base of one node. Resolve first: the route is keyed by
         // the instance UUID, but users pass whatever `knaix list` showed them.
         let uuid = resolve_node_uuid(ctx, nid).await?;
@@ -897,6 +1025,34 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return Ok(());
     }
 
+    // A local node is a node. An account is what hosted nodes need, not what
+    // makes the question answerable, so this one is reported either way.
+    let local = local_node_row();
+    let token = match ctx.get_token() {
+        Ok(token) => token,
+        Err(no_session) => {
+            if local.is_none() {
+                return Err(no_session);
+            }
+            // Still an array: a table is the one shape a script cannot read.
+            if ctx.output_format == "json" {
+                let all: Vec<serde_json::Value> = local_node_json().into_iter().collect();
+                println!("{}", serde_json::to_string_pretty(&all).unwrap_or_default());
+                return Ok(());
+            }
+            print_node_table(local.into_iter().collect());
+            println!(
+                "  {}",
+                format!(
+                    "Hosted nodes are not listed: no session on this machine. {} signs in.",
+                    crate::brand::cmd("login")
+                )
+                .dimmed()
+            );
+            return Ok(());
+        }
+    };
+
     // List Nodes (default behavior)
     let url = format!("{}/api/instances", ctx.config.api_url);
 
@@ -913,14 +1069,22 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         let nodes_val = &wrapper["data"];
 
         if ctx.output_format == "json" {
-            let json_data = serde_json::to_string_pretty(nodes_val).unwrap_or_default();
-            println!("{}", json_data);
+            // Last, not first: this list has always been the hosted nodes, and
+            // a script reading `.[0]` would otherwise start getting another.
+            let mut all = nodes_val.as_array().cloned().unwrap_or_default();
+            if let Some(local) = local_node_json() {
+                all.push(local);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(all)).unwrap_or_default()
+            );
             return Ok(());
         }
 
         let nodes: Vec<Node> = serde_json::from_value(nodes_val.clone()).unwrap_or_default();
 
-        if nodes.is_empty() {
+        if nodes.is_empty() && local.is_none() {
             println!(
                 "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
                 "Info:".blue(),
@@ -928,12 +1092,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 crate::brand::cmd("local up")
             );
         } else {
-            println!("\n{}", "Your Kovalent Nodes:".bold().underline());
-            let mut table = comfy_table::Table::new();
-            table.load_preset(comfy_table::presets::UTF8_FULL);
-            table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
-            table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
-
+            let mut rows: Vec<Vec<String>> = Vec::new();
             for node in nodes {
                 let status = if node.state == "running" {
                     node.state.green()
@@ -959,7 +1118,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     .unwrap_or_else(|| "Standard".to_string())
                     .magenta();
 
-                table.add_row(vec![
+                rows.push(vec![
                     node.name.bold().white().to_string(),
                     id_display.cyan().to_string(),
                     status.to_string(),
@@ -968,7 +1127,11 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     model.to_string(),
                 ]);
             }
-            println!("{table}\n");
+            // Last, so the table reads in the same order as `-o json`.
+            if let Some(local) = local {
+                rows.push(local);
+            }
+            print_node_table(rows);
         }
     } else {
         return Err(anyhow!("Failed to fetch nodes: HTTP {}", resp.status()))
