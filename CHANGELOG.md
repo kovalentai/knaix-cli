@@ -2,6 +2,10 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.6.1] - 2026-08-10
+
+<!-- One paragraph on what this release is about. Delete this comment. -->
+
 ## [0.6.0] - 2026-08-08
 
 `knaix list` can see the node on your own machine. It refused to, on the grounds that a local node kept chunks and no document registry, which was true when it was written and stopped being true a release later. The refusal outlived the limitation, and so did two other things built on the same belief.
