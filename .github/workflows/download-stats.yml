@@ -117,6 +117,14 @@ jobs:
       # what makes this double as the history series, so the trend lines cost
       # nothing extra.
       #
+      # Two grouping sets rather than one. The detail set carries every
+      # dimension and is what the breakdowns are built from. The rollup set is
+      # one row per day and kind, and it exists because distinct-device counts
+      # cannot be recovered from the detail rows: summing them would count a
+      # machine once per platform it fetched. is_rollup separates the two,
+      # since an aggregated dimension and a genuinely empty one are both empty
+      # by the time Athena has written the CSV.
+      #
       # A download is a successful GET of a versioned binary, on any of the
       # three platforms we publish. The .sha256 and .cosign.bundle companions
       # are excluded by the anchored regex, since fetching a checksum or a
@@ -175,11 +183,15 @@ jobs:
             FROM classified
           )
           SELECT day, kind, version, os, arch, channel,
+                 grouping(version, os, arch, channel) AS is_rollup,
                  count(*) AS hits,
                  count(DISTINCT device) AS devices
           FROM labelled
           WHERE kind <> 'other'
-          GROUP BY day, kind, version, os, arch, channel
+          GROUP BY GROUPING SETS (
+            (day, kind, version, os, arch, channel),
+            (day, kind)
+          )
           ORDER BY day
           SQL
 
@@ -282,8 +294,52 @@ jobs:
 
           echo "Newest log entry $LATEST, $AGE_DAYS days old."
 
+      # The history published by the previous run is the only copy of anything
+      # older than the 365 day log window, so it is merged rather than
+      # replaced. A missing object is the first run; anything else is a fault
+      # and must not be mistaken for one. Treating a failed read as a cold
+      # start would discard every day the logs no longer hold, and the payload
+      # that replaced it would look entirely plausible.
+      #
+      # Existence is asked over a structured channel rather than read out of
+      # the CLI's error prose. Matching on text put the destructive branch one
+      # stray "404" away: a proxy error page, or any message mentioning a
+      # status code, would have been taken for a first run. A count cannot
+      # drift with a CLI version, and a genuine fault raises here instead of
+      # answering, because every failure mode of these two calls is a nonzero
+      # exit under set -e.
+      #
+      # A prefix is exact for this key. The other objects under metrics/ are
+      # history-recent.json and history-monthly.json, and neither extends
+      # "metrics/history.json".
+      - name: Fetch published history
+        run: |
+          set -euo pipefail
+
+          FOUND=$(aws s3api list-objects-v2 \
+                    --bucket "$RELEASES_BUCKET" \
+                    --prefix metrics/history.json \
+                    --query 'length(Contents || `[]`)' \
+                    --output text)
+
+          if [ "$FOUND" = "0" ]; then
+            echo "No previous history; starting one."
+            : > .stats/history-in.json
+          else
+            aws s3api get-object \
+              --bucket "$RELEASES_BUCKET" \
+              --key metrics/history.json \
+              .stats/history-in.json >/dev/null
+            python3 -c "import json;print('Previous history:', len(json.load(open('.stats/history-in.json'))['days']), 'days')"
+          fi
+
       - name: Build payloads
-        run: python3 .github/scripts/build_stats.py .stats/cube.csv .stats/windows.csv .stats
+        run: |
+          set -euo pipefail
+          HISTORY=.stats/history-in.json
+          [ -s "$HISTORY" ] || HISTORY=""
+          python3 .github/scripts/build_stats.py \
+            .stats/cube.csv .stats/windows.csv "$HISTORY" .stats
 
       - name: Publish
         env:
@@ -302,7 +358,11 @@ jobs:
 
           put stats.json .stats/stats.json
           put metrics/metrics.json .stats/metrics.json
+          # Three grains of one series: the archive, the window a widget can
+          # afford to refetch, and the monthly rollup a multi-year chart needs.
           put metrics/history.json .stats/history.json
+          put metrics/history-recent.json .stats/history-recent.json
+          put metrics/history-monthly.json .stats/history-monthly.json
 
           aws cloudfront create-invalidation \
             --distribution-id "$DISTRIBUTION_ID" \

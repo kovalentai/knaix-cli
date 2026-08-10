@@ -112,3 +112,16 @@ jobs:
       # dependency tree, including unmaintained crates.
       - name: Audit
         run: cargo audit --deny warnings
+
+  stats:
+    name: Stats payload builder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The nightly download-stats job publishes an append-only history that
+      # nothing else keeps a copy of, so its builder is covered here rather
+      # than only by the run that would discover a fault at midnight. Standard
+      # library only, so there is nothing to install.
+      - name: Test
+        run: python3 .github/scripts/test_build_stats.py

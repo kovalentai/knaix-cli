@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Turn the two Athena result sets into the three published payloads.
+"""Turn the two Athena result sets into the published payloads.
 
-Usage: build_stats.py CUBE_CSV WINDOWS_CSV OUT_DIR
+Usage: build_stats.py CUBE_CSV WINDOWS_CSV PRIOR_HISTORY OUT_DIR
 
-Writes stats.json (public badge payload), metrics.json and history.json
-(private fleet health) into OUT_DIR.
+PRIOR_HISTORY is the history published by the last run, or "" on the first one.
+It is merged rather than replaced, because the access logs expire at 365 days
+and the query can only ever see that far back. Anything older survives here or
+not at all.
+
+Writes stats.json (public badge payload), metrics.json, history.json,
+history-recent.json and history-monthly.json into OUT_DIR.
 """
 
 import csv
@@ -13,6 +18,12 @@ import json
 import sys
 
 WINDOW_DAYS = 30
+RECENT_DAYS = 90
+
+# Daily fields that are counts, and so add up across days.
+COUNTS = ("downloads", "unique", "failures")
+# Sparse per-day breakdowns of download hits by dimension.
+SPLITS = ("platforms", "channels", "versions")
 
 
 def read_rows(path):
@@ -21,8 +32,11 @@ def read_rows(path):
 
 
 def as_int(row, key):
-    value = (row.get(key) or "").strip()
-    return int(value) if value else 0
+    """Read an integer from either a CSV row or a parsed JSON row."""
+    value = row.get(key)
+    if isinstance(value, str):
+        value = value.strip()
+    return int(value) if value not in (None, "") else 0
 
 
 def short(n):
@@ -52,47 +66,195 @@ def breakdown(rows, key, total):
     ]
 
 
-def build_history(cube):
-    """Daily series.
+def blank_day(day):
+    row = {"day": day, "downloads": 0, "unique": 0, "active": 0, "failures": 0}
+    for name in SPLITS:
+        row[name] = {}
+    return row
 
-    Only exactly-recoverable figures go in here. Download and failure counts
-    are request counts, which sum cleanly across the cube's dimensions. Active
-    installs are distinct devices, which do not sum, but heartbeat rows carry
-    no version, platform or channel and so collapse to one row per day, making
-    that row's device count the exact daily figure.
+
+def normalise(row):
+    """Bring a row published by an older schema up to the current shape."""
+    out = blank_day(row.get("day", ""))
+    for key in ("downloads", "unique", "active", "failures"):
+        out[key] = as_int(row, key)
+    for name in SPLITS:
+        value = row.get(name)
+        if isinstance(value, dict):
+            out[name] = {k: int(v) for k, v in value.items() if v}
+    return out
+
+
+def split_cube(rows):
+    """Detail rows carry every dimension; rollup rows are one per day and kind.
+
+    The rollup rows are why distinct-device counts are exact per day. Summing
+    the detail rows' device counts would count one machine once per platform it
+    fetched, which is not what a daily install figure means.
+    """
+    detail, daily = [], []
+    for row in rows:
+        (daily if as_int(row, "is_rollup") else detail).append(row)
+    return detail, daily
+
+
+def build_days(daily, detail):
+    """One row per day, with sparse dimensional breakdowns.
+
+    Every figure here is exactly recoverable. Counts come from the rollup row
+    for that day and kind, and the dimensional splits are download hits, which
+    add up cleanly because a hit belongs to exactly one combination.
     """
     days = {}
-    for row in cube:
-        day = days.setdefault(
-            row["day"], {"day": row["day"], "downloads": 0, "active": 0, "failures": 0}
-        )
+
+    for row in daily:
+        day = days.setdefault(row["day"], blank_day(row["day"]))
         kind = row["kind"]
         if kind == "download":
-            day["downloads"] += as_int(row, "hits")
+            day["downloads"] = as_int(row, "hits")
+            day["unique"] = as_int(row, "devices")
         elif kind == "failure":
-            day["failures"] += as_int(row, "hits")
+            day["failures"] = as_int(row, "hits")
         elif kind == "heartbeat":
-            day["active"] += as_int(row, "devices")
-    return [days[d] for d in sorted(days)]
+            day["active"] = as_int(row, "devices")
+
+    for row in detail:
+        if row["kind"] != "download":
+            continue
+        day = days.setdefault(row["day"], blank_day(row["day"]))
+        hits = as_int(row, "hits")
+        if row["os"] and row["arch"]:
+            platform = f"{row['os']}/{row['arch']}"
+            day["platforms"][platform] = day["platforms"].get(platform, 0) + hits
+        for name, column in (("channels", "channel"), ("versions", "version")):
+            value = row[column]
+            if value:
+                day[name][value] = day[name].get(value, 0) + hits
+
+    return days
+
+
+def lost_days(prior, days):
+    """Days that came in but are not going out.
+
+    Always empty while merge is a union. It is checked anyway because the
+    defect this file exists to fix was a history that silently got shorter,
+    and the cheapest way to reintroduce it is a well-meaning window trim
+    somewhere in the merge.
+    """
+    return sorted({row["day"] for row in prior} - {row["day"] for row in days})
+
+
+def merge(prior, fresh):
+    """Prior days, with the ones the query still covers replaced.
+
+    Replaced rather than added to: the query re-derives the same days on every
+    run, and the newest day is always partial when first seen.
+    """
+    merged = {row["day"]: row for row in prior}
+    merged.update(fresh)
+    return [merged[day] for day in sorted(merged)]
+
+
+def monthly(days):
+    """Monthly rollups, the grain a multi-year chart can actually draw.
+
+    Versions are left out. Which build a machine ran is a question about a
+    rollout in progress, answered by the daily rows; which platforms people are
+    on is a question about years, and belongs here.
+    """
+    months = {}
+    for row in days:
+        key = row["day"][:7]
+        month = months.setdefault(
+            key,
+            {
+                "month": key,
+                "days": 0,
+                "downloads": 0,
+                "unique": 0,
+                "failures": 0,
+                "activePeak": 0,
+                "platforms": {},
+                "channels": {},
+            },
+        )
+        month["days"] += 1
+        for name in COUNTS:
+            month[name] += row[name]
+        # Distinct devices do not add up across days, so the month carries its
+        # highest daily figure rather than a sum that would mean nothing.
+        month["activePeak"] = max(month["activePeak"], row["active"])
+        for name in ("platforms", "channels"):
+            for dimension, hits in row[name].items():
+                month[name][dimension] = month[name].get(dimension, 0) + hits
+    return [months[key] for key in sorted(months)]
 
 
 def main():
-    cube_path, windows_path, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+    cube_path, windows_path, history_path, out_dir = sys.argv[1:5]
 
-    cube = read_rows(cube_path)
+    detail, daily = split_cube(read_rows(cube_path))
     windows = read_rows(windows_path)
     w = windows[0] if windows else {}
 
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    total = as_int(w, "total")
-    deduped = as_int(w, "deduped")
+    # No try/except here on purpose. The workflow has already established
+    # whether the archive exists, so anything unreadable at this point is a
+    # real fault, and starting a fresh history would quietly discard every day
+    # the logs no longer hold.
+    prior = []
+    if history_path:
+        with open(history_path) as f:
+            prior = [normalise(row) for row in json.load(f).get("days", [])]
+        # Only the workflow may declare a first run, and it does that by
+        # passing no path at all. An archive that exists but carries no days
+        # is a fault: publishing over it would drop everything it should have
+        # held, and the result would be indistinguishable from a first run.
+        if not prior:
+            sys.exit(
+                f"{history_path} holds no days. An archive that exists must "
+                f"carry days, so this is a partial or truncated read, not a "
+                f"first run."
+            )
+
+    days = merge(prior, build_days(daily, detail))
+
+    # The history only grows. A day that came in and is not going out would be
+    # dropped from the only copy that holds it, in a payload that still parses
+    # and still agrees with itself, which is why this is an error and not a
+    # warning.
+    lost = lost_days(prior, days)
+    if lost:
+        sys.exit(
+            f"refusing to publish: {len(lost)} day(s) carried in are missing "
+            f"from the result, starting {lost[0]}. The history only grows."
+        )
+
+    # Cumulative figures come from the history, not from the scan, so they
+    # cannot shrink as logs expire. Summing daily uniques is exact because the
+    # scan dedupes on request IP, User-Agent and day: the day is inside the
+    # key, so one machine downloading on two days is already two.
+    total = sum(row["downloads"] for row in days)
+    deduped = sum(row["unique"] for row in days)
+    first_log = days[0]["day"] if days else ""
+
+    scanned_total, scanned_unique = as_int(w, "total"), as_int(w, "deduped")
+    if days and (total, deduped) != (scanned_total, scanned_unique):
+        print(
+            f"note: history totals {total}/{deduped} differ from the scan's "
+            f"{scanned_total}/{scanned_unique}. Expected once days age out of "
+            f"the 365 day log window, since the history keeps them and the "
+            f"scan cannot. Unexpected before then.",
+            file=sys.stderr,
+        )
+
     downloads_7d = as_int(w, "downloads_7d")
     failures_7d = as_int(w, "failures_7d")
     downloads_30d = as_int(w, "downloads_30d")
     unique_30d = as_int(w, "unique_30d")
-    first_log = (w.get("first_log") or "").strip()
 
     # The badge shows a rolling thirty days, not a cumulative count.
     #
@@ -120,10 +282,8 @@ def main():
         "updated": stamp,
     }
 
-    history = build_history(cube)
-
     cutoff = str((now.date() - datetime.timedelta(days=WINDOW_DAYS)))
-    recent = [r for r in cube if r["kind"] == "download" and r["day"] >= cutoff]
+    recent = [r for r in detail if r["kind"] == "download" and r["day"] >= cutoff]
     recent_total = sum(as_int(r, "hits") for r in recent)
 
     attempts_7d = downloads_7d + failures_7d
@@ -180,13 +340,22 @@ def main():
         },
     }
 
+    # Three grains of the same series. A widget refetches on every refresh and
+    # cannot afford the archive, and a chart a few hundred points wide cannot
+    # draw a decade of days regardless.
     payloads = {
         "stats.json": stats,
         "metrics.json": metrics,
-        "history.json": {
-            "schemaVersion": 1,
+        "history.json": {"schemaVersion": 2, "generated": stamp, "days": days},
+        "history-recent.json": {
+            "schemaVersion": 2,
             "generated": stamp,
-            "days": history,
+            "days": days[-RECENT_DAYS:],
+        },
+        "history-monthly.json": {
+            "schemaVersion": 2,
+            "generated": stamp,
+            "months": monthly(days),
         },
     }
 
@@ -195,6 +364,8 @@ def main():
             json.dump(payload, f, indent=2 if name != "stats.json" else None)
             f.write("\n")
         print(f"{name}: {len(json.dumps(payload))} bytes")
+
+    print(f"history: {len(days)} days, {len(prior)} carried in, {first_log} onward")
 
 
 if __name__ == "__main__":
