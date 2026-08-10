@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod doctor;
 mod exit;
+mod hardware;
 mod local;
 mod login;
 mod markdown;
@@ -191,9 +192,64 @@ enum Commands {
         #[clap(long)]
         all: bool,
 
+        /// Replace what is already filed under the same name, instead of
+        /// adding a second copy of it
+        #[clap(long)]
+        replace: bool,
+
         /// List what would be ingested without sending anything
         #[clap(long)]
         dry_run: bool,
+    },
+
+    /// Print a document's contents
+    ///
+    /// Takes the name shown by 'knaix ls', or a document id. The text is
+    /// written as it was ingested, so it pipes into anything.
+    #[clap(alias = "show")]
+    Cat {
+        /// The node to read from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to print, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+    },
+
+    /// Write a document out to a file
+    Export {
+        /// The node to read from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to export, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+
+        /// Where to write it (default: standard output)
+        #[clap(long, value_name = "PATH")]
+        out: Option<String>,
+    },
+
+    /// Remove a document from a node's knowledge base
+    ///
+    /// Takes the name shown by 'knaix ls', or a document id. A name that was
+    /// ingested more than once picks out every copy, and the count is stated
+    /// before anything is removed.
+    #[clap(alias = "remove")]
+    Rm {
+        /// The node to remove from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to remove, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+
+        /// Skip the confirmation prompt
+        #[clap(long)]
+        yes: bool,
     },
 
     /// Show who is logged in, the default node, and the local node's state
@@ -562,15 +618,32 @@ async fn main() -> std::process::ExitCode {
                 // plane would have worked against the node on this machine.
                 // Probed with a short deadline, since this is the error path and
                 // nothing here is worth hanging on.
-                let local_up = code == exit::Code::Unavailable
-                    && local::summarize_within(std::time::Duration::from_millis(400)).state
-                        == "running";
+                //
+                // Auth as well as Unavailable: a machine with a node already
+                // running was being told to go and make an account.
+                let worth_pointing_local =
+                    matches!(code, exit::Code::Unavailable | exit::Code::Auth)
+                        && subcommand != "login";
+                // The URL, not just the state: the container is machine-wide but
+                // the record addressing it is per-user, so a home that lost its
+                // record was pointed at `-n local`, which then refuses.
+                let local = local::summarize_within(std::time::Duration::from_millis(400));
+                let local_up =
+                    worth_pointing_local && local.state == "running" && local.url.is_some();
                 if local_up {
                     eprintln!(
                         "\n  {} A local node is running on this machine.",
                         "Note:".blue()
                     );
                     eprintln!("        {}", local_node_remedy(subcommand));
+                } else if worth_pointing_local && code == exit::Code::Auth {
+                    // The first run. Being told only to log in sent people off
+                    // to make an account for a product that does not need one.
+                    eprintln!("\n  {} Kovalent runs without an account.", "Note:".blue());
+                    eprintln!(
+                        "        {} starts a node on this machine, with nothing to sign up for.",
+                        brand::cmd("local up")
+                    );
                 }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",
@@ -901,6 +974,7 @@ async fn run() -> Result<()> {
             include,
             exclude,
             all,
+            replace,
             dry_run,
         } => {
             let node_id = project_node(node_id, project.as_ref());
@@ -923,7 +997,12 @@ async fn run() -> Result<()> {
                     let bytes = stdin_arg::read_bytes("the document")?;
                     let staged = stdin_arg::TempFile::write(&checked, &bytes)?;
                     if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                        // Same order as a file: what is there goes only once the
+                        // piped copy has landed.
+                        let superseded =
+                            nodes::superseded_by(&ctx, &target, &checked, replace).await;
                         nodes::upload_single_file(&ctx, &target, staged.path(), &checked).await?;
+                        nodes::remove_superseded(&ctx, &target, &superseded, &checked).await;
                     }
                 }
             } else {
@@ -935,7 +1014,7 @@ async fn run() -> Result<()> {
                 if dry_run {
                     nodes::report_plan(&plan, &file_path);
                 } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                    nodes::upload(&ctx, &target, &file_path, plan).await?;
+                    nodes::upload(&ctx, &target, &file_path, plan, replace).await?;
                 }
             }
         }
@@ -973,6 +1052,32 @@ async fn run() -> Result<()> {
                     "  No node recorded. Set one with {}, or edit the file.",
                     brand::cmd("init --node-id <NODE>").as_str()
                 )),
+            }
+        }
+        Commands::Cat { node_id, document } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::cat_document(&ctx, &target, &document).await?;
+            }
+        }
+        Commands::Export {
+            node_id,
+            document,
+            out,
+        } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::export_document(&ctx, &target, &document, out.as_deref()).await?;
+            }
+        }
+        Commands::Rm {
+            node_id,
+            document,
+            yes,
+        } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::remove_document(&ctx, &target, &document, yes).await?;
             }
         }
         Commands::Status => {

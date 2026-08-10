@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use walkdir::WalkDir;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct Node {
@@ -694,6 +694,442 @@ pub async fn resolve_target(
         .map(|uuid| Target::Remote { uuid }))
 }
 
+/// Every document a node holds, in one shape whichever kind answered, so the
+/// commands acting on a document are written once.
+pub async fn documents_of(ctx: &KnaixContext, target: &Target) -> Result<Vec<Document>> {
+    match target {
+        Target::Local { base, instance_id } => Ok(local_documents(ctx, base, instance_id)
+            .await?
+            .iter()
+            .map(Document::from)
+            .collect()),
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!("{}/api/knowledge/{}/documents", ctx.config.api_url, uuid);
+            let resp = ctx
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("Could not list documents: HTTP {}", resp.status()))
+                    .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(serde_json::from_value(wrapper["data"].clone()).unwrap_or_default())
+        }
+    }
+}
+
+/// Remove one document and everything it was chunked into.
+pub async fn delete_document(ctx: &KnaixContext, target: &Target, document_id: &str) -> Result<()> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/delete", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "document_id": document_id,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node. Is it running?")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not remove the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            Ok(())
+        }
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!(
+                "{}/api/knowledge/{}/documents/{}",
+                ctx.config.api_url, uuid, document_id
+            );
+            let resp = ctx
+                .client
+                .delete(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not remove the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The documents a name or id picks out, newest first.
+///
+/// An id matches one document. A name can match several: re-ingesting an edited
+/// file files it under the same name as a new document, so a corpus can hold
+/// more than one version of the same filename.
+pub fn documents_named<'a>(documents: &'a [Document], wanted: &str) -> Vec<&'a Document> {
+    if let Some(exact) = documents.iter().find(|d| d.id == wanted) {
+        return vec![exact];
+    }
+    documents
+        .iter()
+        .filter(|d| {
+            d.source
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .is_some_and(|n| n == wanted)
+        })
+        .collect()
+}
+
+/// What is already filed under `name`, for removing once the new copy lands.
+///
+/// Ingest first and delete after. Deleting first turned a refused ingest into a
+/// lost document: the old copy was gone, the new one never arrived, and the
+/// command that was meant to update it had destroyed it.
+pub async fn superseded_by(
+    ctx: &KnaixContext,
+    target: &Target,
+    name: &str,
+    replace: bool,
+) -> Vec<String> {
+    if !replace {
+        if already_filed(ctx, target, name).await > 0 {
+            ctx.info(&format!(
+                "  {} {} is already ingested. This adds another copy; {} updates it instead.",
+                "Warning:".yellow(),
+                name,
+                "--replace".cyan()
+            ));
+        }
+        return Vec::new();
+    }
+    match documents_of(ctx, target).await {
+        Ok(documents) => documents_named(&documents, name)
+            .into_iter()
+            .map(|d| d.id.clone())
+            .collect(),
+        // Nothing to supersede that we can name; the ingest still goes ahead.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Remove what the new copy replaced, now it is safely in.
+///
+/// A failure here leaves a duplicate rather than a hole, which is the side to
+/// fail on, so it is reported and not raised.
+pub async fn remove_superseded(ctx: &KnaixContext, target: &Target, ids: &[String], name: &str) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut removed = 0;
+    for id in ids {
+        if delete_document(ctx, target, id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        ctx.info(&format!(
+            "  {} replaced {} already filed under {}",
+            "↻".cyan(),
+            plural_count(removed, "copy", "copies"),
+            name
+        ));
+    }
+    if removed < ids.len() {
+        ctx.info(&format!(
+            "  {} {} older {} of {} could not be removed and is still there.",
+            "Warning:".yellow(),
+            ids.len() - removed,
+            plural(ids.len() - removed, "copy", "copies"),
+            name
+        ));
+    }
+}
+
+/// How many documents are already filed under a name.
+async fn already_filed(ctx: &KnaixContext, target: &Target, name: &str) -> usize {
+    match documents_of(ctx, target).await {
+        Ok(documents) => documents_named(&documents, name).len(),
+        // Only decides whether to warn, so a failed listing is not worth
+        // failing the ingest over.
+        Err(_) => 0,
+    }
+}
+
+/// "1 copy" / "2 copies", where the number is worth showing.
+fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+/// One document's text, as the node that holds it reassembles it.
+///
+/// The node does the reassembly because it owns the chunks, and the rule for
+/// consuming their overlap belongs beside the chunking.
+pub async fn document_content(
+    ctx: &KnaixContext,
+    target: &Target,
+    document_id: &str,
+) -> Result<String> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/document", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "document_id": document_id,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node. Is it running?")?;
+            if resp.status() == 404 {
+                return Err(anyhow!(
+                    "This node is too old to read a document back. Update it with {}.",
+                    crate::brand::cmd("local up --pull")
+                ))
+                .coded(Code::Precondition);
+            }
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["content"].as_str().unwrap_or_default().to_string())
+        }
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!(
+                "{}/api/knowledge/{}/documents/{}/content",
+                ctx.config.api_url, uuid, document_id
+            );
+            let resp = ctx
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
+        }
+    }
+}
+
+/// The one document a name picks out, or an error naming the ambiguity.
+///
+/// Ambiguous for reading where it is not for removing: `rm` was asked for every
+/// copy, but printing one of several would guess at which version was wanted.
+fn one_document<'a>(documents: &'a [Document], wanted: &str) -> Result<&'a Document> {
+    let matches = documents_named(documents, wanted);
+    match matches.len() {
+        0 => Err(anyhow!(
+            "No document named {}. {} lists what is there.",
+            wanted,
+            crate::brand::cmd("ls")
+        ))
+        .coded(Code::NotFound),
+        1 => Ok(matches[0]),
+        n => {
+            let mut lines = format!("{} copies of {} are filed here:\n", n, wanted);
+            for d in &matches {
+                lines.push_str(&format!(
+                    "  {}  ingested {}\n",
+                    d.id,
+                    d.created_at.as_deref().unwrap_or("unknown")
+                ));
+            }
+            lines.push_str("Name one by its id, or remove the copies you do not want.");
+            Err(anyhow!("{}", lines)).coded(Code::Usage)
+        }
+    }
+}
+
+/// Print a document's text.
+pub async fn cat_document(ctx: &KnaixContext, target: &Target, wanted: &str) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+    // Raw, not rendered: a file's contents are worth more piped than prettied.
+    print!("{}", content);
+    if !content.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// Write a document out to a file, or to stdout where none is named.
+pub async fn export_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &str,
+    out: Option<&str>,
+) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+
+    let Some(out) = out else {
+        print!("{}", content);
+        if !content.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    };
+
+    let path = Path::new(out);
+    // The named file is one the user already has, and cannot be got back.
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists. Move it, or pass a different --out.",
+            path.display()
+        ))
+        .coded(Code::Denied);
+    }
+    // Ending on a newline, like `cat` does. Ingest trimmed the document's own,
+    // so without this the file written is a byte short of the one ingested and
+    // the two commands disagree about the same document.
+    let mut content = content;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    std::fs::write(path, &content)
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    ctx.info(&format!(
+        "{} Wrote {} ({} bytes) to {}",
+        "✓".green(),
+        doc.source
+            .as_ref()
+            .and_then(|s| s.name.as_deref())
+            .unwrap_or(&doc.id),
+        content.len(),
+        path.display().to_string().bold()
+    ));
+    Ok(())
+}
+
+/// Remove a document from a node's knowledge base, by name or by id.
+///
+/// Not undoable, so it confirms unless told not to, and states the count first:
+/// "remove widget.md" meaning three removals is the surprise worth a line.
+pub async fn remove_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &str,
+    yes: bool,
+) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+    use std::io::IsTerminal;
+
+    let documents = documents_of(ctx, target).await?;
+    let matches = documents_named(&documents, wanted);
+
+    if matches.is_empty() {
+        return Err(anyhow!(
+            "No document named {} on {}. {} lists what is there.",
+            wanted,
+            target.label(),
+            crate::brand::cmd("ls")
+        ))
+        .coded(Code::NotFound);
+    }
+
+    let chunks: u64 = matches.iter().map(|d| d.chunk_count.unwrap_or(0)).sum();
+    println!(
+        "\n{} {} {} ({} {}) from {}:",
+        "Removing".bold(),
+        matches.len(),
+        plural(matches.len(), "document", "documents"),
+        chunks,
+        plural(chunks as usize, "chunk", "chunks"),
+        target.label().cyan()
+    );
+    for d in &matches {
+        println!(
+            "  - {}  {}",
+            d.source
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .unwrap_or(&d.id),
+            format!("ingested {}", d.created_at.as_deref().unwrap_or("unknown")).dimmed()
+        );
+    }
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "Refusing to remove a document without confirmation. Pass --yes to remove it in a script."
+            ))
+            .coded(Code::Denied);
+        }
+        let go = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Remove it? This cannot be undone")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !go {
+            println!("{} Nothing removed.", "Info:".blue());
+            return Ok(());
+        }
+    }
+
+    // One failure must not hide the rest, or the corpus ends in a state the
+    // command cannot describe.
+    let mut removed = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for d in &matches {
+        let name = d
+            .source
+            .as_ref()
+            .and_then(|s| s.name.clone())
+            .unwrap_or_else(|| d.id.clone());
+        match delete_document(ctx, target, &d.id).await {
+            Ok(()) => removed += 1,
+            Err(e) => failed.push((name, e.to_string())),
+        }
+    }
+
+    for (name, why) in &failed {
+        println!("  {} {}: {}", "✗".red(), name, why);
+    }
+    println!(
+        "\n{} Removed {} {}.",
+        "✓".green(),
+        removed,
+        plural(removed, "document", "documents")
+    );
+    if !failed.is_empty() {
+        return Err(anyhow!(
+            "{} of {} could not be removed.",
+            failed.len(),
+            matches.len()
+        ));
+    }
+    Ok(())
+}
+
 /// True when a node is the one the user named, by UUID, instance id, or name.
 /// Users read the last two off `knaix list`; the routes only accept the first.
 fn node_matches(node: &Node, wanted: &str) -> bool {
@@ -810,6 +1246,7 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
         "\n{}",
         "Knowledge Base for the local node:".bold().underline()
     );
+    print_local_node_summary(&documents);
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
@@ -827,6 +1264,134 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
     Ok(())
 }
 
+/// The node the listing came from, above the listing itself.
+///
+/// The table printed alone, so which node it came from and what was answering
+/// on it were a `local status` away.
+fn print_local_node_summary(documents: &[NodeDocument]) {
+    let node = crate::local::load();
+    let summary = crate::local::summarize();
+    let chunks: u64 = documents.iter().map(|d| d.chunks.unwrap_or(0)).sum();
+
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.yellow(),
+    };
+    let where_ = summary
+        .url
+        .or_else(|| node.as_ref().map(|n| n.base_url()))
+        .unwrap_or_else(|| "not started".to_string());
+
+    println!("  {}  {}  {}", "local".bold(), state, where_.dimmed());
+    println!(
+        "  {}",
+        format!(
+            "{} {}, {} {}, answered by {}",
+            documents.len(),
+            plural(documents.len(), "document", "documents"),
+            chunks,
+            plural(chunks as usize, "chunk", "chunks"),
+            answering(node.as_ref())
+        )
+        .dimmed()
+    );
+    println!();
+}
+
+/// What the node answers with, in the words `local status` uses.
+fn answering(node: Option<&crate::local::LocalNode>) -> String {
+    match node {
+        Some(n) => match (&n.model, &n.model_url) {
+            (Some(model), Some(url)) => format!("{model} at {url}"),
+            (None, Some(url)) => format!("the model at {url}"),
+            _ => "the deterministic mock".to_string(),
+        },
+        None => "the deterministic mock".to_string(),
+    }
+}
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// The local node as a row in the nodes table, or None where none was started.
+///
+/// Built from the saved record rather than the container: a stopped node is
+/// still a node worth listing.
+fn local_node_row() -> Option<Vec<String>> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.to_string().yellow(),
+    };
+    Some(vec![
+        crate::local::LOCAL_NODE_ID.bold().white().to_string(),
+        node.instance_id.cyan().to_string(),
+        state.to_string(),
+        node.base_url().blue().to_string(),
+        "LOCAL".green().to_string(),
+        match &node.model {
+            Some(m) => m.clone().magenta().to_string(),
+            None => "mock".magenta().to_string(),
+        },
+    ])
+}
+
+/// The local node in the shape the control plane reports a hosted one.
+///
+/// Built through `Node` for the same reason the document records above are:
+/// one shape whichever node answered, and going through the struct means the
+/// two cannot drift.
+///
+/// `id` is the UUID routes are keyed by, `instanceId` the name passed to `-n`.
+fn local_node_json() -> Option<serde_json::Value> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    let shaped = Node {
+        id: Some(node.instance_id.clone()),
+        name: crate::local::LOCAL_NODE_ID.to_string(),
+        state: if summary.state == "none" {
+            "stopped".to_string()
+        } else {
+            summary.state
+        },
+        instance_id: Some(crate::local::LOCAL_NODE_ID.to_string()),
+        // A hosted node is reached on a mesh address; this one is on loopback.
+        private_ip: None,
+        model: node.model.clone(),
+        config: None,
+    };
+    let mut value = serde_json::to_value(&shaped).ok()?;
+    // Additive: a hosted node has neither.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("local".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "url".to_string(),
+            serde_json::Value::String(node.base_url()),
+        );
+    }
+    Some(value)
+}
+
+fn print_node_table(rows: Vec<Vec<String>>) {
+    println!("\n{}", "Your Kovalent Nodes:".bold().underline());
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
+    for row in rows {
+        table.add_row(row);
+    }
+    println!("{table}\n");
+}
+
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
     // Answered before the token is read, because neither a session nor the
     // control plane has anything to do with it. Reaching for them first is what
@@ -835,9 +1400,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return list_local_documents(ctx).await;
     }
 
-    let token = ctx.get_token()?;
-
     if let Some(nid) = node_id {
+        let token = ctx.get_token()?;
         // The knowledge base of one node. Resolve first: the route is keyed by
         // the instance UUID, but users pass whatever `knaix list` showed them.
         let uuid = resolve_node_uuid(ctx, nid).await?;
@@ -897,6 +1461,34 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return Ok(());
     }
 
+    // A local node is a node. An account is what hosted nodes need, not what
+    // makes the question answerable, so this one is reported either way.
+    let local = local_node_row();
+    let token = match ctx.get_token() {
+        Ok(token) => token,
+        Err(no_session) => {
+            if local.is_none() {
+                return Err(no_session);
+            }
+            // Still an array: a table is the one shape a script cannot read.
+            if ctx.output_format == "json" {
+                let all: Vec<serde_json::Value> = local_node_json().into_iter().collect();
+                println!("{}", serde_json::to_string_pretty(&all).unwrap_or_default());
+                return Ok(());
+            }
+            print_node_table(local.into_iter().collect());
+            println!(
+                "  {}",
+                format!(
+                    "Hosted nodes are not listed: no session on this machine. {} signs in.",
+                    crate::brand::cmd("login")
+                )
+                .dimmed()
+            );
+            return Ok(());
+        }
+    };
+
     // List Nodes (default behavior)
     let url = format!("{}/api/instances", ctx.config.api_url);
 
@@ -913,14 +1505,22 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         let nodes_val = &wrapper["data"];
 
         if ctx.output_format == "json" {
-            let json_data = serde_json::to_string_pretty(nodes_val).unwrap_or_default();
-            println!("{}", json_data);
+            // Last, not first: this list has always been the hosted nodes, and
+            // a script reading `.[0]` would otherwise start getting another.
+            let mut all = nodes_val.as_array().cloned().unwrap_or_default();
+            if let Some(local) = local_node_json() {
+                all.push(local);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(all)).unwrap_or_default()
+            );
             return Ok(());
         }
 
         let nodes: Vec<Node> = serde_json::from_value(nodes_val.clone()).unwrap_or_default();
 
-        if nodes.is_empty() {
+        if nodes.is_empty() && local.is_none() {
             println!(
                 "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
                 "Info:".blue(),
@@ -928,12 +1528,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 crate::brand::cmd("local up")
             );
         } else {
-            println!("\n{}", "Your Kovalent Nodes:".bold().underline());
-            let mut table = comfy_table::Table::new();
-            table.load_preset(comfy_table::presets::UTF8_FULL);
-            table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
-            table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
-
+            let mut rows: Vec<Vec<String>> = Vec::new();
             for node in nodes {
                 let status = if node.state == "running" {
                     node.state.green()
@@ -959,7 +1554,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     .unwrap_or_else(|| "Standard".to_string())
                     .magenta();
 
-                table.add_row(vec![
+                rows.push(vec![
                     node.name.bold().white().to_string(),
                     id_display.cyan().to_string(),
                     status.to_string(),
@@ -968,7 +1563,11 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     model.to_string(),
                 ]);
             }
-            println!("{table}\n");
+            // Last, so the table reads in the same order as `-o json`.
+            if let Some(local) = local {
+                rows.push(local);
+            }
+            print_node_table(rows);
         }
     } else {
         return Err(anyhow!("Failed to fetch nodes: HTTP {}", resp.status()))
@@ -2386,6 +2985,7 @@ pub async fn upload(
     target: &Target,
     file_path: &str,
     plan: UploadPlan,
+    replace: bool,
 ) -> Result<()> {
     let base_path = Path::new(file_path);
 
@@ -2396,9 +2996,12 @@ pub async fn upload(
     } = plan;
 
     if let Some(file_name) = single_file {
-        return upload_single_file(ctx, target, base_path, &file_name)
-            .await
-            .map(|_| ());
+        let superseded = superseded_by(ctx, target, &file_name, replace).await;
+        let ingested = upload_single_file(ctx, target, base_path, &file_name).await;
+        if ingested.is_ok() {
+            remove_superseded(ctx, target, &superseded, &file_name).await;
+        }
+        return ingested.map(|_| ());
     }
 
     if queue.is_empty() {
@@ -2424,8 +3027,10 @@ pub async fn upload(
         // One bad file must not abandon the rest: a partial ingest that stops
         // wherever it happened to fail is worse than a complete one with a
         // named failure, because nothing says how far it got.
+        let superseded = superseded_by(ctx, target, &file_name, replace).await;
         match upload_single_file(ctx, target, path, &file_name).await {
             Ok(chunks) => {
+                remove_superseded(ctx, target, &superseded, &file_name).await;
                 summary.ingested += 1;
                 summary.chunks += chunks;
             }

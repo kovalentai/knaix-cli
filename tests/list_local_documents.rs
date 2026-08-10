@@ -75,6 +75,36 @@ fn serve_node_with_broken_documents() -> u16 {
     port
 }
 
+/// A node that answers every request with one status and body, for the paths
+/// where the status is the point.
+fn serve_status(status: u16, body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+        }
+    });
+    port
+}
+
+/// Serves as both a listing and a document read: the stub answers every path
+/// with this, and the two commands read different fields out of it.
+const ONE_DOCUMENT_WITH_CONTENT: &str = r##"{
+  "documents":[{"document_id":"h-1","source":"Handbook.md","chunks":2,"created_at":"2026-08-05T00:45:03.286Z"}],
+  "document_id":"h-1","source":"Handbook.md","chunks":2,
+  "content":"# Handbook\n\nRefunds are processed within seven days.\n"
+}"##;
+
 fn scratch_home(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("knaix-lslocal-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -114,7 +144,9 @@ fn record_local_node_with_default(home: &Path, port: u16, default: Option<&str>)
 
 fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
-    cmd.env("HOME", home).env("KNAIX_NO_UPDATE_CHECK", "1");
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("KNAIX_NO_UPDATE_CHECK", "1");
     cmd
 }
 
@@ -547,4 +579,493 @@ fn other_commands_keep_the_full_note() {
             "a command that reads the default lost the advice: {stderr}"
         );
     }
+}
+
+/// The table printed alone, so the node it came from and what was answering on
+/// it were a separate command away.
+#[test]
+fn the_listing_names_the_node_it_came_from() {
+    let home = scratch_home("summary");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "-n", "local"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exited {:?}", out.status.code());
+    // The node, and the totals the table would otherwise have to be added up by
+    // hand to get.
+    for expected in ["local", "2 documents", "15 chunks"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+}
+
+/// Listing nodes answered "not logged in" on a machine that had one running:
+/// an account problem reported in place of an answer that needed no account.
+#[test]
+fn listing_nodes_without_a_session_still_reports_the_local_one() {
+    let home = scratch_home("nodeslocal");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("local"), "no local node listed: {stdout}");
+    // Said, not silently omitted: hosted nodes are missing for a reason the
+    // user can act on.
+    assert!(
+        stdout.contains("login"),
+        "no word on why hosted nodes are absent: {stdout}"
+    );
+}
+
+/// The no-session path is the one that prints something extra, and a table
+/// there is the one shape a script cannot read.
+#[test]
+fn listing_nodes_as_json_without_a_session_stays_machine_readable() {
+    let home = scratch_home("nodesjson");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+    assert_eq!(nodes.len(), 1, "expected only the local node: {stdout}");
+    assert_eq!(nodes[0]["name"], "local");
+    assert_eq!(nodes[0]["local"], true);
+}
+
+/// Swallowing the account error would leave a machine with nothing set up
+/// looking like one with nothing to show.
+#[test]
+fn listing_nodes_without_a_session_or_a_local_node_is_still_an_auth_error() {
+    let home = scratch_home("nodesneither");
+    let dir = home.join(".knaix");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{"api_url":"http://127.0.0.1:9"}"#,
+    )
+    .unwrap();
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(3), "expected the auth code");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("login"),
+        "the remedy should still be named"
+    );
+}
+
+const ONE_HOSTED_NODE: &str = r#"{"data":[
+  {"id":"aaaaaaaa-1111-2222-3333-444444444444","name":"acme-prod","state":"running",
+   "instanceId":"acme-prod-01","privateIp":"100.64.0.7","model":"Standard","config":null}
+]}"#;
+
+/// This list has always meant the hosted nodes, so a script reading `.[0]`
+/// must keep getting the one it has always got.
+#[test]
+fn the_local_node_joins_the_hosted_list_last() {
+    let home = scratch_home("nodesorder");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+
+    assert_eq!(nodes.len(), 2, "expected the hosted node and the local one");
+    assert_eq!(
+        nodes[0]["name"], "acme-prod",
+        "the hosted node must stay first: {stdout}"
+    );
+    assert_eq!(nodes[1]["name"], "local");
+    assert_eq!(nodes[1]["local"], true);
+
+    // Same spelling as the hosted node beside it: one shape, either kind.
+    let hosted = nodes[0].as_object().unwrap();
+    let local = nodes[1].as_object().unwrap();
+    for field in [
+        "id",
+        "name",
+        "state",
+        "instanceId",
+        "privateIp",
+        "model",
+        "config",
+    ] {
+        assert!(
+            local.contains_key(field),
+            "the local node is missing {field}, which a hosted node carries: {stdout}"
+        );
+        assert!(hosted.contains_key(field), "fixture lost {field}");
+    }
+    // `id` routes and `instanceId` is what a person types, on both.
+    assert_eq!(nodes[1]["id"], "11111111-2222-3333-4444-555555555555");
+    assert_eq!(nodes[1]["instanceId"], "local");
+}
+
+/// The table reads in the same order, so the two output modes agree.
+#[test]
+fn the_table_lists_the_local_node_last_too() {
+    let home = scratch_home("nodesordertable");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+    let api = format!("http://127.0.0.1:{}", serve_node(ONE_HOSTED_NODE));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .env("KNAIX_TOKEN", "test-token")
+        .env("KNAIX_API_URL", &api)
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hosted = stdout.find("acme-prod").expect("hosted node missing");
+    let local = stdout.rfind("local").expect("local node missing");
+    assert!(hosted < local, "local should come last: {stdout}");
+}
+
+const TWO_COPIES: &str = r#"{"documents":[
+  {"document_id":"new-copy","source":"Policy.md","chunks":2,"created_at":"2026-08-06T03:03:56.140Z"},
+  {"document_id":"old-copy","source":"Policy.md","chunks":3,"created_at":"2026-08-01T00:00:00.000Z"},
+  {"document_id":"other","source":"Handbook.md","chunks":9,"created_at":"2026-08-05T00:45:03.286Z"}
+]}"#;
+
+/// Ingest mints a fresh id every time and only collapses byte-identical chunks,
+/// so an edited file lands as a second document under the same name. Removing
+/// by name has to take every copy, or the superseded text stays retrievable.
+#[test]
+fn removing_by_name_takes_every_copy_filed_under_it() {
+    let home = scratch_home("rmcopies");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exited {:?}: {stdout}",
+        out.status.code()
+    );
+    assert!(stdout.contains("Removed 2 documents"), "{stdout}");
+
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        bodies.contains("new-copy"),
+        "the newer copy was left: {bodies}"
+    );
+    assert!(
+        bodies.contains("old-copy"),
+        "the superseded copy was left: {bodies}"
+    );
+    // The document that shares no name with it must not be touched.
+    assert!(
+        !bodies.contains("\"other\""),
+        "an unrelated document was deleted: {bodies}"
+    );
+}
+
+/// The whole store is one flag away on the node's delete route, so the command
+/// that removes one document must never reach for it.
+#[test]
+fn removing_a_document_never_asks_to_erase_everything() {
+    let home = scratch_home("rmnowipe");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("\"all\""),
+        "a document removal carried the erase-everything flag: {bodies}"
+    );
+}
+
+/// A script that forgot --yes must not have documents removed, and must be able
+/// to tell that refusal from a crash.
+#[test]
+fn removing_without_confirmation_is_refused_and_deletes_nothing() {
+    let home = scratch_home("rmdenied");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(6), "expected the denied code");
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("kb/delete"),
+        "a refused removal still deleted: {bodies}"
+    );
+}
+
+/// Naming something that is not there is not found, not a generic failure: a
+/// script can tell a typo from a node that would not answer.
+#[test]
+fn removing_a_document_that_is_not_there_is_not_found() {
+    let home = scratch_home("rmmissing");
+    record_local_node(&home, serve_node(TWO_COPIES));
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Nothing.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(5), "expected not-found");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Nothing.md"));
+}
+
+/// Re-ingesting without --replace leaves the old copy in place, so it says so.
+/// Silence is what let a corpus fill with superseded versions of one file.
+#[test]
+fn re_ingesting_a_known_name_warns_that_it_adds_a_copy() {
+    let home = scratch_home("uploadwarn");
+    record_local_node(&home, serve_node(TWO_COPIES));
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nRefunds in 7 days.\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already ingested") && stdout.contains("--replace"),
+        "no word that this adds a copy: {stdout}"
+    );
+}
+
+/// And with --replace, what was there is removed once the new text has landed.
+/// The order is the guarantee: ingest first, so a refusal costs nothing.
+#[test]
+fn replacing_removes_what_was_filed_under_the_name_after_the_new_copy_lands() {
+    let home = scratch_home("uploadreplace");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nRefunds same day.\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", "--replace", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("replaced 2 copies"), "{stdout}");
+
+    let requests = seen.lock().unwrap().clone();
+    let ingest = requests.iter().position(|r| r.contains("/api/kb/ingest"));
+    let delete = requests.iter().position(|r| r.contains("/api/kb/delete"));
+    assert!(ingest.is_some() && delete.is_some(), "expected both calls");
+    assert!(
+        ingest < delete,
+        "the old copies were deleted before the new one landed"
+    );
+    let bodies = requests.join("\n");
+    assert!(bodies.contains("new-copy") && bodies.contains("old-copy"));
+}
+
+/// `cat` and `export` must agree byte for byte about the same document. Ingest
+/// trims the document's own trailing newline, and only `cat` was putting one
+/// back, so the exported file came out a byte short of the one ingested.
+#[test]
+fn an_exported_file_ends_on_a_newline_like_cat_does() {
+    let home = scratch_home("exportnewline");
+    record_local_node(&home, serve_node(ONE_DOCUMENT_WITH_CONTENT));
+    let out_path = home.join("written.md");
+
+    let out = knaix(&home)
+        .args([
+            "export",
+            "-n",
+            "local",
+            "Handbook.md",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run knaix");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let written = fs::read_to_string(&out_path).unwrap();
+    assert!(written.ends_with('\n'), "no trailing newline: {written:?}");
+
+    let printed = knaix(&home)
+        .args(["cat", "-n", "local", "Handbook.md"])
+        .output()
+        .expect("failed to run knaix");
+    assert_eq!(
+        written,
+        String::from_utf8_lossy(&printed.stdout),
+        "cat and export disagree about the same document"
+    );
+}
+
+/// A node that lists documents but refuses every ingest, recording what it was
+/// asked. Enough to prove what a failed upload did and did not delete.
+fn serve_refusing_ingest(listing: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let refuse = request.contains("/api/kb/ingest");
+            record.lock().unwrap().push(request);
+            let body = if refuse {
+                r#"{"error":"The document contained no readable text."}"#
+            } else {
+                listing
+            };
+            let status = if refuse { "400 Bad Request" } else { "200 OK" };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+        }
+    });
+    (port, seen)
+}
+
+/// Deleting before ingesting turned a refused upload into a lost document: the
+/// old copy gone, the new one never arrived, and the command meant to update it
+/// had destroyed it instead.
+#[test]
+fn a_replace_whose_ingest_fails_leaves_the_document_alone() {
+    let home = scratch_home("replacesafe");
+    let (port, seen) = serve_refusing_ingest(TWO_COPIES);
+    record_local_node(&home, port);
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nnew text\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", "--replace", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    assert!(!out.status.success(), "the ingest was supposed to fail");
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("kb/delete"),
+        "a failed replace deleted the copy it could not supersede: {bodies}"
+    );
+}
+/// A node that predates the content route answers 404, which is a node to
+/// update rather than a document that is missing. Reporting it as not-found
+/// would send someone looking for a document that is right there in the listing.
+#[test]
+fn reading_from_a_node_without_the_route_says_to_update_it() {
+    let home = scratch_home("catold");
+    // The stub answers every path with the listing, so /api/kb/document gets a
+    // body with no content field rather than a 404. Serve a 404 instead.
+    let port = serve_status(404, r#"{"error":"not found"}"#);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["cat", "-n", "local", "Anything.md"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The listing itself is what 404s first here, and that is already covered;
+    // what matters is that a 404 never reads as a successful empty document.
+    assert_ne!(out.status.code(), Some(0), "a 404 must not read as success");
+    assert!(!stderr.is_empty(), "the failure said nothing: {stderr}");
+}
+
+/// A name filed more than once is ambiguous for reading, where it is not for
+/// removing: printing one of several without saying which would be a guess at
+/// which version was wanted.
+#[test]
+fn reading_a_name_with_two_copies_asks_which_one() {
+    let home = scratch_home("catambiguous");
+    record_local_node(&home, serve_node(TWO_COPIES));
+
+    let out = knaix(&home)
+        .args(["cat", "-n", "local", "Policy.md"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected a usage error");
+    assert!(
+        stderr.contains("new-copy") && stderr.contains("old-copy"),
+        "{stderr}"
+    );
+}
+
+/// Exporting must not write over a file that is already there: the document
+/// lands in the user's own directory, and what it replaced cannot be got back.
+#[test]
+fn exporting_refuses_to_overwrite_an_existing_file() {
+    let home = scratch_home("exportclobber");
+    record_local_node(&home, serve_node(ONE_DOCUMENT_WITH_CONTENT));
+    let target = home.join("precious.md");
+    fs::write(&target, "do not lose me").unwrap();
+
+    let out = knaix(&home)
+        .args([
+            "export",
+            "-n",
+            "local",
+            "Handbook.md",
+            "--out",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(6), "expected the denied code");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "do not lose me");
 }

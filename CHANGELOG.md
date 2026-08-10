@@ -2,6 +2,44 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.6.1] - 2026-08-10
+
+Most of this release is about the first ten minutes. Three separate things could make a fresh install look broken, and all of them were reachable with a stock Ollama: a model picker that offered models which cannot run, a timeout shorter than the models it offered, and no sense of what a machine can actually hold.
+
+The rest is the knowledge base becoming something you can manage rather than only add to. Documents can be read back, written out, replaced, and removed. One of those, `upload --replace`, could destroy the document it was updating; if you have been using the flag since it appeared earlier in this release cycle, that fix is the reason to take this one.
+
+A patch, not a minor: nothing here removes or renames an interface, and the one change to `-o json` appends rather than reorders, so a script reading `.[0]` still gets what it always got.
+
+### Added
+
+- **`knaix cat` prints a document, and `knaix export` writes one to a file.** A node could be asked what it held and how many chunks each document was cut into, but never for the text. Both reassemble the document from its chunks, so what comes back is a document rather than passages. `cat` writes the text and nothing else, so it pipes. `export` refuses to write over a file that already exists, because the path you name is one you already have. Both need a node running 0.33.0 or newer; an older one says so and names `knaix local up --pull`.
+
+- **`knaix rm` removes a document.** Until now nothing could take a document out short of `knaix local reset`, which empties the store: everything you had ingested, to remove one file. It takes the name `knaix ls` shows, removes every copy filed under it, states the count before acting, and confirms first -- refusing outright where there is no terminal to confirm at, so a script that forgot `--yes` cannot delete by accident.
+
+- **`knaix upload --replace` updates a document instead of duplicating it.** Re-ingesting an edited file filed a second document under the same name, and answers were then grounded in the old text as readily as the new. Without the flag the upload behaves as it always has and now says it is adding a copy.
+
+- **`knaix local setup` sizes models against your machine.** Choices carry their weight and whether they fit the memory you have; the ones that fit comfortably come first, and picking one too large to hold says so rather than leaving you to find out at the first question.
+
+- **A first run is told it needs no account.** `knaix ls` and `knaix chat` on a machine with nothing set up answered "Not logged in", which sent people off to make an account for a product that does not need one. They now name `knaix local up`.
+
+### Changed
+
+- **A document listing leads with the node it came from.** Which node you had just listed, whether it was running, and what was answering on it were all a separate `knaix local status` away. The table now sits under the node, its state, and the totals.
+
+- **`knaix ls --nodes` includes a local node, with or without a session.** It answered "Not logged in" on a machine with a node running and nothing else wrong. An account is what hosted nodes need, not what makes the question answerable. In `-o json` the local node is appended after the hosted ones and carries the same field names, so existing readers are unaffected.
+
+- **A served model gets three minutes to answer, not one.** The node's own default is a minute, and a reasoning model spends most of its output budget thinking before the first word of the answer. Models the picker itself offered needed longer than they were given.
+
+### Fixed
+
+- **`knaix local setup` no longer offers models that cannot run.** An Ollama Cloud entry is listed like any other but has no weights on your machine, and choosing one answered every question with a 403. They are named and set aside, and whatever you do pick is asked for a token before the choice is saved.
+
+- **`knaix upload --replace` could destroy the document it was updating.** It removed what was filed under the name and then ingested. Where the ingest was refused -- an unparseable file, one over the size cap, a node that stopped answering -- the old copy was already gone and the new one never arrived. It now ingests first and removes the old only once the new has landed.
+
+- **The Windows binary could die before it started.** A stack overflow while building the command tree, before a single argument was parsed: Windows reserves an eighth of the stack that Linux and macOS give the main thread. Every integration test on Windows failed this way. Whether a release build crossed the same line was never established, because until now nothing had ever run the Windows binary -- the release workflow compiled it and stopped there. It reserves the same stack the other platforms get, and Windows is now compiled and tested on every pull request.
+
+- **An exported file ends on a newline, as `cat` already did.** The two commands returned different bytes for the same document.
+
 ## [0.6.0] - 2026-08-08
 
 `knaix list` can see the node on your own machine. It refused to, on the grounds that a local node kept chunks and no document registry, which was true when it was written and stopped being true a release later. The refusal outlived the limitation, and so did two other things built on the same belief.

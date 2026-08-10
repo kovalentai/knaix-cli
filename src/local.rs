@@ -28,6 +28,13 @@ const CONTAINER: &str = "knaix-local";
 const VOLUME: &str = "knaix-local-data";
 const DEFAULT_PORT: u16 = 8080;
 
+/// How long a served model may spend on one answer before the node gives up.
+/// Sized for a reasoning model on consumer hardware, which reaches the first
+/// word of the answer only after a long silent stretch of thinking. Generous
+/// on purpose: a wait the spinner is counting out is a far smaller failure
+/// than a working setup that cannot answer at all.
+const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 180;
+
 /// Published image. Overridable so a developer can run the tag they just built
 /// rather than the released one.
 fn image() -> String {
@@ -697,19 +704,21 @@ pub async fn up(
     }
 
     // The node's own default is a minute, which a large or reasoning model on
-    // consumer hardware passes routinely. Left unset otherwise, so the node
-    // keeps deciding.
+    // consumer hardware passes routinely: a reasoning model spends most of its
+    // output budget thinking before the first word of the answer, and a minute
+    // is not enough to reach it. Leaving the node to decide meant a model the
+    // picker itself offered timed out on every question. Only the mock runs
+    // without one, and it has nothing to wait for.
     //
     // Saturating, though the flag is already bounded: a release build does not
     // check overflow, so a plain multiply turns a request for a long timeout
     // into a sub-second one without saying anything. State files are edited by
     // hand, so the bound at the flag is not the only way a value arrives here.
-    if let Some(secs) = launch.generation_timeout_secs {
+    if let Some(ms) =
+        generation_timeout_ms(launch.model_url.as_deref(), launch.generation_timeout_secs)
+    {
         args.push("-e".into());
-        args.push(format!(
-            "GENERATION_TIMEOUT_MS={}",
-            secs.saturating_mul(1000)
-        ));
+        args.push(format!("GENERATION_TIMEOUT_MS={ms}"));
     }
 
     // The node clamps every answer to its own ceiling, and its default is the
@@ -929,6 +938,10 @@ pub async fn setup() -> Result<()> {
         return offer_start_or_restart(&node).await;
     }
 
+    // Set where the server is known not to be running: the choice was already
+    // confirmed once on that basis, and asking a model there to answer can only
+    // fail for the reason already accepted.
+    let mut server_absent = false;
     let (url, models) = if pick == manual_idx {
         let raw: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Server URL (the base, e.g. http://192.168.1.50:11434)")
@@ -949,6 +962,7 @@ pub async fn setup() -> Result<()> {
                     println!("{} Nothing changed.", "Info:".blue());
                     return Ok(());
                 }
+                server_absent = true;
                 (url, Vec::new())
             }
         }
@@ -956,6 +970,25 @@ pub async fn setup() -> Result<()> {
         let s = &found[pick];
         (s.url.clone(), s.models.clone())
     };
+
+    // A server can list a model it cannot run from here. Offering one is how a
+    // first run ends with every question failing, so they are named and set
+    // aside rather than mixed into the choices.
+    let (models, hosted): (Vec<_>, Vec<_>) = models.into_iter().partition(|m| m.local);
+    if !hosted.is_empty() {
+        println!(
+            "{} Not offered, hosted elsewhere rather than pulled here: {}.",
+            "Info:".blue(),
+            hosted
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let total_memory = crate::hardware::total_memory();
+    let models = order_by_fit(models, total_memory);
 
     let model = match models.len() {
         0 => {
@@ -971,19 +1004,27 @@ pub async fn setup() -> Result<()> {
             }
         }
         1 => {
-            println!("{} One model hosted: {}.", "Info:".blue(), models[0].cyan());
-            Some(models[0].clone())
+            println!(
+                "{} One model to run: {}.",
+                "Info:".blue(),
+                describe_model(&models[0], total_memory).cyan()
+            );
+            Some(models[0].id.clone())
         }
         _ => {
             let current = saved
                 .as_ref()
                 .and_then(|n| n.model.as_deref())
-                .and_then(|m| models.iter().position(|x| x == m))
+                .and_then(|m| models.iter().position(|x| x.id == m))
                 .unwrap_or(0);
+            let items: Vec<String> = models
+                .iter()
+                .map(|m| describe_model(m, total_memory))
+                .collect();
             let _ = execute!(std::io::stderr(), cursor::Hide);
             let choice = FuzzySelect::with_theme(&ColorfulTheme::default())
                 .with_prompt("Which model?")
-                .items(&models)
+                .items(&items)
                 .default(current)
                 .interact_opt()
                 .unwrap_or(None);
@@ -992,9 +1033,58 @@ pub async fn setup() -> Result<()> {
                 println!("{} Nothing changed.", "Info:".blue());
                 return Ok(());
             };
-            Some(models[i].clone())
+            Some(models[i].id.clone())
         }
     };
+
+    // Picking one anyway is allowed -- it is their machine -- but it should not
+    // be a surprise later, when the only symptom is an answer that never
+    // arrives.
+    if let Some(chosen) = model
+        .as_deref()
+        .and_then(|id| models.iter().find(|m| m.id == id))
+    {
+        let fit = crate::hardware::fit(chosen.size_bytes, total_memory);
+        if fit.is_discouraged() {
+            println!(
+                "\n{} {} is {}, and this machine has {}. It will swap to disk, and\n  answers will be slow or will not arrive. A smaller model will serve better.",
+                "Warning:".yellow(),
+                chosen.id.cyan(),
+                crate::hardware::human_size(chosen.size_bytes.unwrap_or(0)),
+                crate::hardware::human_size(total_memory)
+            );
+        }
+    }
+
+    // Ask for one token before saving. A model that cannot answer is worth
+    // finding here, where there is still a picker to go back to, rather than
+    // at the first question.
+    let verdict = if server_absent {
+        crate::model_server::GenerationCheck::Works
+    } else {
+        println!("{} Checking that it answers...", "Info:".blue());
+        crate::model_server::check_generation(
+            &url,
+            model.as_deref(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    };
+    if let crate::model_server::GenerationCheck::Failed(why) = verdict {
+        println!("\n{} That model did not answer: {}", "✗".red(), why);
+        let keep = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Remember it anyway?")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !keep {
+            println!(
+                "{} Nothing changed. Run setup again to pick another.",
+                "Info:".blue()
+            );
+            return Ok(());
+        }
+    }
 
     let node = remember_choice(saved, Some(url.clone()), model.clone())?;
     match &model {
@@ -1007,6 +1097,60 @@ pub async fn setup() -> Result<()> {
         None => println!("\n{} The model at {} will answer.", "✓".green(), url.cyan()),
     }
     offer_start_or_restart(&node).await
+}
+
+/// How long the node may spend on one answer, in milliseconds, or None to let
+/// the node keep its own default.
+fn generation_timeout_ms(model_url: Option<&str>, explicit_secs: Option<u64>) -> Option<u64> {
+    // The mock answers instantly and has nothing to wait for; a served model is
+    // the only case where the node's own minute is too short to reach the first
+    // word of a reasoning model's answer.
+    let secs = match (model_url, explicit_secs) {
+        (_, Some(secs)) => secs,
+        (Some(_), None) => DEFAULT_GENERATION_TIMEOUT_SECS,
+        (None, None) => return None,
+    };
+    Some(secs.saturating_mul(1000))
+}
+
+/// Models with the ones this machine runs well first, and the ones it cannot
+/// hold last. Order within a band is left as the server gave it, which for
+/// Ollama is most recently pulled first.
+fn order_by_fit(
+    models: Vec<crate::model_server::ModelInfo>,
+    total_memory: u64,
+) -> Vec<crate::model_server::ModelInfo> {
+    use crate::hardware::Fit;
+    let rank =
+        |m: &crate::model_server::ModelInfo| match crate::hardware::fit(m.size_bytes, total_memory)
+        {
+            Fit::Comfortable => 0,
+            // An unmeasured model is not demoted: nothing is known about it, and
+            // most servers report no size at all.
+            Fit::Unknown => 1,
+            Fit::Tight => 2,
+            Fit::TooLarge => 3,
+        };
+    let mut models = models;
+    models.sort_by_key(rank);
+    models
+}
+
+/// One line in the picker: the name, how big it is, and whether it fits.
+fn describe_model(model: &crate::model_server::ModelInfo, total_memory: u64) -> String {
+    let fit = crate::hardware::fit(model.size_bytes, total_memory);
+    match (model.size_bytes, fit.note()) {
+        (Some(bytes), note) if !note.is_empty() => {
+            format!(
+                "{}  ({}, {})",
+                model.id,
+                crate::hardware::human_size(bytes),
+                note
+            )
+        }
+        (Some(bytes), _) => format!("{}  ({})", model.id, crate::hardware::human_size(bytes)),
+        (None, _) => model.id.clone(),
+    }
 }
 
 /// Record the choice, creating state if the node has never been started.
@@ -1184,12 +1328,23 @@ const WARM_TOKENS: u32 = 8;
 /// Best effort throughout. The node is already serving by this point, so a
 /// warm-up that fails, times out, or hits a node with no model runtime is not a
 /// reason to fail `up`; it only means the saving is not collected.
-async fn warm(node: &LocalNode) -> bool {
+/// How a warm-up ended. A model that refused is worth telling apart from one
+/// that was merely slow: the first is a setup that will never answer, and
+/// reporting it as slowness is what let a broken model look like a warm cache.
+enum Warmth {
+    Warmed,
+    /// The node answered, but generation did not. Carries the node's own words.
+    Refused(String),
+    /// No verdict: too slow, or the node could not be reached.
+    Unknown,
+}
+
+async fn warm(node: &LocalNode) -> Warmth {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(WARM_TIMEOUT_SECS))
         .build()
     else {
-        return false;
+        return Warmth::Unknown;
     };
     let body = serde_json::json!({
         "instance_id": node.instance_id,
@@ -1207,14 +1362,38 @@ async fn warm(node: &LocalNode) -> bool {
         // three cold starts to land on the first question after all.
         "policy": { "k": crate::nodes::DEFAULT_K, "rerank": true },
     });
-    matches!(
-        client
-            .post(format!("{}/api/query/answer", node.base_url()))
-            .json(&body)
-            .send()
-            .await,
-        Ok(resp) if resp.status().is_success()
-    )
+    let resp = client
+        .post(format!("{}/api/query/answer", node.base_url()))
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => Warmth::Warmed,
+        // The node fails closed on generation and says why. A 5xx here is the
+        // model refusing, not the node being slow to wake.
+        Ok(r) if r.status().is_server_error() => {
+            let detail = r
+                .text()
+                .await
+                .ok()
+                .and_then(|b| generation_error_message(&b))
+                .unwrap_or_else(|| "the model did not answer".to_string());
+            Warmth::Refused(detail)
+        }
+        _ => Warmth::Unknown,
+    }
+}
+
+/// The message out of the node's generation error body.
+fn generation_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = v
+        .get("message")
+        .or_else(|| v.get("error"))
+        .and_then(|m| m.as_str())?
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Warm the node and say how long it took, or say nothing at all.
@@ -1247,17 +1426,30 @@ async fn warm_up(node: &LocalNode) {
         }
     };
 
-    if warmed {
-        println!(" ({:.1}s)", started.elapsed().as_secs_f64());
-    } else {
+    match warmed {
+        Warmth::Warmed => println!(" ({:.1}s)", started.elapsed().as_secs_f64()),
+        // Not slowness. Every question will fail the same way, so say that here
+        // rather than letting the first one deliver the news.
+        Warmth::Refused(why) => {
+            println!();
+            println!(
+                "\n{} The model did not answer: {}",
+                "Warning:".yellow(),
+                why
+            );
+            println!(
+                "  Questions will fail until this is fixed. {} picks another model.",
+                "knaix local setup".cyan()
+            );
+        }
         // Said, not silent. The node is fine and the only cost is that the
         // first question pays what this was meant to absorb -- but printing
         // nothing meant a warm-up that never worked looked identical to one
         // that did, which is how this stayed hidden.
-        println!(
+        Warmth::Unknown => println!(
             " {}",
             "skipped; the first question will be slower.".dimmed()
-        );
+        ),
     }
 }
 
@@ -2159,5 +2351,118 @@ mod tests {
     fn the_image_can_be_overridden_for_local_builds() {
         // Default points at the published image; developers run their own tag.
         assert!(image().contains("node-runtime") || !image().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_from_the_node_is_quoted_back() {
+        // The node fails closed on generation and says why; that sentence is
+        // the only thing that tells a broken model from a slow one.
+        assert_eq!(
+            generation_error_message(
+                r#"{"message":"The local model runtime is not reachable.","code":"generation_unavailable"}"#
+            )
+            .unwrap(),
+            "The local model runtime is not reachable."
+        );
+        assert_eq!(
+            generation_error_message(r#"{"error":"Local generation failed."}"#).unwrap(),
+            "Local generation failed."
+        );
+        assert!(generation_error_message("<html>502</html>").is_none());
+        assert!(generation_error_message(r#"{"message":"   "}"#).is_none());
+    }
+
+    #[test]
+    fn a_served_model_always_gets_a_timeout_long_enough_to_reason() {
+        // The node's own default is a minute, and the picker offers models that
+        // routinely need longer to reach the first word. Left unset, those
+        // timed out on every question.
+        assert_eq!(
+            generation_timeout_ms(Some("http://localhost:11434"), None),
+            Some(DEFAULT_GENERATION_TIMEOUT_SECS * 1000)
+        );
+        // The whole point of the default. Enforced at compile time so lowering
+        // it back under the node's own minute cannot build.
+        const { assert!(DEFAULT_GENERATION_TIMEOUT_SECS * 1000 > 60_000) };
+    }
+
+    #[test]
+    fn an_explicit_timeout_still_wins_and_the_mock_needs_none() {
+        assert_eq!(
+            generation_timeout_ms(Some("http://localhost:11434"), Some(30)),
+            Some(30_000)
+        );
+        // No model server means the mock, which answers from the chunks it
+        // already retrieved and has nothing to wait for.
+        assert_eq!(generation_timeout_ms(None, None), None);
+        // A value from a hand-edited state file is honoured whichever it is.
+        assert_eq!(generation_timeout_ms(None, Some(45)), Some(45_000));
+    }
+
+    #[test]
+    fn an_absurd_timeout_cannot_wrap_into_a_short_one() {
+        // Release builds do not check overflow, so a plain multiply turns a
+        // request for a long timeout into a sub-second one in silence.
+        assert_eq!(
+            generation_timeout_ms(Some("http://x"), Some(u64::MAX)),
+            Some(u64::MAX)
+        );
+    }
+
+    fn model(id: &str, gb: Option<u64>) -> crate::model_server::ModelInfo {
+        crate::model_server::ModelInfo {
+            id: id.to_string(),
+            size_bytes: gb.map(|g| g * (1 << 30)),
+            local: true,
+        }
+    }
+
+    #[test]
+    fn the_picker_leads_with_what_this_machine_runs_well() {
+        let total = 16 * (1 << 30);
+        let ordered = order_by_fit(
+            vec![
+                model("huge", Some(30)),
+                model("tight", Some(10)),
+                model("small", Some(4)),
+            ],
+            total,
+        );
+        let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["small", "tight", "huge"]);
+    }
+
+    #[test]
+    fn an_unmeasured_model_keeps_its_place_near_the_front() {
+        // Most servers report no size. Sinking them below models known to be a
+        // poor fit would bury the only choice a non-Ollama user has.
+        let total = 16 * (1 << 30);
+        let ordered = order_by_fit(
+            vec![model("huge", Some(30)), model("unmeasured", None)],
+            total,
+        );
+        assert_eq!(ordered[0].id, "unmeasured");
+    }
+
+    #[test]
+    fn a_model_line_carries_its_size_and_whether_it_fits() {
+        let total = 16 * (1 << 30);
+        assert_eq!(
+            describe_model(&model("small", Some(4)), total),
+            "small  (4.0 GB, fits comfortably)"
+        );
+        assert_eq!(
+            describe_model(&model("huge", Some(30)), total),
+            "huge  (30.0 GB, larger than this machine can hold)"
+        );
+        // Nothing is claimed about a model the server never measured.
+        assert_eq!(describe_model(&model("plain", None), total), "plain");
+    }
+
+    #[test]
+    fn without_a_memory_reading_no_model_is_judged() {
+        // total_memory() returning 0 means the probe failed. Every model is
+        // then offered plainly rather than all of them being called too large.
+        assert_eq!(describe_model(&model("any", Some(30)), 0), "any  (30.0 GB)");
     }
 }
