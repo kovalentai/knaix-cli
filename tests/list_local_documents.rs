@@ -550,3 +550,102 @@ fn other_commands_keep_the_full_note() {
         );
     }
 }
+
+/// A knowledge base means little without the node holding it. The table used to
+/// print alone, and the node it came from -- and what was answering on it -- was
+/// a separate command away.
+#[test]
+fn the_listing_names_the_node_it_came_from() {
+    let home = scratch_home("summary");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "-n", "local"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exited {:?}", out.status.code());
+    // The node, and the totals the table would otherwise have to be added up by
+    // hand to get.
+    for expected in ["local", "2 documents", "15 chunks"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+}
+
+/// The local node is a node. Listing nodes answered "not logged in" on a machine
+/// that had one running, which is an account problem reported in place of an
+/// answer that needed no account.
+#[test]
+fn listing_nodes_without_a_session_still_reports_the_local_one() {
+    let home = scratch_home("nodeslocal");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("local"), "no local node listed: {stdout}");
+    // Said, not silently omitted: hosted nodes are missing for a reason the
+    // user can act on.
+    assert!(
+        stdout.contains("login"),
+        "no word on why hosted nodes are absent: {stdout}"
+    );
+}
+
+/// `-o json` is an interface. The no-session path is the one that prints
+/// something extra, and printing a table there would hand a script the one
+/// shape it cannot read.
+#[test]
+fn listing_nodes_as_json_without_a_session_stays_machine_readable() {
+    let home = scratch_home("nodesjson");
+    record_local_node(&home, serve_node(TWO_DOCUMENTS));
+
+    let out = knaix(&home)
+        .args(["-o", "json", "list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+    let nodes = parsed.as_array().expect("nodes should be an array");
+    assert_eq!(nodes.len(), 1, "expected only the local node: {stdout}");
+    assert_eq!(nodes[0]["name"], "local");
+    assert_eq!(nodes[0]["local"], true);
+}
+
+/// The account error is still the right answer where there is no local node to
+/// report instead. Swallowing it would leave a machine with nothing set up
+/// looking like a machine with nothing to show.
+#[test]
+fn listing_nodes_without_a_session_or_a_local_node_is_still_an_auth_error() {
+    let home = scratch_home("nodesneither");
+    let dir = home.join(".knaix");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{"api_url":"http://127.0.0.1:9"}"#,
+    )
+    .unwrap();
+
+    let out = knaix(&home)
+        .args(["list", "--nodes"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(3), "expected the auth code");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("login"),
+        "the remedy should still be named"
+    );
+}

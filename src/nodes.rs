@@ -810,6 +810,7 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
         "\n{}",
         "Knowledge Base for the local node:".bold().underline()
     );
+    print_local_node_summary(&documents);
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
@@ -827,6 +828,116 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
     Ok(())
 }
 
+/// The node the listing came from, above the listing itself.
+///
+/// A knowledge base is only meaningful next to the node holding it: the same
+/// table printed with the node unnamed left people running `local status`
+/// afterwards to find out which node, and what was answering, they had just
+/// listed.
+fn print_local_node_summary(documents: &[NodeDocument]) {
+    let node = crate::local::load();
+    let summary = crate::local::summarize();
+    let chunks: u64 = documents.iter().map(|d| d.chunks.unwrap_or(0)).sum();
+
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.yellow(),
+    };
+    let where_ = summary
+        .url
+        .or_else(|| node.as_ref().map(|n| n.base_url()))
+        .unwrap_or_else(|| "not started".to_string());
+
+    println!("  {}  {}  {}", "local".bold(), state, where_.dimmed());
+    println!(
+        "  {}",
+        format!(
+            "{} {}, {} {}, answered by {}",
+            documents.len(),
+            plural(documents.len(), "document", "documents"),
+            chunks,
+            plural(chunks as usize, "chunk", "chunks"),
+            answering(node.as_ref())
+        )
+        .dimmed()
+    );
+    println!();
+}
+
+/// What the node answers with, in the words `local status` uses.
+fn answering(node: Option<&crate::local::LocalNode>) -> String {
+    match node {
+        Some(n) => match (&n.model, &n.model_url) {
+            (Some(model), Some(url)) => format!("{model} at {url}"),
+            (None, Some(url)) => format!("the model at {url}"),
+            _ => "the deterministic mock".to_string(),
+        },
+        None => "the deterministic mock".to_string(),
+    }
+}
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// The local node as a row in the nodes table, or None where this machine has
+/// never started one.
+///
+/// A node that was started and then stopped is still a node, so the row is
+/// built from the saved state rather than from the container being up.
+fn local_node_row() -> Option<Vec<String>> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    let state = match summary.state.as_str() {
+        "running" => "running".green(),
+        "none" => "not started".yellow(),
+        other => other.to_string().yellow(),
+    };
+    Some(vec![
+        crate::local::LOCAL_NODE_ID.bold().white().to_string(),
+        node.instance_id.cyan().to_string(),
+        state.to_string(),
+        node.base_url().blue().to_string(),
+        "LOCAL".green().to_string(),
+        match &node.model {
+            Some(m) => m.clone().magenta().to_string(),
+            None => "mock".magenta().to_string(),
+        },
+    ])
+}
+
+/// The same row as `-o json`, in the shape the control plane uses for a node.
+fn local_node_json() -> Option<serde_json::Value> {
+    let node = crate::local::load()?;
+    let summary = crate::local::summarize();
+    Some(serde_json::json!({
+        "name": crate::local::LOCAL_NODE_ID,
+        "instanceId": node.instance_id,
+        "state": if summary.state == "none" { "stopped" } else { &summary.state },
+        "privateIp": null,
+        "url": node.base_url(),
+        "local": true,
+        "model": node.model,
+    }))
+}
+
+fn print_node_table(rows: Vec<Vec<String>>) {
+    println!("\n{}", "Your Kovalent Nodes:".bold().underline());
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
+    for row in rows {
+        table.add_row(row);
+    }
+    println!("{table}\n");
+}
+
 pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()> {
     // Answered before the token is read, because neither a session nor the
     // control plane has anything to do with it. Reaching for them first is what
@@ -835,9 +946,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return list_local_documents(ctx).await;
     }
 
-    let token = ctx.get_token()?;
-
     if let Some(nid) = node_id {
+        let token = ctx.get_token()?;
         // The knowledge base of one node. Resolve first: the route is keyed by
         // the instance UUID, but users pass whatever `knaix list` showed them.
         let uuid = resolve_node_uuid(ctx, nid).await?;
@@ -897,6 +1007,39 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return Ok(());
     }
 
+    // A local node is a node, and listing nodes used to answer "not logged in"
+    // on a machine that had one running and nothing else wrong. An account is
+    // what hosted nodes need, not what makes the question answerable, so the
+    // local node is reported either way and the session decides only whether
+    // hosted ones join it.
+    let local = local_node_row();
+    let token = match ctx.get_token() {
+        Ok(token) => token,
+        Err(no_session) => {
+            if local.is_none() {
+                return Err(no_session);
+            }
+            // Still the machine-readable shape: a script listing nodes on a
+            // machine with no session gets an array with the local node in it,
+            // not a table it cannot parse.
+            if ctx.output_format == "json" {
+                let all: Vec<serde_json::Value> = local_node_json().into_iter().collect();
+                println!("{}", serde_json::to_string_pretty(&all).unwrap_or_default());
+                return Ok(());
+            }
+            print_node_table(local.into_iter().collect());
+            println!(
+                "  {}",
+                format!(
+                    "Hosted nodes are not listed: no session on this machine. {} signs in.",
+                    crate::brand::cmd("login")
+                )
+                .dimmed()
+            );
+            return Ok(());
+        }
+    };
+
     // List Nodes (default behavior)
     let url = format!("{}/api/instances", ctx.config.api_url);
 
@@ -913,14 +1056,22 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         let nodes_val = &wrapper["data"];
 
         if ctx.output_format == "json" {
-            let json_data = serde_json::to_string_pretty(nodes_val).unwrap_or_default();
-            println!("{}", json_data);
+            // The local node joins the hosted ones here too. A script asking
+            // what nodes exist gets the same answer the table shows.
+            let mut all = nodes_val.as_array().cloned().unwrap_or_default();
+            if let Some(local) = local_node_json() {
+                all.insert(0, local);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(all)).unwrap_or_default()
+            );
             return Ok(());
         }
 
         let nodes: Vec<Node> = serde_json::from_value(nodes_val.clone()).unwrap_or_default();
 
-        if nodes.is_empty() {
+        if nodes.is_empty() && local.is_none() {
             println!(
                 "{} No hosted nodes yet. {} provisions one on your account; {} runs one on this machine with no account.",
                 "Info:".blue(),
@@ -928,12 +1079,12 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                 crate::brand::cmd("local up")
             );
         } else {
-            println!("\n{}", "Your Kovalent Nodes:".bold().underline());
-            let mut table = comfy_table::Table::new();
-            table.load_preset(comfy_table::presets::UTF8_FULL);
-            table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
-            table.set_header(vec!["Name", "ID", "State", "IP", "Type", "Model"]);
-
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            // First, because it is the one on the machine the command is being
+            // run from.
+            if let Some(local) = local {
+                rows.push(local);
+            }
             for node in nodes {
                 let status = if node.state == "running" {
                     node.state.green()
@@ -959,7 +1110,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     .unwrap_or_else(|| "Standard".to_string())
                     .magenta();
 
-                table.add_row(vec![
+                rows.push(vec![
                     node.name.bold().white().to_string(),
                     id_display.cyan().to_string(),
                     status.to_string(),
@@ -968,7 +1119,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
                     model.to_string(),
                 ]);
             }
-            println!("{table}\n");
+            print_node_table(rows);
         }
     } else {
         return Err(anyhow!("Failed to fetch nodes: HTTP {}", resp.status()))
