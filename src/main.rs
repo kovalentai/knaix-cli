@@ -192,9 +192,34 @@ enum Commands {
         #[clap(long)]
         all: bool,
 
+        /// Replace what is already filed under the same name, instead of
+        /// adding a second copy of it
+        #[clap(long)]
+        replace: bool,
+
         /// List what would be ingested without sending anything
         #[clap(long)]
         dry_run: bool,
+    },
+
+    /// Remove a document from a node's knowledge base
+    ///
+    /// Takes the name shown by 'knaix ls', or a document id. A name that was
+    /// ingested more than once picks out every copy, and the count is stated
+    /// before anything is removed.
+    #[clap(alias = "remove")]
+    Rm {
+        /// The node to remove from (falls back to the default)
+        #[clap(short = 'n', long = "node-id")]
+        node_id: Option<String>,
+
+        /// The document to remove, by name or id
+        #[clap(name = "DOCUMENT")]
+        document: String,
+
+        /// Skip the confirmation prompt
+        #[clap(long)]
+        yes: bool,
     },
 
     /// Show who is logged in, the default node, and the local node's state
@@ -919,6 +944,7 @@ async fn run() -> Result<()> {
             include,
             exclude,
             all,
+            replace,
             dry_run,
         } => {
             let node_id = project_node(node_id, project.as_ref());
@@ -941,6 +967,7 @@ async fn run() -> Result<()> {
                     let bytes = stdin_arg::read_bytes("the document")?;
                     let staged = stdin_arg::TempFile::write(&checked, &bytes)?;
                     if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
+                        nodes::replace_if_asked(&ctx, &target, &checked, replace).await?;
                         nodes::upload_single_file(&ctx, &target, staged.path(), &checked).await?;
                     }
                 }
@@ -953,7 +980,7 @@ async fn run() -> Result<()> {
                 if dry_run {
                     nodes::report_plan(&plan, &file_path);
                 } else if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                    nodes::upload(&ctx, &target, &file_path, plan).await?;
+                    nodes::upload(&ctx, &target, &file_path, plan, replace).await?;
                 }
             }
         }
@@ -991,6 +1018,16 @@ async fn run() -> Result<()> {
                     "  No node recorded. Set one with {}, or edit the file.",
                     brand::cmd("init --node-id <NODE>").as_str()
                 )),
+            }
+        }
+        Commands::Rm {
+            node_id,
+            document,
+            yes,
+        } => {
+            let node_id = project_node(node_id, project.as_ref());
+            if let Some(target) = nodes::resolve_target(&ctx, node_id).await? {
+                nodes::remove_document(&ctx, &target, &document, yes).await?;
             }
         }
         Commands::Status => {

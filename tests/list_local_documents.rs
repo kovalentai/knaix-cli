@@ -721,3 +721,146 @@ fn the_table_lists_the_local_node_last_too() {
     let local = stdout.rfind("local").expect("local node missing");
     assert!(hosted < local, "local should come last: {stdout}");
 }
+
+const TWO_COPIES: &str = r#"{"documents":[
+  {"document_id":"new-copy","source":"Policy.md","chunks":2,"created_at":"2026-08-06T03:03:56.140Z"},
+  {"document_id":"old-copy","source":"Policy.md","chunks":3,"created_at":"2026-08-01T00:00:00.000Z"},
+  {"document_id":"other","source":"Handbook.md","chunks":9,"created_at":"2026-08-05T00:45:03.286Z"}
+]}"#;
+
+/// Ingest mints a fresh id every time and only collapses byte-identical chunks,
+/// so an edited file lands as a second document under the same name. Removing
+/// by name has to take every copy, or the superseded text stays retrievable.
+#[test]
+fn removing_by_name_takes_every_copy_filed_under_it() {
+    let home = scratch_home("rmcopies");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exited {:?}: {stdout}",
+        out.status.code()
+    );
+    assert!(stdout.contains("Removed 2 documents"), "{stdout}");
+
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        bodies.contains("new-copy"),
+        "the newer copy was left: {bodies}"
+    );
+    assert!(
+        bodies.contains("old-copy"),
+        "the superseded copy was left: {bodies}"
+    );
+    // The document that shares no name with it must not be touched.
+    assert!(
+        !bodies.contains("\"other\""),
+        "an unrelated document was deleted: {bodies}"
+    );
+}
+
+/// The whole store is one flag away on the node's delete route, so the command
+/// that removes one document must never reach for it.
+#[test]
+fn removing_a_document_never_asks_to_erase_everything() {
+    let home = scratch_home("rmnowipe");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("\"all\""),
+        "a document removal carried the erase-everything flag: {bodies}"
+    );
+}
+
+/// A script that forgot --yes must not have documents removed, and must be able
+/// to tell that refusal from a crash.
+#[test]
+fn removing_without_confirmation_is_refused_and_deletes_nothing() {
+    let home = scratch_home("rmdenied");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Policy.md"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(6), "expected the denied code");
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("kb/delete"),
+        "a refused removal still deleted: {bodies}"
+    );
+}
+
+/// Naming something that is not there is not found, not a generic failure: a
+/// script can tell a typo from a node that would not answer.
+#[test]
+fn removing_a_document_that_is_not_there_is_not_found() {
+    let home = scratch_home("rmmissing");
+    record_local_node(&home, serve_node(TWO_COPIES));
+
+    let out = knaix(&home)
+        .args(["rm", "-n", "local", "Nothing.md", "--yes"])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(5), "expected not-found");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Nothing.md"));
+}
+
+/// Re-ingesting without --replace leaves the old copy in place, so it says so.
+/// Silence is what let a corpus fill with superseded versions of one file.
+#[test]
+fn re_ingesting_a_known_name_warns_that_it_adds_a_copy() {
+    let home = scratch_home("uploadwarn");
+    record_local_node(&home, serve_node(TWO_COPIES));
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nRefunds in 7 days.\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already ingested") && stdout.contains("--replace"),
+        "no word that this adds a copy: {stdout}"
+    );
+}
+
+/// And with --replace, what was there is removed before the new text lands.
+#[test]
+fn replacing_removes_what_was_filed_under_the_name_first() {
+    let home = scratch_home("uploadreplace");
+    let (port, seen) = serve_node_recording(TWO_COPIES);
+    record_local_node(&home, port);
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nRefunds same day.\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", "--replace", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("replacing 2 copies"), "{stdout}");
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(bodies.contains("new-copy") && bodies.contains("old-copy"));
+}
