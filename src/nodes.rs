@@ -793,74 +793,84 @@ pub fn documents_named<'a>(documents: &'a [Document], wanted: &str) -> Vec<&'a D
         .collect()
 }
 
-/// Clear the way for a document about to be ingested under `name`.
+/// What is already filed under `name`, for removing once the new copy lands.
 ///
-/// Ingest mints a fresh document id every time, and chunks only collapse where
-/// their content is byte-identical. So re-ingesting a file that has been edited
-/// files a second document under the same name, and answers are then grounded
-/// in both the old text and the new. Replacing removes what was there first.
-///
-/// Returns how many were removed, for the caller to report.
-pub async fn replace_if_asked(
+/// Ingest first and delete after. Deleting first turned a refused ingest into a
+/// lost document: the old copy was gone, the new one never arrived, and the
+/// command that was meant to update it had destroyed it.
+pub async fn superseded_by(
     ctx: &KnaixContext,
     target: &Target,
     name: &str,
     replace: bool,
-) -> Result<usize> {
+) -> Vec<String> {
     if !replace {
-        return Ok(0);
+        if already_filed(ctx, target, name).await > 0 {
+            ctx.info(&format!(
+                "  {} {} is already ingested. This adds another copy; {} updates it instead.",
+                "Warning:".yellow(),
+                name,
+                "--replace".cyan()
+            ));
+        }
+        return Vec::new();
     }
-    let documents = documents_of(ctx, target).await?;
-    let existing = documents_named(&documents, name);
-    let mut removed = 0;
-    for d in existing {
-        delete_document(ctx, target, &d.id).await?;
-        removed += 1;
+    match documents_of(ctx, target).await {
+        Ok(documents) => documents_named(&documents, name)
+            .into_iter()
+            .map(|d| d.id.clone())
+            .collect(),
+        // Nothing to supersede that we can name; the ingest still goes ahead.
+        Err(_) => Vec::new(),
     }
-    Ok(removed)
 }
 
-/// Replace what a name already holds, or say what re-ingesting is about to do.
+/// Remove what the new copy replaced, now it is safely in.
 ///
-/// Silence here is what let a corpus fill with superseded copies of the same
-/// file without anything saying so.
-async fn report_replacement(ctx: &KnaixContext, target: &Target, name: &str, replace: bool) {
-    if replace {
-        match replace_if_asked(ctx, target, name, true).await {
-            Ok(0) | Err(_) => {}
-            Ok(n) => ctx.info(&format!(
-                "  {} replacing {} already filed under {}",
-                "↻".cyan(),
-                plural_count(n, "copy", "copies"),
-                name
-            )),
-        }
+/// A failure here leaves a duplicate rather than a hole, which is the side to
+/// fail on, so it is reported and not raised.
+pub async fn remove_superseded(ctx: &KnaixContext, target: &Target, ids: &[String], name: &str) {
+    if ids.is_empty() {
         return;
     }
-    if already_filed(ctx, target, name).await > 0 {
+    let mut removed = 0;
+    for id in ids {
+        if delete_document(ctx, target, id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
         ctx.info(&format!(
-            "  {} {} is already ingested. This adds another copy; {} updates it instead.",
-            "Warning:".yellow(),
-            name,
-            "--replace".cyan()
+            "  {} replaced {} already filed under {}",
+            "↻".cyan(),
+            plural_count(removed, "copy", "copies"),
+            name
         ));
+    }
+    if removed < ids.len() {
+        ctx.info(&format!(
+            "  {} {} older {} of {} could not be removed and is still there.",
+            "Warning:".yellow(),
+            ids.len() - removed,
+            plural(ids.len() - removed, "copy", "copies"),
+            name
+        ));
+    }
+}
+
+/// How many documents are already filed under a name.
+async fn already_filed(ctx: &KnaixContext, target: &Target, name: &str) -> usize {
+    match documents_of(ctx, target).await {
+        Ok(documents) => documents_named(&documents, name).len(),
+        // Only decides whether to warn, so a failed listing is not worth
+        // failing the ingest over.
+        Err(_) => 0,
     }
 }
 
 /// "1 copy" / "2 copies", where the number is worth showing.
 fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
-}
-
-/// What is already filed under a name, for the warning that re-ingesting adds
-/// to it rather than replacing it.
-async fn already_filed(ctx: &KnaixContext, target: &Target, name: &str) -> usize {
-    match documents_of(ctx, target).await {
-        Ok(documents) => documents_named(&documents, name).len(),
-        // Only used to decide whether to warn, so a listing that failed is not
-        // worth failing the ingest over.
-        Err(_) => 0,
-    }
 }
 
 /// Remove a document from a node's knowledge base, by name or by id.
@@ -2831,10 +2841,12 @@ pub async fn upload(
     } = plan;
 
     if let Some(file_name) = single_file {
-        report_replacement(ctx, target, &file_name, replace).await;
-        return upload_single_file(ctx, target, base_path, &file_name)
-            .await
-            .map(|_| ());
+        let superseded = superseded_by(ctx, target, &file_name, replace).await;
+        let ingested = upload_single_file(ctx, target, base_path, &file_name).await;
+        if ingested.is_ok() {
+            remove_superseded(ctx, target, &superseded, &file_name).await;
+        }
+        return ingested.map(|_| ());
     }
 
     if queue.is_empty() {
@@ -2860,9 +2872,10 @@ pub async fn upload(
         // One bad file must not abandon the rest: a partial ingest that stops
         // wherever it happened to fail is worse than a complete one with a
         // named failure, because nothing says how far it got.
-        report_replacement(ctx, target, &file_name, replace).await;
+        let superseded = superseded_by(ctx, target, &file_name, replace).await;
         match upload_single_file(ctx, target, path, &file_name).await {
             Ok(chunks) => {
+                remove_superseded(ctx, target, &superseded, &file_name).await;
                 summary.ingested += 1;
                 summary.chunks += chunks;
             }

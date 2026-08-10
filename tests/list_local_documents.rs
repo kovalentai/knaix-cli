@@ -845,9 +845,10 @@ fn re_ingesting_a_known_name_warns_that_it_adds_a_copy() {
     );
 }
 
-/// And with --replace, what was there is removed before the new text lands.
+/// And with --replace, what was there is removed once the new text has landed.
+/// The order is the guarantee: ingest first, so a refusal costs nothing.
 #[test]
-fn replacing_removes_what_was_filed_under_the_name_first() {
+fn replacing_removes_what_was_filed_under_the_name_after_the_new_copy_lands() {
     let home = scratch_home("uploadreplace");
     let (port, seen) = serve_node_recording(TWO_COPIES);
     record_local_node(&home, port);
@@ -860,7 +861,73 @@ fn replacing_removes_what_was_filed_under_the_name_first() {
         .expect("failed to run knaix");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("replacing 2 copies"), "{stdout}");
-    let bodies = seen.lock().unwrap().join("\n");
+    assert!(stdout.contains("replaced 2 copies"), "{stdout}");
+
+    let requests = seen.lock().unwrap().clone();
+    let ingest = requests.iter().position(|r| r.contains("/api/kb/ingest"));
+    let delete = requests.iter().position(|r| r.contains("/api/kb/delete"));
+    assert!(ingest.is_some() && delete.is_some(), "expected both calls");
+    assert!(
+        ingest < delete,
+        "the old copies were deleted before the new one landed"
+    );
+    let bodies = requests.join("\n");
     assert!(bodies.contains("new-copy") && bodies.contains("old-copy"));
+}
+
+/// A node that lists documents but refuses every ingest, recording what it was
+/// asked. Enough to prove what a failed upload did and did not delete.
+fn serve_refusing_ingest(listing: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let refuse = request.contains("/api/kb/ingest");
+            record.lock().unwrap().push(request);
+            let body = if refuse {
+                r#"{"error":"The document contained no readable text."}"#
+            } else {
+                listing
+            };
+            let status = if refuse { "400 Bad Request" } else { "200 OK" };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+        }
+    });
+    (port, seen)
+}
+
+/// Deleting before ingesting turned a refused upload into a lost document: the
+/// old copy gone, the new one never arrived, and the command meant to update it
+/// had destroyed it instead.
+#[test]
+fn a_replace_whose_ingest_fails_leaves_the_document_alone() {
+    let home = scratch_home("replacesafe");
+    let (port, seen) = serve_refusing_ingest(TWO_COPIES);
+    record_local_node(&home, port);
+    let file = home.join("Policy.md");
+    fs::write(&file, "# Policy\nnew text\n").unwrap();
+
+    let out = knaix(&home)
+        .args(["upload", "-n", "local", "--replace", file.to_str().unwrap()])
+        .output()
+        .expect("failed to run knaix");
+
+    assert!(!out.status.success(), "the ingest was supposed to fail");
+    let bodies = seen.lock().unwrap().join("\n");
+    assert!(
+        !bodies.contains("kb/delete"),
+        "a failed replace deleted the copy it could not supersede: {bodies}"
+    );
 }
