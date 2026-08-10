@@ -73,15 +73,30 @@ jobs:
   # And this one compiles the binary that actually ships, which is the gnu
   # target cross-built with zig -- the same way release.yml builds it. msvc
   # passing is not evidence that gnu links.
-  windows-release-target:
-    name: Windows release target compiles
+  # Every target a release publishes, built the way the release builds it. The
+  # release workflow was the first thing to compile any of these, so a target
+  # that would not link was found at tag time with the tag already pushed: a
+  # Windows stack overflow, then a macOS build reaching for Apple frameworks
+  # that a Linux runner has no SDK for. Same toolchain here as there, so the
+  # answer is the same answer.
+  release-targets:
+    name: Release target compiles (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: ${{ matrix.target }}
 
       - uses: mlugg/setup-zig@v2
 
@@ -91,10 +106,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-pc-windows-gnu
+          key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo zigbuild --release --locked --target x86_64-pc-windows-gnu
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
   audit:
     name: Dependency advisories
