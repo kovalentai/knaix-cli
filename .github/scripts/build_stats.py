@@ -134,6 +134,17 @@ def build_days(daily, detail):
     return days
 
 
+def lost_days(prior, days):
+    """Days that came in but are not going out.
+
+    Always empty while merge is a union. It is checked anyway because the
+    defect this file exists to fix was a history that silently got shorter,
+    and the cheapest way to reintroduce it is a well-meaning window trim
+    somewhere in the merge.
+    """
+    return sorted({row["day"] for row in prior} - {row["day"] for row in days})
+
+
 def merge(prior, fresh):
     """Prior days, with the ones the query still covers replaced.
 
@@ -190,16 +201,37 @@ def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # No try/except here on purpose. The workflow has already distinguished a
-    # missing object from a failed read, so anything unreadable at this point
-    # is a real fault, and starting a fresh history would quietly discard
-    # every day the logs no longer hold.
+    # No try/except here on purpose. The workflow has already established
+    # whether the archive exists, so anything unreadable at this point is a
+    # real fault, and starting a fresh history would quietly discard every day
+    # the logs no longer hold.
     prior = []
     if history_path:
         with open(history_path) as f:
             prior = [normalise(row) for row in json.load(f).get("days", [])]
+        # Only the workflow may declare a first run, and it does that by
+        # passing no path at all. An archive that exists but carries no days
+        # is a fault: publishing over it would drop everything it should have
+        # held, and the result would be indistinguishable from a first run.
+        if not prior:
+            sys.exit(
+                f"{history_path} holds no days. An archive that exists must "
+                f"carry days, so this is a partial or truncated read, not a "
+                f"first run."
+            )
 
     days = merge(prior, build_days(daily, detail))
+
+    # The history only grows. A day that came in and is not going out would be
+    # dropped from the only copy that holds it, in a payload that still parses
+    # and still agrees with itself, which is why this is an error and not a
+    # warning.
+    lost = lost_days(prior, days)
+    if lost:
+        sys.exit(
+            f"refusing to publish: {len(lost)} day(s) carried in are missing "
+            f"from the result, starting {lost[0]}. The history only grows."
+        )
 
     # Cumulative figures come from the history, not from the scan, so they
     # cannot shrink as logs expire. Summing daily uniques is exact because the

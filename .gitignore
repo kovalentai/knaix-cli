@@ -25,3 +25,6 @@ _knaix_ephemeral_log.md
 
 # Logs
 *.log
+
+# The stats payload builder and its test are Python.
+__pycache__/

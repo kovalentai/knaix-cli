@@ -300,22 +300,37 @@ jobs:
       # and must not be mistaken for one. Treating a failed read as a cold
       # start would discard every day the logs no longer hold, and the payload
       # that replaced it would look entirely plausible.
+      #
+      # Existence is asked over a structured channel rather than read out of
+      # the CLI's error prose. Matching on text put the destructive branch one
+      # stray "404" away: a proxy error page, or any message mentioning a
+      # status code, would have been taken for a first run. A count cannot
+      # drift with a CLI version, and a genuine fault raises here instead of
+      # answering, because every failure mode of these two calls is a nonzero
+      # exit under set -e.
+      #
+      # A prefix is exact for this key. The other objects under metrics/ are
+      # history-recent.json and history-monthly.json, and neither extends
+      # "metrics/history.json".
       - name: Fetch published history
         run: |
           set -euo pipefail
 
-          if aws s3api get-object \
-               --bucket "$RELEASES_BUCKET" \
-               --key metrics/history.json \
-               .stats/history-in.json >/dev/null 2>.stats/fetch-err.txt; then
-            python3 -c "import json;print('Previous history:', len(json.load(open('.stats/history-in.json'))['days']), 'days')"
-          elif grep -qi 'NoSuchKey\|Not Found\|404' .stats/fetch-err.txt; then
+          FOUND=$(aws s3api list-objects-v2 \
+                    --bucket "$RELEASES_BUCKET" \
+                    --prefix metrics/history.json \
+                    --query 'length(Contents || `[]`)' \
+                    --output text)
+
+          if [ "$FOUND" = "0" ]; then
             echo "No previous history; starting one."
             : > .stats/history-in.json
           else
-            echo "::error::Could not read metrics/history.json, and it is not a missing object. Refusing to publish a history that would silently drop every day the logs no longer cover."
-            cat .stats/fetch-err.txt
-            exit 1
+            aws s3api get-object \
+              --bucket "$RELEASES_BUCKET" \
+              --key metrics/history.json \
+              .stats/history-in.json >/dev/null
+            python3 -c "import json;print('Previous history:', len(json.load(open('.stats/history-in.json'))['days']), 'days')"
           fi
 
       - name: Build payloads
