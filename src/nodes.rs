@@ -1008,6 +1008,13 @@ pub async fn export_document(
         ))
         .coded(Code::Denied);
     }
+    // Ending on a newline, like `cat` does. Ingest trimmed the document's own,
+    // so without this the file written is a byte short of the one ingested and
+    // the two commands disagree about the same document.
+    let mut content = content;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
     std::fs::write(path, &content)
         .with_context(|| format!("Could not write {}", path.display()))?;
     ctx.info(&format!(

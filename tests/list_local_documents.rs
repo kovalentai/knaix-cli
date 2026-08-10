@@ -905,6 +905,46 @@ fn replacing_removes_what_was_filed_under_the_name_after_the_new_copy_lands() {
     assert!(bodies.contains("new-copy") && bodies.contains("old-copy"));
 }
 
+/// `cat` and `export` must agree byte for byte about the same document. Ingest
+/// trims the document's own trailing newline, and only `cat` was putting one
+/// back, so the exported file came out a byte short of the one ingested.
+#[test]
+fn an_exported_file_ends_on_a_newline_like_cat_does() {
+    let home = scratch_home("exportnewline");
+    record_local_node(&home, serve_node(ONE_DOCUMENT_WITH_CONTENT));
+    let out_path = home.join("written.md");
+
+    let out = knaix(&home)
+        .args([
+            "export",
+            "-n",
+            "local",
+            "Handbook.md",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run knaix");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let written = fs::read_to_string(&out_path).unwrap();
+    assert!(written.ends_with('\n'), "no trailing newline: {written:?}");
+
+    let printed = knaix(&home)
+        .args(["cat", "-n", "local", "Handbook.md"])
+        .output()
+        .expect("failed to run knaix");
+    assert_eq!(
+        written,
+        String::from_utf8_lossy(&printed.stdout),
+        "cat and export disagree about the same document"
+    );
+}
+
 /// A node that lists documents but refuses every ingest, recording what it was
 /// asked. Enough to prove what a failed upload did and did not delete.
 fn serve_refusing_ingest(listing: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
