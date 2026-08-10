@@ -1,0 +1,10 @@
+# Windows reserves 1 MiB of stack for the main thread, an eighth of what Linux
+# and macOS give it. Building clap's command tree in a debug build overruns that
+# and knaix.exe dies with STACK_OVERFLOW before it has parsed an argument, so
+# every command fails on Windows and none of them says why. Reserving 8 MiB
+# matches the other platforms; it is address space, not memory committed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
