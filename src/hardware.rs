@@ -5,13 +5,69 @@
 //! means swapping to disk and an answer that never really arrives. Sizing the
 //! choices against the machine is what turns the list into a recommendation.
 
-use sysinfo::System;
-
-/// Total physical memory, in bytes.
+/// Total physical memory, in bytes, or 0 where it cannot be read.
+///
+/// Read directly rather than through a crate that covers every platform: the
+/// one that did pulled in Apple frameworks, and a macOS build cross-compiled
+/// from Linux has no SDK to find them. Three calls is cheaper than that.
+#[cfg(target_os = "macos")]
 pub fn total_memory() -> u64 {
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.total_memory()
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    // Safe: the name is a literal, and the out-pointer and its size describe
+    // the u64 above.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut bytes as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        bytes
+    } else {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn total_memory() -> u64 {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse::<u64>().ok())
+        // /proc/meminfo is in kibibytes.
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+pub fn total_memory() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // Safe: dwLength is set, as the call requires, and the struct outlives it.
+    // A non-zero return means it filled the struct; windows-sys types BOOL as
+    // a plain i32, so this is the comparison rather than a method.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+        status.ullTotalPhys
+    } else {
+        0
+    }
+}
+
+/// Nothing to read on a platform none of the above covers, which leaves every
+/// model unjudged rather than wrongly judged.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn total_memory() -> u64 {
+    0
 }
 
 /// How a model's weights sit against the memory this machine has.

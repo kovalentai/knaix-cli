@@ -42,8 +42,14 @@ globset = "0.4.19"
 toml = "0.8"
 clap_complete = "4.6.7"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
-sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 
-# Only to hand SIGPIPE back to the kernel at startup. See restore_sigpipe.
+# SIGPIPE back to the kernel at startup (see restore_sigpipe), and sysctl for
+# the machine's memory on macOS.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Total memory on Windows. Reading it is one call, and the crate that used to
+# do it for every platform dragged Apple frameworks in with it, which a macOS
+# build cross-compiled from Linux has no SDK to find.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_SystemInformation"] }
