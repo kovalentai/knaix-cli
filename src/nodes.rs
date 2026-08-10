@@ -873,6 +873,163 @@ fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
 }
 
+/// One document's text, as the node that holds it reassembles it.
+///
+/// The node owns the reassembly because it owns the chunks: the overlap the
+/// chunker left between them has to be consumed once, and the rule for that
+/// lives beside the chunking rather than being guessed at from here.
+pub async fn document_content(
+    ctx: &KnaixContext,
+    target: &Target,
+    document_id: &str,
+) -> Result<String> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/document", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "document_id": document_id,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node. Is it running?")?;
+            if resp.status() == 404 {
+                return Err(anyhow!(
+                    "This node is too old to read a document back. Update it with {}.",
+                    crate::brand::cmd("local up --pull")
+                ))
+                .coded(Code::Precondition);
+            }
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["content"].as_str().unwrap_or_default().to_string())
+        }
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!(
+                "{}/api/knowledge/{}/documents/{}/content",
+                ctx.config.api_url, uuid, document_id
+            );
+            let resp = ctx
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not read the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
+        }
+    }
+}
+
+/// The one document a name picks out, or an error naming the ambiguity.
+///
+/// A name that was ingested more than once is genuinely ambiguous for reading,
+/// where it is not for removing: removing every copy is what was meant, and
+/// printing one of several without saying which would be a quiet guess at which
+/// version the reader wanted.
+fn one_document<'a>(documents: &'a [Document], wanted: &str) -> Result<&'a Document> {
+    let matches = documents_named(documents, wanted);
+    match matches.len() {
+        0 => Err(anyhow!(
+            "No document named {}. {} lists what is there.",
+            wanted,
+            crate::brand::cmd("ls")
+        ))
+        .coded(Code::NotFound),
+        1 => Ok(matches[0]),
+        n => {
+            let mut lines = format!("{} copies of {} are filed here:\n", n, wanted);
+            for d in &matches {
+                lines.push_str(&format!(
+                    "  {}  ingested {}\n",
+                    d.id,
+                    d.created_at.as_deref().unwrap_or("unknown")
+                ));
+            }
+            lines.push_str("Name one by its id, or remove the copies you do not want.");
+            Err(anyhow!("{}", lines)).coded(Code::Usage)
+        }
+    }
+}
+
+/// Print a document's text.
+pub async fn cat_document(ctx: &KnaixContext, target: &Target, wanted: &str) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+    // Raw, not rendered. This is a file's contents, and the command is worth
+    // more piped into something else than prettied up for a terminal.
+    print!("{}", content);
+    if !content.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// Write a document out to a file, or to stdout where none is named.
+pub async fn export_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &str,
+    out: Option<&str>,
+) -> Result<()> {
+    let documents = documents_of(ctx, target).await?;
+    let doc = one_document(&documents, wanted)?;
+    let content = document_content(ctx, target, &doc.id).await?;
+
+    let Some(out) = out else {
+        print!("{}", content);
+        if !content.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    };
+
+    let path = Path::new(out);
+    // Refusing beats overwriting: the file named here is one the user already
+    // has, and a document written over it cannot be got back.
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists. Move it, or pass a different --out.",
+            path.display()
+        ))
+        .coded(Code::Denied);
+    }
+    std::fs::write(path, &content)
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    ctx.info(&format!(
+        "{} Wrote {} ({} bytes) to {}",
+        "✓".green(),
+        doc.source
+            .as_ref()
+            .and_then(|s| s.name.as_deref())
+            .unwrap_or(&doc.id),
+        content.len(),
+        path.display().to_string().bold()
+    ));
+    Ok(())
+}
+
 /// Remove a document from a node's knowledge base, by name or by id.
 ///
 /// Deleting is not undoable and the corpus is the point of the node, so it

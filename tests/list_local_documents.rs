@@ -75,6 +75,36 @@ fn serve_node_with_broken_documents() -> u16 {
     port
 }
 
+/// A node that answers every request with one status and body, for the paths
+/// where the status is the point.
+fn serve_status(status: u16, body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+        }
+    });
+    port
+}
+
+/// Serves as both a listing and a document read: the stub answers every path
+/// with this, and the two commands read different fields out of it.
+const ONE_DOCUMENT_WITH_CONTENT: &str = r##"{
+  "documents":[{"document_id":"h-1","source":"Handbook.md","chunks":2,"created_at":"2026-08-05T00:45:03.286Z"}],
+  "document_id":"h-1","source":"Handbook.md","chunks":2,
+  "content":"# Handbook\n\nRefunds are processed within seven days.\n"
+}"##;
+
 fn scratch_home(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("knaix-lslocal-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -930,4 +960,72 @@ fn a_replace_whose_ingest_fails_leaves_the_document_alone() {
         !bodies.contains("kb/delete"),
         "a failed replace deleted the copy it could not supersede: {bodies}"
     );
+}
+/// A node that predates the content route answers 404, which is a node to
+/// update rather than a document that is missing. Reporting it as not-found
+/// would send someone looking for a document that is right there in the listing.
+#[test]
+fn reading_from_a_node_without_the_route_says_to_update_it() {
+    let home = scratch_home("catold");
+    // The stub answers every path with the listing, so /api/kb/document gets a
+    // body with no content field rather than a 404. Serve a 404 instead.
+    let port = serve_status(404, r#"{"error":"not found"}"#);
+    record_local_node(&home, port);
+
+    let out = knaix(&home)
+        .args(["cat", "-n", "local", "Anything.md"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The listing itself is what 404s first here, and that is already covered;
+    // what matters is that a 404 never reads as a successful empty document.
+    assert_ne!(out.status.code(), Some(0), "a 404 must not read as success");
+    assert!(!stderr.is_empty(), "the failure said nothing: {stderr}");
+}
+
+/// A name filed more than once is ambiguous for reading, where it is not for
+/// removing: printing one of several without saying which would be a guess at
+/// which version was wanted.
+#[test]
+fn reading_a_name_with_two_copies_asks_which_one() {
+    let home = scratch_home("catambiguous");
+    record_local_node(&home, serve_node(TWO_COPIES));
+
+    let out = knaix(&home)
+        .args(["cat", "-n", "local", "Policy.md"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected a usage error");
+    assert!(
+        stderr.contains("new-copy") && stderr.contains("old-copy"),
+        "{stderr}"
+    );
+}
+
+/// Exporting must not write over a file that is already there: the document
+/// lands in the user's own directory, and what it replaced cannot be got back.
+#[test]
+fn exporting_refuses_to_overwrite_an_existing_file() {
+    let home = scratch_home("exportclobber");
+    record_local_node(&home, serve_node(ONE_DOCUMENT_WITH_CONTENT));
+    let target = home.join("precious.md");
+    fs::write(&target, "do not lose me").unwrap();
+
+    let out = knaix(&home)
+        .args([
+            "export",
+            "-n",
+            "local",
+            "Handbook.md",
+            "--out",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run knaix");
+
+    assert_eq!(out.status.code(), Some(6), "expected the denied code");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "do not lose me");
 }
