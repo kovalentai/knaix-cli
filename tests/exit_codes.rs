@@ -347,14 +347,11 @@ fn completions_fall_back_to_powershell_where_a_shell_is_always_detectable() {
     );
 }
 
-/// The first thing someone runs after downloading this is not `login`, and the
-/// answer they used to get was that they were not logged in. The local half of
-/// the product went unmentioned at the one moment it was the answer, so the
-/// note names it.
+/// The first thing someone runs after downloading this is not `login`, and
+/// being told they were not logged in left the local half unmentioned.
 ///
-/// Deterministic wherever it runs: the scratch home holds no local node record,
-/// so the addressable-node note cannot fire whether or not a container happens
-/// to be running on the machine.
+/// The scratch home records no local node, so the addressable-node note cannot
+/// fire and the assertion holds whether or not a container is running here.
 #[test]
 fn a_first_run_is_told_that_no_account_is_needed() {
     let home = scratch_home("firstrun");
@@ -376,8 +373,7 @@ fn a_first_run_is_told_that_no_account_is_needed() {
     );
 }
 
-/// Not only the command that happened to be tested above: the note belongs to
-/// the auth failure, so every ordinary command carries it.
+/// The note belongs to the auth failure, not to one command.
 #[test]
 fn the_no_account_note_is_not_particular_to_one_command() {
     let home = scratch_home("firstrunlist");

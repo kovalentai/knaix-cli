@@ -830,10 +830,8 @@ async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
 
 /// The node the listing came from, above the listing itself.
 ///
-/// A knowledge base is only meaningful next to the node holding it: the same
-/// table printed with the node unnamed left people running `local status`
-/// afterwards to find out which node, and what was answering, they had just
-/// listed.
+/// The table printed alone, so which node it came from and what was answering
+/// on it were a `local status` away.
 fn print_local_node_summary(documents: &[NodeDocument]) {
     let node = crate::local::load();
     let summary = crate::local::summarize();
@@ -885,11 +883,10 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     }
 }
 
-/// The local node as a row in the nodes table, or None where this machine has
-/// never started one.
+/// The local node as a row in the nodes table, or None where none was started.
 ///
-/// A node that was started and then stopped is still a node, so the row is
-/// built from the saved state rather than from the container being up.
+/// Built from the saved record rather than the container: a stopped node is
+/// still a node worth listing.
 fn local_node_row() -> Option<Vec<String>> {
     let node = crate::local::load()?;
     let summary = crate::local::summarize();
@@ -913,16 +910,11 @@ fn local_node_row() -> Option<Vec<String>> {
 
 /// The local node in the shape the control plane reports a hosted one.
 ///
-/// Built through `Node` rather than written out by hand, for the same reason
-/// the document records above are: `-o json` is an interface, and a local node
-/// spelled differently from a hosted one is a script that reads one and
-/// silently reads nothing from the other. Going through the struct means the
-/// two cannot drift apart later.
+/// Built through `Node` for the same reason the document records above are:
+/// one shape whichever node answered, and going through the struct means the
+/// two cannot drift.
 ///
-/// `id` carries the UUID every route is keyed by and `instanceId` the name a
-/// person passes to `-n`, which is how the hosted shape uses the two. Writing
-/// the UUID into `instanceId` would put a routing key where a script expects a
-/// handle.
+/// `id` is the UUID routes are keyed by, `instanceId` the name passed to `-n`.
 fn local_node_json() -> Option<serde_json::Value> {
     let node = crate::local::load()?;
     let summary = crate::local::summarize();
@@ -941,8 +933,7 @@ fn local_node_json() -> Option<serde_json::Value> {
         config: None,
     };
     let mut value = serde_json::to_value(&shaped).ok()?;
-    // Additive, and meaningful only here: nothing else in the list is on this
-    // machine, and a hosted node has no loopback URL to give.
+    // Additive: a hosted node has neither.
     if let Some(obj) = value.as_object_mut() {
         obj.insert("local".to_string(), serde_json::Value::Bool(true));
         obj.insert(
@@ -1034,11 +1025,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         return Ok(());
     }
 
-    // A local node is a node, and listing nodes used to answer "not logged in"
-    // on a machine that had one running and nothing else wrong. An account is
-    // what hosted nodes need, not what makes the question answerable, so the
-    // local node is reported either way and the session decides only whether
-    // hosted ones join it.
+    // A local node is a node. An account is what hosted nodes need, not what
+    // makes the question answerable, so this one is reported either way.
     let local = local_node_row();
     let token = match ctx.get_token() {
         Ok(token) => token,
@@ -1046,9 +1034,7 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
             if local.is_none() {
                 return Err(no_session);
             }
-            // Still the machine-readable shape: a script listing nodes on a
-            // machine with no session gets an array with the local node in it,
-            // not a table it cannot parse.
+            // Still an array: a table is the one shape a script cannot read.
             if ctx.output_format == "json" {
                 let all: Vec<serde_json::Value> = local_node_json().into_iter().collect();
                 println!("{}", serde_json::to_string_pretty(&all).unwrap_or_default());
@@ -1083,12 +1069,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
         let nodes_val = &wrapper["data"];
 
         if ctx.output_format == "json" {
-            // The local node joins the hosted ones here too. A script asking
-            // what nodes exist gets the same answer the table shows.
-            //
-            // Last, not first. This list has always been the hosted nodes, and
-            // a script reading `.[0]` to pick one would otherwise start getting
-            // the local node instead of the hosted one it has always got.
+            // Last, not first: this list has always been the hosted nodes, and
+            // a script reading `.[0]` would otherwise start getting another.
             let mut all = nodes_val.as_array().cloned().unwrap_or_default();
             if let Some(local) = local_node_json() {
                 all.push(local);

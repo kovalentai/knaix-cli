@@ -551,9 +551,8 @@ fn other_commands_keep_the_full_note() {
     }
 }
 
-/// A knowledge base means little without the node holding it. The table used to
-/// print alone, and the node it came from -- and what was answering on it -- was
-/// a separate command away.
+/// The table printed alone, so the node it came from and what was answering on
+/// it were a separate command away.
 #[test]
 fn the_listing_names_the_node_it_came_from() {
     let home = scratch_home("summary");
@@ -573,9 +572,8 @@ fn the_listing_names_the_node_it_came_from() {
     }
 }
 
-/// The local node is a node. Listing nodes answered "not logged in" on a machine
-/// that had one running, which is an account problem reported in place of an
-/// answer that needed no account.
+/// Listing nodes answered "not logged in" on a machine that had one running:
+/// an account problem reported in place of an answer that needed no account.
 #[test]
 fn listing_nodes_without_a_session_still_reports_the_local_one() {
     let home = scratch_home("nodeslocal");
@@ -602,9 +600,8 @@ fn listing_nodes_without_a_session_still_reports_the_local_one() {
     );
 }
 
-/// `-o json` is an interface. The no-session path is the one that prints
-/// something extra, and printing a table there would hand a script the one
-/// shape it cannot read.
+/// The no-session path is the one that prints something extra, and a table
+/// there is the one shape a script cannot read.
 #[test]
 fn listing_nodes_as_json_without_a_session_stays_machine_readable() {
     let home = scratch_home("nodesjson");
@@ -624,9 +621,8 @@ fn listing_nodes_as_json_without_a_session_stays_machine_readable() {
     assert_eq!(nodes[0]["local"], true);
 }
 
-/// The account error is still the right answer where there is no local node to
-/// report instead. Swallowing it would leave a machine with nothing set up
-/// looking like a machine with nothing to show.
+/// Swallowing the account error would leave a machine with nothing set up
+/// looking like one with nothing to show.
 #[test]
 fn listing_nodes_without_a_session_or_a_local_node_is_still_an_auth_error() {
     let home = scratch_home("nodesneither");
@@ -655,9 +651,8 @@ const ONE_HOSTED_NODE: &str = r#"{"data":[
    "instanceId":"acme-prod-01","privateIp":"100.64.0.7","model":"Standard","config":null}
 ]}"#;
 
-/// The local node joins the list last. This list has always meant the hosted
-/// nodes, and a script reading `.[0]` to pick one would otherwise start getting
-/// the local node instead of the hosted one it has always got.
+/// This list has always meant the hosted nodes, so a script reading `.[0]`
+/// must keep getting the one it has always got.
 #[test]
 fn the_local_node_joins_the_hosted_list_last() {
     let home = scratch_home("nodesorder");
@@ -684,9 +679,7 @@ fn the_local_node_joins_the_hosted_list_last() {
     assert_eq!(nodes[1]["name"], "local");
     assert_eq!(nodes[1]["local"], true);
 
-    // Same spelling as the hosted node beside it. `-o json` is an interface,
-    // and a local node shaped differently is a script that reads one and
-    // silently reads nothing from the other.
+    // Same spelling as the hosted node beside it: one shape, either kind.
     let hosted = nodes[0].as_object().unwrap();
     let local = nodes[1].as_object().unwrap();
     for field in [
@@ -709,8 +702,7 @@ fn the_local_node_joins_the_hosted_list_last() {
     assert_eq!(nodes[1]["instanceId"], "local");
 }
 
-/// The table reads in the same order, so the two output modes do not disagree
-/// about which node is which.
+/// The table reads in the same order, so the two output modes agree.
 #[test]
 fn the_table_lists_the_local_node_last_too() {
     let home = scratch_home("nodesordertable");

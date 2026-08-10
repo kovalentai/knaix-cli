@@ -564,22 +564,14 @@ async fn main() -> std::process::ExitCode {
                 // Probed with a short deadline, since this is the error path and
                 // nothing here is worth hanging on.
                 //
-                // Auth counts as well as Unavailable. "Not logged in" is what a
-                // machine with a node already running was told, and an account
-                // is not what that command was missing.
+                // Auth as well as Unavailable: a machine with a node already
+                // running was being told to go and make an account.
                 let worth_pointing_local =
                     matches!(code, exit::Code::Unavailable | exit::Code::Auth)
                         && subcommand != "login";
-                //
-                // Running is not enough: the container is found on the machine
-                // while the state that addresses it is per-user, so a home
-                // directory that has lost its record sees a node running and
-                // has no port to reach it on. Pointing at `-n local` there
-                // named a command that answers "no local node has been
-                // started", contradicting the note that sent them to it. The
-                // URL is what makes the advice true, so it is what is asked
-                // for; without it the first-run note below is the right one,
-                // and `local up` does adopt a node in that state.
+                // The URL, not just the state: the container is machine-wide but
+                // the record addressing it is per-user, so a home that lost its
+                // record was pointed at `-n local`, which then refuses.
                 let local = local::summarize_within(std::time::Duration::from_millis(400));
                 let local_up =
                     worth_pointing_local && local.state == "running" && local.url.is_some();
@@ -590,11 +582,8 @@ async fn main() -> std::process::ExitCode {
                     );
                     eprintln!("        {}", local_node_remedy(subcommand));
                 } else if worth_pointing_local && code == exit::Code::Auth {
-                    // Nothing running and no session: the first run. Being told
-                    // only to log in is what sent someone off to make an account
-                    // for a product that does not need one, and the whole local
-                    // half of it went unmentioned at the one moment it was the
-                    // answer.
+                    // The first run. Being told only to log in sent people off
+                    // to make an account for a product that does not need one.
                     eprintln!("\n  {} Kovalent runs without an account.", "Note:".blue());
                     eprintln!(
                         "        {} starts a node on this machine, with nothing to sign up for.",
