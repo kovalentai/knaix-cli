@@ -967,8 +967,12 @@ async fn run() -> Result<()> {
                     let bytes = stdin_arg::read_bytes("the document")?;
                     let staged = stdin_arg::TempFile::write(&checked, &bytes)?;
                     if let Some(target) = nodes::resolve_target(&ctx, node_id.clone()).await? {
-                        nodes::replace_if_asked(&ctx, &target, &checked, replace).await?;
+                        // Same order as a file: what is there goes only once the
+                        // piped copy has landed.
+                        let superseded =
+                            nodes::superseded_by(&ctx, &target, &checked, replace).await;
                         nodes::upload_single_file(&ctx, &target, staged.path(), &checked).await?;
+                        nodes::remove_superseded(&ctx, &target, &superseded, &checked).await;
                     }
                 }
             } else {
