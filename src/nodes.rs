@@ -694,10 +694,8 @@ pub async fn resolve_target(
         .map(|uuid| Target::Remote { uuid }))
 }
 
-/// Every document a node holds, in one shape whichever kind answered.
-///
-/// The two listings already agree on the wire; this is what lets the commands
-/// that act on a document be written once.
+/// Every document a node holds, in one shape whichever kind answered, so the
+/// commands acting on a document are written once.
 pub async fn documents_of(ctx: &KnaixContext, target: &Target) -> Result<Vec<Document>> {
     match target {
         Target::Local { base, instance_id } => Ok(local_documents(ctx, base, instance_id)
@@ -875,9 +873,8 @@ fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
 
 /// One document's text, as the node that holds it reassembles it.
 ///
-/// The node owns the reassembly because it owns the chunks: the overlap the
-/// chunker left between them has to be consumed once, and the rule for that
-/// lives beside the chunking rather than being guessed at from here.
+/// The node does the reassembly because it owns the chunks, and the rule for
+/// consuming their overlap belongs beside the chunking.
 pub async fn document_content(
     ctx: &KnaixContext,
     target: &Target,
@@ -943,10 +940,8 @@ pub async fn document_content(
 
 /// The one document a name picks out, or an error naming the ambiguity.
 ///
-/// A name that was ingested more than once is genuinely ambiguous for reading,
-/// where it is not for removing: removing every copy is what was meant, and
-/// printing one of several without saying which would be a quiet guess at which
-/// version the reader wanted.
+/// Ambiguous for reading where it is not for removing: `rm` was asked for every
+/// copy, but printing one of several would guess at which version was wanted.
 fn one_document<'a>(documents: &'a [Document], wanted: &str) -> Result<&'a Document> {
     let matches = documents_named(documents, wanted);
     match matches.len() {
@@ -977,8 +972,7 @@ pub async fn cat_document(ctx: &KnaixContext, target: &Target, wanted: &str) -> 
     let documents = documents_of(ctx, target).await?;
     let doc = one_document(&documents, wanted)?;
     let content = document_content(ctx, target, &doc.id).await?;
-    // Raw, not rendered. This is a file's contents, and the command is worth
-    // more piped into something else than prettied up for a terminal.
+    // Raw, not rendered: a file's contents are worth more piped than prettied.
     print!("{}", content);
     if !content.ends_with('\n') {
         println!();
@@ -1006,8 +1000,7 @@ pub async fn export_document(
     };
 
     let path = Path::new(out);
-    // Refusing beats overwriting: the file named here is one the user already
-    // has, and a document written over it cannot be got back.
+    // The named file is one the user already has, and cannot be got back.
     if path.exists() {
         return Err(anyhow!(
             "{} already exists. Move it, or pass a different --out.",
@@ -1032,10 +1025,8 @@ pub async fn export_document(
 
 /// Remove a document from a node's knowledge base, by name or by id.
 ///
-/// Deleting is not undoable and the corpus is the point of the node, so it
-/// confirms unless told not to. Where a name picks out more than one document
-/// the count is stated before the prompt, because "remove widget.md" reading as
-/// three removals is the surprise worth spending a line on.
+/// Not undoable, so it confirms unless told not to, and states the count first:
+/// "remove widget.md" meaning three removals is the surprise worth a line.
 pub async fn remove_document(
     ctx: &KnaixContext,
     target: &Target,
@@ -1097,8 +1088,8 @@ pub async fn remove_document(
         }
     }
 
-    // One failure must not hide the rest: the corpus is left in a state the
-    // command has to be able to describe, not stopped wherever it got to.
+    // One failure must not hide the rest, or the corpus ends in a state the
+    // command cannot describe.
     let mut removed = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
     for d in &matches {
