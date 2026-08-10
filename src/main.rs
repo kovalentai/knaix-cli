@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod doctor;
 mod exit;
+mod hardware;
 mod local;
 mod login;
 mod markdown;

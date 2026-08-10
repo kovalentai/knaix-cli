@@ -40,6 +40,62 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # A release publishes a Windows binary, but nothing compiled for Windows until
+  # the tag was already cut. Code that only fails there -- a Unix-only helper, a
+  # path assumption -- reached main and surfaced at release, which is the worst
+  # place to find it.
+  #
+  # Two jobs, because they answer different questions. This one runs the tests on
+  # a real Windows machine, which is the only way to catch behaviour rather than
+  # compilation; it uses the default msvc toolchain.
+  windows:
+    name: Windows test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting is not repeated here: it is platform independent and the
+      # Linux job already gates it.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  # And this one compiles the binary that actually ships, which is the gnu
+  # target cross-built with zig -- the same way release.yml builds it. msvc
+  # passing is not evidence that gnu links.
+  windows-release-target:
+    name: Windows release target compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-gnu
+
+      - name: Build
+        run: cargo zigbuild --release --locked --target x86_64-pc-windows-gnu
+
   audit:
     name: Dependency advisories
     runs-on: ubuntu-latest

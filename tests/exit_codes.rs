@@ -46,7 +46,9 @@ fn scratch_home(name: &str) -> PathBuf {
 
 fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
-    cmd.env("HOME", home).env("KNAIX_NO_UPDATE_CHECK", "1");
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("KNAIX_NO_UPDATE_CHECK", "1");
     cmd
 }
 
@@ -176,6 +178,14 @@ fn the_same_lookup_against_a_dead_api_is_unavailable() {
 /// once already: the helper attached the code, and the caller rebuilt the error
 /// with `anyhow!("...: {e}")`, which dropped it and reported a plain failure.
 /// Rebuilding an error anywhere in this path will fail this test.
+///
+/// Unix only, because the setup is: emptying PATH is what hides an executable
+/// on Unix, and it does not hide one on Windows, where a CI runner with Docker
+/// installed still finds and runs it. The command then gets past the check this
+/// is about and fails somewhere else, which proves nothing either way. What is
+/// being asserted is not platform specific; the only way found to provoke it
+/// is.
+#[cfg(unix)]
 #[test]
 fn a_missing_docker_is_a_precondition_not_a_generic_failure() {
     let home = scratch_home("nodocker");
@@ -216,6 +226,7 @@ fn a_closed_pipe_ends_quietly_rather_than_panicking() {
         .arg("-c")
         .arg(format!("'{bin}' top --interval 1 | head -c 200"))
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         // Nothing listens here, so the run needs no control plane and still
         // prints its table.
         .env("KNAIX_API_URL", "http://127.0.0.1:9")
@@ -302,11 +313,36 @@ fn a_named_shell_overrides_the_running_one() {
 
 /// With no shell to detect and none named, the usage error is the right answer.
 /// Guessing would write the wrong completions into a real profile.
+///
+/// Unix only, because the state being described cannot be reached on Windows:
+/// `Shell::from_env` falls back to PowerShell there, so a shell is always
+/// detected and there is nothing to refuse. The Windows behaviour is asserted
+/// below instead of skipped.
+#[cfg(unix)]
 #[test]
 fn completions_without_a_detectable_shell_is_a_usage_error() {
     let home = scratch_home("shellnone");
     assert_eq!(
         code_of(knaix(&home).arg("completions").env_remove("SHELL")),
         2
+    );
+}
+
+/// The other side of the same rule: on Windows there is always a shell to
+/// detect, so the answer is completions rather than a usage error.
+#[cfg(windows)]
+#[test]
+fn completions_fall_back_to_powershell_where_a_shell_is_always_detectable() {
+    let home = scratch_home("shellwin");
+    let out = knaix(&home)
+        .arg("completions")
+        .env_remove("SHELL")
+        .output()
+        .expect("failed to run knaix");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Register-ArgumentCompleter"),
+        "expected PowerShell completions: {stdout}"
     );
 }

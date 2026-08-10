@@ -22,6 +22,7 @@ fn scratch(name: &str) -> PathBuf {
 fn knaix(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", home)
+        .env("USERPROFILE", home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .current_dir(cwd);
     cmd

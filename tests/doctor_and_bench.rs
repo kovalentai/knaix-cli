@@ -19,6 +19,7 @@ fn scratch_home(name: &str) -> PathBuf {
 fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", home)
+        .env("USERPROFILE", home)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         // Port 9 is discard: the control plane is unreachable rather than
         // absent, which is the state a broken machine is actually in.
@@ -55,6 +56,9 @@ fn run(cmd: &mut Command) -> Run {
 ///
 /// Returns a directory to put at the front of PATH. The binary is invoked by
 /// absolute path, so this hides docker without hiding knaix.
+///
+/// Unix only, like its one caller: what it writes is a `/bin/sh` script.
+#[cfg(unix)]
 fn fake_docker(home: &Path, script: &str) -> PathBuf {
     let bin = home.join("fakebin");
     fs::create_dir_all(&bin).unwrap();
@@ -263,6 +267,7 @@ fn an_available_upgrade_does_not_break_json_output() {
     // Not the usual helper: this needs the update check left switched on.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("KNAIX_API_URL", "http://127.0.0.1:9")
         .current_dir(&home)
         .args(["-o", "json", "doctor"]);
@@ -293,6 +298,7 @@ fn doctor_does_not_repeat_the_upgrade_notice() {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("KNAIX_API_URL", "http://127.0.0.1:9")
         .current_dir(&home)
         .arg("doctor");
