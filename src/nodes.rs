@@ -694,6 +694,277 @@ pub async fn resolve_target(
         .map(|uuid| Target::Remote { uuid }))
 }
 
+/// Every document a node holds, in one shape whichever kind answered.
+///
+/// The two listings already agree on the wire; this is what lets the commands
+/// that act on a document be written once.
+pub async fn documents_of(ctx: &KnaixContext, target: &Target) -> Result<Vec<Document>> {
+    match target {
+        Target::Local { base, instance_id } => Ok(local_documents(ctx, base, instance_id)
+            .await?
+            .iter()
+            .map(Document::from)
+            .collect()),
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!("{}/api/knowledge/{}/documents", ctx.config.api_url, uuid);
+            let resp = ctx
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("Could not list documents: HTTP {}", resp.status()))
+                    .coded(Code::for_status(resp.status().as_u16()));
+            }
+            let wrapper: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(serde_json::from_value(wrapper["data"].clone()).unwrap_or_default())
+        }
+    }
+}
+
+/// Remove one document and everything it was chunked into.
+pub async fn delete_document(ctx: &KnaixContext, target: &Target, document_id: &str) -> Result<()> {
+    match target {
+        Target::Local { base, instance_id } => {
+            let resp = ctx
+                .client
+                .post(format!("{}/api/kb/delete", base))
+                .json(&serde_json::json!({
+                    "instance_id": instance_id,
+                    "document_id": document_id,
+                }))
+                .send()
+                .await
+                .context("Could not reach the local node. Is it running?")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not remove the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            Ok(())
+        }
+        Target::Remote { uuid } => {
+            let token = ctx.get_token()?;
+            let url = format!(
+                "{}/api/knowledge/{}/documents/{}",
+                ctx.config.api_url, uuid, document_id
+            );
+            let resp = ctx
+                .client
+                .delete(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Could not reach the Kovalent API")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "Could not remove the document: HTTP {}",
+                    resp.status()
+                ))
+                .coded(Code::for_status(resp.status().as_u16()));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The documents a name or id picks out, newest first.
+///
+/// An id matches one document. A name can match several: re-ingesting an edited
+/// file files it under the same name as a new document, so a corpus can hold
+/// more than one version of the same filename.
+pub fn documents_named<'a>(documents: &'a [Document], wanted: &str) -> Vec<&'a Document> {
+    if let Some(exact) = documents.iter().find(|d| d.id == wanted) {
+        return vec![exact];
+    }
+    documents
+        .iter()
+        .filter(|d| {
+            d.source
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .is_some_and(|n| n == wanted)
+        })
+        .collect()
+}
+
+/// Clear the way for a document about to be ingested under `name`.
+///
+/// Ingest mints a fresh document id every time, and chunks only collapse where
+/// their content is byte-identical. So re-ingesting a file that has been edited
+/// files a second document under the same name, and answers are then grounded
+/// in both the old text and the new. Replacing removes what was there first.
+///
+/// Returns how many were removed, for the caller to report.
+pub async fn replace_if_asked(
+    ctx: &KnaixContext,
+    target: &Target,
+    name: &str,
+    replace: bool,
+) -> Result<usize> {
+    if !replace {
+        return Ok(0);
+    }
+    let documents = documents_of(ctx, target).await?;
+    let existing = documents_named(&documents, name);
+    let mut removed = 0;
+    for d in existing {
+        delete_document(ctx, target, &d.id).await?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Replace what a name already holds, or say what re-ingesting is about to do.
+///
+/// Silence here is what let a corpus fill with superseded copies of the same
+/// file without anything saying so.
+async fn report_replacement(ctx: &KnaixContext, target: &Target, name: &str, replace: bool) {
+    if replace {
+        match replace_if_asked(ctx, target, name, true).await {
+            Ok(0) | Err(_) => {}
+            Ok(n) => ctx.info(&format!(
+                "  {} replacing {} already filed under {}",
+                "↻".cyan(),
+                plural_count(n, "copy", "copies"),
+                name
+            )),
+        }
+        return;
+    }
+    if already_filed(ctx, target, name).await > 0 {
+        ctx.info(&format!(
+            "  {} {} is already ingested. This adds another copy; {} updates it instead.",
+            "Warning:".yellow(),
+            name,
+            "--replace".cyan()
+        ));
+    }
+}
+
+/// "1 copy" / "2 copies", where the number is worth showing.
+fn plural_count(n: usize, one: &'static str, many: &'static str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+/// What is already filed under a name, for the warning that re-ingesting adds
+/// to it rather than replacing it.
+async fn already_filed(ctx: &KnaixContext, target: &Target, name: &str) -> usize {
+    match documents_of(ctx, target).await {
+        Ok(documents) => documents_named(&documents, name).len(),
+        // Only used to decide whether to warn, so a listing that failed is not
+        // worth failing the ingest over.
+        Err(_) => 0,
+    }
+}
+
+/// Remove a document from a node's knowledge base, by name or by id.
+///
+/// Deleting is not undoable and the corpus is the point of the node, so it
+/// confirms unless told not to. Where a name picks out more than one document
+/// the count is stated before the prompt, because "remove widget.md" reading as
+/// three removals is the surprise worth spending a line on.
+pub async fn remove_document(
+    ctx: &KnaixContext,
+    target: &Target,
+    wanted: &str,
+    yes: bool,
+) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Confirm};
+    use std::io::IsTerminal;
+
+    let documents = documents_of(ctx, target).await?;
+    let matches = documents_named(&documents, wanted);
+
+    if matches.is_empty() {
+        return Err(anyhow!(
+            "No document named {} on {}. {} lists what is there.",
+            wanted,
+            target.label(),
+            crate::brand::cmd("ls")
+        ))
+        .coded(Code::NotFound);
+    }
+
+    let chunks: u64 = matches.iter().map(|d| d.chunk_count.unwrap_or(0)).sum();
+    println!(
+        "\n{} {} {} ({} {}) from {}:",
+        "Removing".bold(),
+        matches.len(),
+        plural(matches.len(), "document", "documents"),
+        chunks,
+        plural(chunks as usize, "chunk", "chunks"),
+        target.label().cyan()
+    );
+    for d in &matches {
+        println!(
+            "  - {}  {}",
+            d.source
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .unwrap_or(&d.id),
+            format!("ingested {}", d.created_at.as_deref().unwrap_or("unknown")).dimmed()
+        );
+    }
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "Refusing to remove a document without confirmation. Pass --yes to remove it in a script."
+            ))
+            .coded(Code::Denied);
+        }
+        let go = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Remove it? This cannot be undone")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !go {
+            println!("{} Nothing removed.", "Info:".blue());
+            return Ok(());
+        }
+    }
+
+    // One failure must not hide the rest: the corpus is left in a state the
+    // command has to be able to describe, not stopped wherever it got to.
+    let mut removed = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for d in &matches {
+        let name = d
+            .source
+            .as_ref()
+            .and_then(|s| s.name.clone())
+            .unwrap_or_else(|| d.id.clone());
+        match delete_document(ctx, target, &d.id).await {
+            Ok(()) => removed += 1,
+            Err(e) => failed.push((name, e.to_string())),
+        }
+    }
+
+    for (name, why) in &failed {
+        println!("  {} {}: {}", "✗".red(), name, why);
+    }
+    println!(
+        "\n{} Removed {} {}.",
+        "✓".green(),
+        removed,
+        plural(removed, "document", "documents")
+    );
+    if !failed.is_empty() {
+        return Err(anyhow!(
+            "{} of {} could not be removed.",
+            failed.len(),
+            matches.len()
+        ));
+    }
+    Ok(())
+}
+
 /// True when a node is the one the user named, by UUID, instance id, or name.
 /// Users read the last two off `knaix list`; the routes only accept the first.
 fn node_matches(node: &Node, wanted: &str) -> bool {
@@ -2549,6 +2820,7 @@ pub async fn upload(
     target: &Target,
     file_path: &str,
     plan: UploadPlan,
+    replace: bool,
 ) -> Result<()> {
     let base_path = Path::new(file_path);
 
@@ -2559,6 +2831,7 @@ pub async fn upload(
     } = plan;
 
     if let Some(file_name) = single_file {
+        report_replacement(ctx, target, &file_name, replace).await;
         return upload_single_file(ctx, target, base_path, &file_name)
             .await
             .map(|_| ());
@@ -2587,6 +2860,7 @@ pub async fn upload(
         // One bad file must not abandon the rest: a partial ingest that stops
         // wherever it happened to fail is worse than a complete one with a
         // named failure, because nothing says how far it got.
+        report_replacement(ctx, target, &file_name, replace).await;
         match upload_single_file(ctx, target, path, &file_name).await {
             Ok(chunks) => {
                 summary.ingested += 1;
