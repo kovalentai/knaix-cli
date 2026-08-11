@@ -156,6 +156,7 @@ jobs:
               user_agent,
               regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
               trim(user_agent) IN ('-', '') AS is_silent,
+              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_ci,
               concat_ws('|', request_ip, user_agent) AS device
             FROM knaix_releases.cloudfront_logs
             WHERE method = 'GET'
@@ -163,7 +164,15 @@ jobs:
           labelled AS (
             SELECT
               day,
+              -- is_ci comes first, so our own polling can never be counted as
+              -- somebody installing. The Homebrew tap's bump job runs hourly
+              -- and used to fetch all four platform binaries every run, which
+              -- was roughly 92% of the published download figure and, because a
+              -- bare curl looks exactly like install.sh in these logs, was
+              -- filed as that. Kept as its own kind rather than dropped, so the
+              -- volume stays visible without polluting a single figure.
               CASE
+                WHEN is_ci THEN 'ci'
                 WHEN is_binary AND status IN (200, 206) THEN 'download'
                 WHEN is_binary AND status >= 400 THEN 'failure'
                 WHEN uri = '/latest-version' AND is_silent THEN 'heartbeat'
@@ -173,6 +182,7 @@ jobs:
               COALESCE(regexp_extract(uri, 'knaix-(darwin|linux|windows)-', 1), '') AS os,
               COALESCE(regexp_extract(uri, 'knaix-(?:darwin|linux|windows)-(arm64|x86_64)(?:\.exe)?$', 1), '') AS arch,
               CASE
+                WHEN is_ci THEN 'ci'
                 WHEN lower(user_agent) LIKE '%homebrew%' THEN 'homebrew'
                 WHEN lower(user_agent) LIKE '%powershell%' THEN 'powershell'
                 WHEN lower(user_agent) LIKE '%curl%' THEN 'install.sh'
@@ -217,6 +227,7 @@ jobs:
               user_agent,
               regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
               trim(user_agent) IN ('-', '') AS is_silent,
+              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_ci,
               concat_ws('|', request_ip, user_agent) AS device,
               concat_ws('|', request_ip, user_agent, cast("date" AS varchar)) AS dedup_key
             FROM knaix_releases.cloudfront_logs
@@ -225,8 +236,11 @@ jobs:
           flagged AS (
             SELECT
               day, device, dedup_key,
-              is_binary AND status IN (200, 206) AS is_download,
-              is_binary AND status >= 400 AS is_failure,
+              -- Same exclusion as the cube: our own hourly bump job is not an
+              -- install. No guard on is_heartbeat, which already requires an
+              -- empty User-Agent and so cannot be this job.
+              NOT is_ci AND is_binary AND status IN (200, 206) AS is_download,
+              NOT is_ci AND is_binary AND status >= 400 AS is_failure,
               uri = '/latest-version' AND is_silent AS is_heartbeat
             FROM classified
           )
