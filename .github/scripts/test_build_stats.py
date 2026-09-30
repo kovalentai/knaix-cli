@@ -36,6 +36,7 @@ CUBE = """day,kind,version,os,arch,channel,is_rollup,hits,devices
 2026-08-09,download,,,,,15,23,21
 2026-08-09,heartbeat,,,,cli,15,45,45
 2026-08-09,failure,,,,,15,1,1
+2026-08-09,ci,,,,ci,15,96,4
 """
 
 # Describes only what the logs still hold: the two August days.
@@ -211,6 +212,27 @@ check("a merge that dropped a day is caught",
 check("a merge trimmed to a window is caught",
       build_stats.lost_days(carried, [{"day": "2026-08-08"}]),
       ["2026-07-01", "2026-07-02"])
+
+print("\nour own polling")
+with tempfile.TemporaryDirectory() as d:
+    tmp = Path(d)
+    proc = build(tmp, None)
+    days = {r["day"]: r for r in json.loads((tmp / "history.json").read_text())["days"]}
+    check("ci hits are carried per day", days["2026-08-09"]["ci"], 96)
+    check("ci is not counted as downloads", days["2026-08-09"]["downloads"], 23)
+    check("a day without ci rows reads zero", days["2026-08-08"]["ci"], 0)
+    check("the badge total ignores ci", json.loads((tmp / "stats.json").read_text())["total"], 38)
+
+print("\nthe queries exclude our own polling")
+sql = WORKFLOW.read_text()
+check("both queries tag the bump job", sql.count("AS is_marked"), 2)
+check("both queries reclassify unmarked bump runs", sql.count("legacy_bump AS ("), 2)
+check("both queries read the tagged rows", sql.count("FROM tagged"), 2)
+cube_case = sql[sql.index("CASE", sql.index("labelled AS")):]
+check("ci is decided before download",
+      cube_case.index("WHEN is_ci THEN 'ci'") < cube_case.index("THEN 'download'"), True)
+check("the windows query guards downloads and failures",
+      sql.count("NOT is_ci AND is_binary"), 2)
 
 print("\nexistence is not decided by error prose")
 workflow = WORKFLOW.read_text()
