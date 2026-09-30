@@ -15,6 +15,7 @@ history-recent.json and history-monthly.json into OUT_DIR.
 import csv
 import datetime
 import json
+import os
 import sys
 
 WINDOW_DAYS = 30
@@ -282,7 +283,15 @@ def main():
         "updated": stamp,
     }
 
-    cutoff = str((now.date() - datetime.timedelta(days=WINDOW_DAYS)))
+    # STATS_TODAY exists for the test suite only. Its fixtures are fixed dates,
+    # and measuring their window from the wall clock made the suite start
+    # failing on its own a month after they were written.
+    today = (
+        datetime.date.fromisoformat(os.environ["STATS_TODAY"])
+        if os.environ.get("STATS_TODAY")
+        else now.date()
+    )
+    cutoff = str(today - datetime.timedelta(days=WINDOW_DAYS))
     recent = [r for r in detail if r["kind"] == "download" and r["day"] >= cutoff]
     recent_total = sum(as_int(r, "hits") for r in recent)
 
