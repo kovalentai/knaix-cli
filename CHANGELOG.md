@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.6.2] - 2026-09-30
+
+A security patch and nothing else. Every change is a dependency update: no command, flag or output changes, so there is nothing to adapt before upgrading. The reason to take it is the first entry below, which sits on the TLS path of every command that talks to a hosted node, the control plane, or the release server.
+
+### Security
+
+- **`rustls` 0.23.42 to 0.23.45, for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).** rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level when they followed a key-changing message in the same record, where the protocol requires the connection to be rejected. The handshake transcript is still authenticated, so the advisory rates it medium and notes that an attacker on the network cannot use it to alter or complete a handshake. It is fixed anyway, because every HTTPS connection the CLI makes goes through it.
+
+- **`lru` 0.18.1 to 0.18.5, for [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253).** `LruCache::pop()` was not panic-safe and could in principle lead to a use-after-free. It reaches the CLI only through the terminal UI's layout cache, so only `knaix top` used it.
+
+- **`chacha20` 0.10.1 to 0.10.2.** Its authors yanked 0.10.1. There is no advisory against it; it arrives through the HTTP client's networking stack, and a yanked release is not one to keep shipping.
+
 ## [0.6.1] - 2026-08-10
 
 Most of this release is about the first ten minutes. Three separate things could make a fresh install look broken, and all of them were reachable with a stock Ollama: a model picker that offered models which cannot run, a timeout shorter than the models it offered, and no sense of what a machine can actually hold.
