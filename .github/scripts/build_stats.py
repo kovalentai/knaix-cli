@@ -22,7 +22,8 @@ WINDOW_DAYS = 30
 RECENT_DAYS = 90
 
 # Daily fields that are counts, and so add up across days.
-COUNTS = ("downloads", "unique", "failures")
+# "ci" is our own release polling, kept so that exclusion stays observable.
+COUNTS = ("downloads", "unique", "failures", "ci")
 # Sparse per-day breakdowns of download hits by dimension.
 SPLITS = ("platforms", "channels", "versions")
 
@@ -68,7 +69,7 @@ def breakdown(rows, key, total):
 
 
 def blank_day(day):
-    row = {"day": day, "downloads": 0, "unique": 0, "active": 0, "failures": 0}
+    row = {"day": day, "downloads": 0, "unique": 0, "active": 0, "failures": 0, "ci": 0}
     for name in SPLITS:
         row[name] = {}
     return row
@@ -77,7 +78,7 @@ def blank_day(day):
 def normalise(row):
     """Bring a row published by an older schema up to the current shape."""
     out = blank_day(row.get("day", ""))
-    for key in ("downloads", "unique", "active", "failures"):
+    for key in ("downloads", "unique", "active", "failures", "ci"):
         out[key] = as_int(row, key)
     for name in SPLITS:
         value = row.get(name)
@@ -118,6 +119,11 @@ def build_days(daily, detail):
             day["failures"] = as_int(row, "hits")
         elif kind == "heartbeat":
             day["active"] = as_int(row, "devices")
+        elif kind == "ci":
+            # Requests from our own tap bump job. Never an install; carried so
+            # a regression in that exclusion shows up as this going to zero
+            # while downloads jump.
+            day["ci"] = as_int(row, "hits")
 
     for row in detail:
         if row["kind"] != "download":
@@ -175,6 +181,7 @@ def monthly(days):
                 "downloads": 0,
                 "unique": 0,
                 "failures": 0,
+                "ci": 0,
                 "activePeak": 0,
                 "platforms": {},
                 "channels": {},

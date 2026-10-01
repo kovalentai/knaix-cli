@@ -156,10 +156,30 @@ jobs:
               user_agent,
               regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
               trim(user_agent) IN ('-', '') AS is_silent,
-              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_ci,
+              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_marked,
               concat_ws('|', request_ip, user_agent) AS device
             FROM knaix_releases.cloudfront_logs
             WHERE method = 'GET'
+          ),
+          -- The bump job only started identifying itself with the tap's
+          -- knaix-tap-bump User-Agent. Every run before that was a bare curl,
+          -- indistinguishable by User-Agent from install.sh, but it has a
+          -- signature no install has: one machine fetching all four macOS and
+          -- Linux binaries on the same day. An install fetches the one binary for
+          -- its own platform. This reclassifies every day still in the logs, and
+          -- because the builder replaces those days in the history, it corrects
+          -- the cumulative figure too, not just the rolling windows.
+          legacy_bump AS (
+            SELECT device, day
+            FROM classified
+            WHERE is_binary
+            GROUP BY device, day
+            HAVING count(DISTINCT regexp_extract(uri, 'knaix-((?:darwin|linux)-(?:arm64|x86_64))$', 1)) >= 4
+          ),
+          tagged AS (
+            SELECT c.*, (c.is_marked OR l.device IS NOT NULL) AS is_ci
+            FROM classified c
+            LEFT JOIN legacy_bump l ON l.device = c.device AND l.day = c.day
           ),
           labelled AS (
             SELECT
@@ -190,7 +210,7 @@ jobs:
                 ELSE 'other'
               END AS channel,
               device
-            FROM classified
+            FROM tagged
           )
           SELECT day, kind, version, os, arch, channel,
                  grouping(version, os, arch, channel) AS is_rollup,
@@ -227,11 +247,31 @@ jobs:
               user_agent,
               regexp_like(uri, '^/v[0-9]+\.[0-9]+\.[0-9]+/knaix-(darwin|linux|windows)-(arm64|x86_64)(\.exe)?$') AS is_binary,
               trim(user_agent) IN ('-', '') AS is_silent,
-              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_ci,
+              lower(user_agent) LIKE '%knaix-tap-bump%' AS is_marked,
               concat_ws('|', request_ip, user_agent) AS device,
               concat_ws('|', request_ip, user_agent, cast("date" AS varchar)) AS dedup_key
             FROM knaix_releases.cloudfront_logs
             WHERE method = 'GET'
+          ),
+          -- The bump job only started identifying itself with the tap's
+          -- knaix-tap-bump User-Agent. Every run before that was a bare curl,
+          -- indistinguishable by User-Agent from install.sh, but it has a
+          -- signature no install has: one machine fetching all four macOS and
+          -- Linux binaries on the same day. An install fetches the one binary for
+          -- its own platform. This reclassifies every day still in the logs, and
+          -- because the builder replaces those days in the history, it corrects
+          -- the cumulative figure too, not just the rolling windows.
+          legacy_bump AS (
+            SELECT device, day
+            FROM classified
+            WHERE is_binary
+            GROUP BY device, day
+            HAVING count(DISTINCT regexp_extract(uri, 'knaix-((?:darwin|linux)-(?:arm64|x86_64))$', 1)) >= 4
+          ),
+          tagged AS (
+            SELECT c.*, (c.is_marked OR l.device IS NOT NULL) AS is_ci
+            FROM classified c
+            LEFT JOIN legacy_bump l ON l.device = c.device AND l.day = c.day
           ),
           flagged AS (
             SELECT
@@ -242,7 +282,7 @@ jobs:
               NOT is_ci AND is_binary AND status IN (200, 206) AS is_download,
               NOT is_ci AND is_binary AND status >= 400 AS is_failure,
               uri = '/latest-version' AND is_silent AS is_heartbeat
-            FROM classified
+            FROM tagged
           )
           SELECT
             count_if(is_download) AS total,
