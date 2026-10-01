@@ -11,6 +11,7 @@ what is asserted here is that a bad day cannot quietly shorten the record.
 
 import datetime
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -75,7 +76,10 @@ def build(tmp, prior):
         (tmp / "prior.json").write_text(json.dumps(prior))
         args.append(str(tmp / "prior.json"))
     args.append(str(tmp))
-    return subprocess.run(args, capture_output=True, text=True)
+    # The fixtures are fixed dates, so the builder's 30 day window is pinned to
+    # them rather than to whenever the suite happens to run.
+    env = {**os.environ, "STATS_TODAY": "2026-08-10"}
+    return subprocess.run(args, capture_output=True, text=True, env=env)
 
 
 def payloads(tmp):
