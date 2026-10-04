@@ -644,6 +644,22 @@ async fn main() -> std::process::ExitCode {
                         "        {} starts a node on this machine, with nothing to sign up for.",
                         brand::cmd("local up")
                     );
+                } else if subcommand == "login" && code == exit::Code::Unavailable {
+                    // Signing in is the one command a local node cannot stand in
+                    // for, which is why it is excluded above. But the bare error
+                    // left the reader to work out two things on their own: that
+                    // hosted nodes are a private beta whose control plane is not
+                    // always running, and that nothing they came to do needs it.
+                    // Said here rather than in the error itself, which has to
+                    // stay true for someone pointed at their own control plane.
+                    eprintln!(
+                        "\n  {} Hosted nodes are in a private beta, and signing in needs its control plane to be up.",
+                        "Note:".blue()
+                    );
+                    eprintln!(
+                        "        {} starts a node on this machine, with nothing to sign in to.",
+                        brand::cmd("local up")
+                    );
                 }
                 eprintln!(
                     "\n  {} checks everything a command needs and says what to fix.",

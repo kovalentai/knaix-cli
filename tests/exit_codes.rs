@@ -373,6 +373,34 @@ fn a_first_run_is_told_that_no_account_is_needed() {
     );
 }
 
+/// `login` is the one command a running local node cannot stand in for, so it
+/// is left out of the notes above. That left a failed sign-in with nothing but
+/// "could not reach the API", at the moment someone most needs to hear that the
+/// product works without it.
+#[test]
+fn a_failed_sign_in_names_the_path_that_needs_no_control_plane() {
+    let home = scratch_home("loginunreachable");
+
+    let out = knaix(&home)
+        // Port 9 is discard: nothing answers, so this fails at the preflight
+        // and never opens a browser.
+        .env("KNAIX_API_URL", "http://127.0.0.1:9")
+        .arg("login")
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "expected Unavailable: {stderr}");
+    assert!(
+        stderr.contains("private beta"),
+        "the note did not say why sign-in may be down: {stderr}"
+    );
+    assert!(
+        stderr.contains("local up"),
+        "the note named no command to run: {stderr}"
+    );
+}
+
 /// The note belongs to the auth failure, not to one command.
 #[test]
 fn the_no_account_note_is_not_particular_to_one_command() {
