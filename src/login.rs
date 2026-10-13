@@ -422,13 +422,19 @@ impl LoginReply {
     }
 }
 
+/// The sign-in route. `api_url` is the control plane's origin, as every other
+/// command uses it; the routes live under `/api`.
+fn login_url(api_url: &str) -> String {
+    format!("{}/api/auth/login", api_url.trim_end_matches('/'))
+}
+
 async fn post_login(
     client: &reqwest::Client,
     api_url: &str,
     body: serde_json::Value,
 ) -> Result<LoginReply> {
     let response = client
-        .post(format!("{api_url}/auth/login"))
+        .post(login_url(api_url))
         .json(&body)
         .send()
         .await
@@ -639,6 +645,18 @@ mod tests {
 
     fn reply(json: &str) -> LoginReply {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn signing_in_posts_to_the_api_routes_under_the_origin() {
+        assert_eq!(
+            login_url("https://api.kovalentai.com"),
+            "https://api.kovalentai.com/api/auth/login"
+        );
+        assert_eq!(
+            login_url("http://localhost:3002/"),
+            "http://localhost:3002/api/auth/login"
+        );
     }
 
     #[test]
