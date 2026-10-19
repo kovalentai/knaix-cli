@@ -2,12 +2,6 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
-## [Unreleased]
-
-### Added
-
-- **`knaix login --no-browser` signs in from the terminal.** It asks for your username, your password (hidden, sent only to the Kovalent API over HTTPS, never stored) and, if MFA is on, your authenticator code, then keeps the session exactly as the browser sign-in does. Use it on a machine with no browser, over SSH, or wherever the sign-in page cannot complete, as on the hosted dashboard during the invite-only Beta. `--username` skips the first question. The browser sign-in now mentions it in case the page does not finish.
-
 ## [0.6.2] - 2026-09-30
 
 A security patch and nothing else. Every change is a dependency update: no command, flag or output changes, so there is nothing to adapt before upgrading. The reason to take it is the first entry below, which sits on the TLS path of every command that talks to a hosted node, the control plane, or the release server.
