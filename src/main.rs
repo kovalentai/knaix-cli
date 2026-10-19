@@ -86,7 +86,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Log in to your Kovalent account (opens the browser)
-    Login,
+    ///
+    /// With --no-browser, signs in here instead: username, password, and the
+    /// authenticator code if the account has MFA on. For a machine without a
+    /// browser, or a dashboard that cannot serve the sign-in page.
+    Login {
+        /// Sign in in the terminal instead of the browser
+        #[clap(long)]
+        no_browser: bool,
+        /// The username to sign in as (asked for when omitted; --no-browser only)
+        #[clap(long, short = 'u', requires = "no_browser")]
+        username: Option<String>,
+    },
 
     /// Log out, removing the saved session from this machine
     Logout,
@@ -799,8 +810,15 @@ async fn run() -> Result<()> {
     let reports_its_own_version = matches!(command, Commands::Doctor { .. });
 
     match command {
-        Commands::Login => {
-            login::login().await?;
+        Commands::Login {
+            no_browser,
+            username,
+        } => {
+            if no_browser {
+                login::login_in_terminal(username).await?;
+            } else {
+                login::login().await?;
+            }
             // If a local node is running, connect it so it shows up right away.
             local::connect_snapshot().await;
         }

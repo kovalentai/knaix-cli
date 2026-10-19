@@ -48,6 +48,8 @@ fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        // A session exported in the shell running the tests is not this test's.
+        .env_remove("KNAIX_TOKEN")
         .env("KNAIX_NO_UPDATE_CHECK", "1");
     cmd
 }
@@ -227,6 +229,8 @@ fn a_closed_pipe_ends_quietly_rather_than_panicking() {
         .arg(format!("'{bin}' top --interval 1 | head -c 200"))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
+        // A session exported in the shell running the tests is not this test's.
+        .env_remove("KNAIX_TOKEN")
         // Nothing listens here, so the run needs no control plane and still
         // prints its table.
         .env("KNAIX_API_URL", "http://127.0.0.1:9")
