@@ -500,10 +500,9 @@ pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
     drop(password);
 
     if reply.mfa_required {
-        let temp = reply
-            .temp_token
-            .take()
-            .ok_or_else(|| anyhow!("The API asked for an MFA code but sent no session to send it with"))?;
+        let temp = reply.temp_token.take().ok_or_else(|| {
+            anyhow!("The API asked for an MFA code but sent no session to send it with")
+        })?;
         let code: String = Input::with_theme(&theme)
             .with_prompt("Authenticator code")
             .interact_text()
@@ -671,7 +670,10 @@ mod tests {
             reply(r#"{"error":"Invalid credentials"}"#).refusal(reqwest::StatusCode::UNAUTHORIZED),
             "Invalid credentials"
         );
-        assert_eq!(reply("{}").refusal(status), "The API answered 403 Forbidden");
+        assert_eq!(
+            reply("{}").refusal(status),
+            "The API answered 403 Forbidden"
+        );
     }
 
     #[test]
