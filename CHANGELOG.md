@@ -2,6 +2,18 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.6.3] - 2026-10-19
+
+<!-- One paragraph on what this release is about. Delete this comment. -->
+
+### Added
+
+- **login: sign in from the terminal with --no-browser**
+
+### Fixed
+
+- **deps: rustls 0.23.46 and quinn-proto 0.11.19 for five RustSec advisories**
+
 ## [0.6.2] - 2026-09-30
 
 A security patch and nothing else. Every change is a dependency update: no command, flag or output changes, so there is nothing to adapt before upgrading. The reason to take it is the first entry below, which sits on the TLS path of every command that talks to a hosted node, the control plane, or the release server.
