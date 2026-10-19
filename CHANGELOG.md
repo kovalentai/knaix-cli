@@ -4,16 +4,21 @@ All notable changes to the Knaix CLI will be documented in this file.
 
 ## [0.6.3] - 2026-10-19
 
-<!-- One paragraph on what this release is about. Delete this comment. -->
+Two reasons to take this one. `knaix login` can now sign in without a browser, which also gets you past a sign-in page that cannot finish, as the hosted dashboard's cannot during the invite-only Beta. And it clears five dependency advisories, four of them in the TLS library under every connection the CLI makes. Nothing is removed or renamed, so there is nothing to adapt before upgrading.
 
 ### Added
 
-- **login: sign in from the terminal with --no-browser**
+- **`knaix login --no-browser` signs in from the terminal.** It asks for your username, your password (hidden, sent only to the Kovalent API over HTTPS, never stored) and, if MFA is on, your authenticator code, then keeps the session exactly as the browser sign-in does. Use it on a machine with no browser, over SSH, or wherever the sign-in page cannot complete. `--username` skips the first question. A refusal gives the API's own reason, such as a lockout or an account awaiting approval, and exits 3. Where there is no terminal to ask for a password at, it exits 2 and points scripts at `KNAIX_TOKEN`. The browser sign-in now mentions the flag in case the page does not finish.
+
+### Security
+
+- **`rustls` 0.23.45 to 0.23.46, for [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349).** The one rated medium, 0346, is that the `Debug` output of client session values could include TLS secrets; the CLI's own code never holds those values, but anything that logged one would have written key material out. The other three are rated low: application data buffered before an Encrypted Client Hello rejection could be sent to the outer server, Brotli certificate decompression could allocate up to 1 GiB before the peer was authenticated, and an unauthenticated ServerHello could downgrade later connections to classical key exchange. The CLI enables neither ECH nor Brotli certificate compression, so 0347 and 0348 do not reach it. All four are fixed because every HTTPS connection the CLI makes goes through rustls.
+
+- **`quinn-proto` 0.11.16 to 0.11.19, for [RUSTSEC-2026-0338](https://rustsec.org/advisories/RUSTSEC-2026-0338).** A remote peer could make it panic with zero-length STREAM frames. It is in the lockfile through the HTTP client but is not compiled into the CLI, so no release was exposed; it is updated so the dependency audit stays clean.
 
 ### Fixed
 
-- **deps: rustls 0.23.46 and quinn-proto 0.11.19 for five RustSec advisories**
-
+- **A failed `knaix login` says where to go.** When the hosted control plane did not answer, it printed only that the API could not be reached, which left two things unsaid: that hosted nodes are a private beta whose control plane is not always running, and that nothing done on a local node needs one. It now says both, and names `knaix local up`. The error itself and its exit code (4) are unchanged, so scripts that check the code are unaffected.
 ## [0.6.2] - 2026-09-30
 
 A security patch and nothing else. Every change is a dependency update: no command, flag or output changes, so there is nothing to adapt before upgrading. The reason to take it is the first entry below, which sits on the TLS path of every command that talks to a hosted node, the control plane, or the release server.
