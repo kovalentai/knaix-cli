@@ -22,6 +22,8 @@ fn knaix(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_knaix"));
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        // A session exported in the shell running the tests is not this test's.
+        .env_remove("KNAIX_TOKEN")
         // Keep the test off the network and away from the release endpoint.
         .env("KNAIX_NO_UPDATE_CHECK", "1");
     cmd

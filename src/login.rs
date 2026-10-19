@@ -102,20 +102,8 @@ async fn handle_callback(
         return Html(REJECTED_HTML);
     }
 
-    // Persist only the disk state plus the new session, so a KNAIX_API_URL set
-    // for this shell does not become the user's saved API URL.
-    let mut stored = load_stored_config();
-    stored.token = Some(params.token.clone());
-    stored.username = Some(params.username.clone());
-    save_config(&stored).ok();
-
-    println!("\n{} Successfully logged in!", "✓".green());
-    println!("  Welcome, {}", params.username.cyan());
-    println!(
-        "  {} lists your nodes; {} makes one the default.",
-        crate::brand::cmd("list"),
-        crate::brand::cmd("use <node-id>")
-    );
+    println!();
+    store_session(&params.token, &params.username).ok();
 
     *state.completed.lock().unwrap() = true;
     state.done.notify_one();
@@ -379,6 +367,162 @@ async fn handle_callback(
     )
 }
 
+/// Save a new session and say what to do next. Both sign-in paths end here.
+///
+/// Persists only the disk state plus the new session, so a KNAIX_API_URL set
+/// for this shell does not become the user's saved API URL.
+fn store_session(token: &str, username: &str) -> Result<()> {
+    let mut stored = load_stored_config();
+    stored.token = Some(token.to_string());
+    stored.username = Some(username.to_string());
+    save_config(&stored).context("Could not save the session")?;
+
+    println!("{} Successfully logged in!", "✓".green());
+    println!("  Welcome, {}", username.cyan());
+    println!(
+        "  {} lists your nodes; {} makes one the default.",
+        crate::brand::cmd("list"),
+        crate::brand::cmd("use <node-id>")
+    );
+    Ok(())
+}
+
+/// What `/auth/login` answers, on either step.
+#[derive(Deserialize, Default)]
+struct LoginReply {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    user: Option<LoginUser>,
+    #[serde(default, rename = "mfaRequired")]
+    mfa_required: bool,
+    #[serde(default, rename = "tempToken")]
+    temp_token: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginUser {
+    username: String,
+}
+
+impl LoginReply {
+    /// The API's own words for a refusal: "Invalid credentials", or the
+    /// lockout or pending-approval explanation, which matter more than the code.
+    fn refusal(&self, status: reqwest::StatusCode) -> String {
+        match (&self.error, &self.message) {
+            (Some(e), Some(m)) if m != e => format!("{e}. {m}"),
+            (Some(e), _) => e.clone(),
+            (None, Some(m)) => m.clone(),
+            (None, None) => format!("The API answered {status}"),
+        }
+    }
+}
+
+/// The sign-in route. `api_url` is the control plane's origin, as every other
+/// command uses it; the routes live under `/api`.
+fn login_url(api_url: &str) -> String {
+    format!("{}/api/auth/login", api_url.trim_end_matches('/'))
+}
+
+async fn post_login(
+    client: &reqwest::Client,
+    api_url: &str,
+    body: serde_json::Value,
+) -> Result<LoginReply> {
+    let response = client
+        .post(login_url(api_url))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("Could not reach the Kovalent API at {api_url}"))
+        .coded(Code::Unavailable)?;
+    let status = response.status();
+    let reply: LoginReply = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!(reply.refusal(status)))
+            .context("Sign-in refused")
+            .coded(Code::Auth);
+    }
+    Ok(reply)
+}
+
+/// Sign in here in the terminal: username, a hidden password, and the
+/// authenticator code when the account has MFA on.
+///
+/// For a machine with no browser (a server, an SSH session), and for any
+/// dashboard that cannot serve the sign-in page, as the hosted one cannot
+/// during the invite-only Beta. The password goes only to the API's own
+/// `/auth/login`, over HTTPS, and is never stored; what is kept is the session
+/// token, exactly as the browser flow keeps it.
+pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Input, Password};
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "Signing in without a browser asks for a password, and there is no terminal to ask at"
+        ))
+        .context("For a script, set KNAIX_TOKEN to a session token instead")
+        .coded(Code::Usage);
+    }
+
+    let api_url = load_config().api_url;
+    let theme = ColorfulTheme::default();
+    let username = match username {
+        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => Input::<String>::with_theme(&theme)
+            .with_prompt("Username")
+            .interact_text()
+            .context("Could not read the username")?
+            .trim()
+            .to_string(),
+    };
+    let password = Password::with_theme(&theme)
+        .with_prompt(format!("Password for {username}"))
+        .interact()
+        .context("Could not read the password")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Could not start the HTTP client")?;
+
+    let mut reply = post_login(
+        &client,
+        &api_url,
+        serde_json::json!({ "username": username, "password": password }),
+    )
+    .await?;
+    drop(password);
+
+    if reply.mfa_required {
+        let temp = reply.temp_token.take().ok_or_else(|| {
+            anyhow!("The API asked for an MFA code but sent no session to send it with")
+        })?;
+        let code: String = Input::with_theme(&theme)
+            .with_prompt("Authenticator code")
+            .interact_text()
+            .context("Could not read the code")?;
+        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        reply = post_login(
+            &client,
+            &api_url,
+            serde_json::json!({ "mfaToken": temp, "mfaCode": code }),
+        )
+        .await?;
+    }
+
+    let token = reply
+        .token
+        .ok_or_else(|| anyhow!("The API accepted the sign-in but returned no session"))?;
+    let username = reply.user.map(|u| u.username).unwrap_or(username);
+    store_session(&token, &username)
+}
+
 /// Whether the control plane that would issue the session can be reached.
 ///
 /// The browser half of the flow cannot report this: it redirects to a callback
@@ -451,7 +595,11 @@ pub async fn login() -> Result<()> {
         .context("Invalid authentication URL")?;
 
     println!("{} Opening the browser to sign in.", "Info:".blue());
-    println!("  If nothing opened, visit: {}\n", auth_url.dimmed());
+    println!("  If nothing opened, visit: {}", auth_url.dimmed());
+    println!(
+        "  No browser here, or the page will not sign you in? {}\n",
+        crate::brand::cmd("login --no-browser")
+    );
 
     if let Err(e) = open::that(&auth_url) {
         println!(
@@ -493,6 +641,53 @@ pub async fn login() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(json: &str) -> LoginReply {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn signing_in_posts_to_the_api_routes_under_the_origin() {
+        assert_eq!(
+            login_url("https://api.kovalentai.com"),
+            "https://api.kovalentai.com/api/auth/login"
+        );
+        assert_eq!(
+            login_url("http://localhost:3002/"),
+            "http://localhost:3002/api/auth/login"
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_why_in_the_apis_own_words() {
+        let status = reqwest::StatusCode::FORBIDDEN;
+        assert_eq!(
+            reply(r#"{"error":"Account locked","message":"Too many failed attempts. Account locked for 15 minutes."}"#)
+                .refusal(status),
+            "Account locked. Too many failed attempts. Account locked for 15 minutes."
+        );
+        assert_eq!(
+            reply(r#"{"error":"Invalid credentials"}"#).refusal(reqwest::StatusCode::UNAUTHORIZED),
+            "Invalid credentials"
+        );
+        assert_eq!(
+            reply("{}").refusal(status),
+            "The API answered 403 Forbidden"
+        );
+    }
+
+    #[test]
+    fn the_mfa_step_is_read_from_the_first_reply() {
+        let first = reply(r#"{"mfaRequired":true,"tempToken":"t","message":"MFA code required"}"#);
+        assert!(first.mfa_required);
+        assert_eq!(first.temp_token.as_deref(), Some("t"));
+        assert!(first.token.is_none());
+
+        let done = reply(r#"{"token":"jwt","user":{"username":"diego-ent","roleName":"member"}}"#);
+        assert!(!done.mfa_required);
+        assert_eq!(done.token.as_deref(), Some("jwt"));
+        assert_eq!(done.user.map(|u| u.username).as_deref(), Some("diego-ent"));
+    }
 
     #[test]
     fn production_api_keeps_the_hosted_dashboard() {
