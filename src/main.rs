@@ -1,6 +1,7 @@
 mod bench;
 mod brand;
 mod config;
+mod device;
 mod diagnostics;
 mod doctor;
 mod exit;
@@ -365,6 +366,16 @@ enum Commands {
         action: LocalAction,
     },
 
+    /// Lend this machine to a pooled model, and manage your compute devices
+    ///
+    /// A device runs llama.cpp's rpc-server on loopback, sandboxed, behind a
+    /// gateway that admits only the pool's coordinator, with a ticket the
+    /// control plane signed for this machine. macOS (Apple silicon) and Linux.
+    Device {
+        #[clap(subcommand)]
+        action: device::DeviceAction,
+    },
+
     /// Check everything a command needs, and say what to do about what is wrong
     Doctor {
         /// The node to diagnose (falls back to the default)
@@ -595,6 +606,14 @@ async fn main() -> std::process::ExitCode {
     // `knaix report` can carry it, which is the difference between a crash
     // somebody can act on and one they can only describe.
     install_panic_hook();
+
+    // The device bridge runs inside rpc-server's sandbox, with no network and
+    // an empty home. It must not read the configuration or check for updates,
+    // so it is taken before anything else in the CLI starts.
+    let argv: Vec<String> = std::env::args().collect();
+    if device::bridge::is_bridge(&argv) {
+        return device::bridge::entry(argv).await;
+    }
 
     match run().await {
         Ok(()) => std::process::ExitCode::from(exit::Code::Ok.as_u8()),
@@ -1301,6 +1320,7 @@ async fn run() -> Result<()> {
             LocalAction::Connect { daemon, worker } => local::connect(daemon, worker).await?,
             LocalAction::Disconnect => local::disconnect().await?,
         },
+        Commands::Device { action } => device::dispatch(&ctx, action).await?,
         Commands::Up => {
             nodes::up(&ctx).await?;
         }

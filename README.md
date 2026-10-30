@@ -121,6 +121,32 @@ knaix repl           # ask it questions
 `knaix local connect` attaches a local node to your account instead, so it shows
 up in the dashboard alongside hosted ones.
 
+## Lend a machine to a pooled model
+
+A pool runs one model across several machines you own, so a model too large for
+any one of them still runs on your own hardware. Each machine joins with one
+command:
+
+```bash
+knaix login
+knaix device join --daemon    # enrol this machine and keep it running
+knaix device status           # is it online, and in which pools
+```
+
+`join` detects the backend (Metal on Apple silicon, CUDA, ROCm, or CPU; Vulkan
+with `--backend vulkan --max-memory <size>`), downloads llama.cpp's own
+`rpc-server` build pinned by checksum, connects Tailscale with the account's
+device tag, and enrols the machine. Then it runs `rpc-server` on loopback only,
+inside a sandbox, behind a gateway that admits nothing but the pool's
+coordinator presenting a ticket the control plane signed for this machine. On
+Linux `rpc-server` also gets a network namespace of its own, with no route
+anywhere. Refused connections are logged here (`knaix device logs`) and never
+explained on the wire.
+
+Needs Tailscale, and macOS on Apple silicon or Linux (glibc 2.35 or newer, with
+systemd user sessions or bubblewrap). Windows is not supported yet. `knaix device
+leave` stops the machine and removes it from your account.
+
 ## Commands
 
 | Command          | Description                                           |
@@ -136,6 +162,7 @@ up in the dashboard alongside hosted ones.
 | `knaix upload`   | Ingest a file or directory into a node's knowledge base. |
 | `knaix memory`   | List or read the notes saved with `/remember`.        |
 | `knaix mcp`      | Print the MCP client config that points Claude Code, Claude Desktop or Cursor at a node. |
+| `knaix device`   | Lend this machine to a pooled model (`join`, `status`, `ls`, `logs`, `rekey`, `leave`). |
 | `knaix local`    | Run the whole stack on this machine (`setup`, `up`, `reset`, `down`, `status`, `logs`), or `connect`/`disconnect` it to your account to see it in the dashboard. |
 | `knaix verify`   | Check that this binary is the one we published: checksum, signature, and build provenance. |
 | `knaix doctor`   | Check everything a command needs, and say what to do about what is wrong. |
