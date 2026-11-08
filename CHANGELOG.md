@@ -4,13 +4,21 @@ All notable changes to the Knaix CLI will be documented in this file.
 
 ## [0.7.0] - 2026-11-08
 
-Two reasons to take this one. It clears two advisories in the certificate checks under every HTTPS connection the CLI makes. And it adds `knaix device`, which lends a machine you own to a pooled model, so one large model can run across several of your machines. Nothing is removed or renamed, so there is nothing to adapt before upgrading.
+Two reasons to take this one. It clears two advisories in the certificate checks under every HTTPS connection the CLI makes. And it adds `knaix device`, which lends a machine you own to a pooled model, so one large model can run across several of your machines. One thing to check before upgrading: `knaix report` now exits 6 rather than 7 when its `--out` file already exists, so a script that branches on that code needs the new one.
 
 ### Added
 
 - **`knaix device` lends this machine to a pooled model.** `knaix device join` installs llama.cpp's `rpc-server`, pinned to build b11669 and checked by SHA-256 before it runs, connects Tailscale with the device tag, enrols the machine in your account, and starts it, in the foreground or as a background service with `--daemon`. `rpc-server` is never exposed to the network: on Linux it runs in a sandbox with no network but loopback, and on macOS `sandbox-exec` confines it to loopback. It sits behind a gateway that admits only your pool's coordinator and only with a ticket the control plane signed for this machine. `--max-memory` caps what pools may use and `--backend` overrides the detected one (`metal`, `cuda`, `rocm`, `vulkan` or `cpu`; `vulkan` needs `--max-memory`). `knaix device status`, `ls`, `logs`, `rekey` and `leave` cover the rest of a device's life. macOS on Apple silicon and Linux; on Windows the commands refuse with exit code 7 rather than run unsandboxed.
 
   A device belongs to an account, so `join` needs you signed in to the hosted control plane, which is part of the private beta and is not always running. When it is down, `knaix login` says so and points at `knaix local up`, which needs nothing hosted. A pool currently needs a hosted node as its coordinator; a local node cannot coordinate one yet.
+
+### Changed
+
+- **`knaix report` exits 6 when `--out` already exists, not 7.** Refusing to write over a file is a refusal on purpose, which is what 6 (Denied) means, and it is what `knaix export` and `knaix init` already answer. 7 (Precondition) means the machine is not ready, so a script branching on it would have started Docker or a node over a filename that was simply taken. The file is still left untouched.
+
+### Fixed
+
+- **`-o json` now works on `config`, `memory`, `logs` and `local logs`.** The flag is global, but these four printed text regardless, so a script parsing them got a syntax error. `config` gives `apiUrl`, both reading and setting it; `memory` gives the note `files`, an empty list when there are none, and `memory --file` gives the file's `contents`; `logs` and `local logs` give the `lines`. Hosted-node `logs` also stopped printing its header line ahead of the output.
 
 ### Security
 
