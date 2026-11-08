@@ -4,7 +4,23 @@ All notable changes to the Knaix CLI will be documented in this file.
 
 ## [0.7.0] - 2026-11-08
 
-<!-- One paragraph on what this release is about. Delete this comment. -->
+Two reasons to take this one. It clears two advisories in the certificate checks under every HTTPS connection the CLI makes. And it adds `knaix device`, which lends a machine you own to a pooled model, so one large model can run across several of your machines. Nothing is removed or renamed, so there is nothing to adapt before upgrading.
+
+### Added
+
+- **`knaix device` lends this machine to a pooled model.** `knaix device join` installs llama.cpp's `rpc-server`, pinned to build b11669 and checked by SHA-256 before it runs, connects Tailscale with the device tag, enrols the machine in your account, and starts it, in the foreground or as a background service with `--daemon`. `rpc-server` is never exposed to the network: on Linux it runs in a sandbox with no network but loopback, and on macOS `sandbox-exec` confines it to loopback. It sits behind a gateway that admits only your pool's coordinator and only with a ticket the control plane signed for this machine. `--max-memory` caps what pools may use and `--backend` overrides the detected one (`metal`, `cuda`, `rocm`, `vulkan` or `cpu`; `vulkan` needs `--max-memory`). `knaix device status`, `ls`, `logs`, `rekey` and `leave` cover the rest of a device's life. macOS on Apple silicon and Linux; on Windows the commands refuse with exit code 7 rather than run unsandboxed.
+
+  A device belongs to an account, so `join` needs you signed in to the hosted control plane, which is part of the private beta and is not always running. When it is down, `knaix login` says so and points at `knaix local up`, which needs nothing hosted. A pool currently needs a hosted node as its coordinator; a local node cannot coordinate one yet.
+
+### Security
+
+- **`rustls-webpki` 0.103.15 to 0.103.16, for [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382).** Certificate verification could accept a chain through an intermediate that should have been distrusted. Every HTTPS connection the CLI makes is verified by it.
+
+- **`webpki-roots` 1.0.9 to 1.0.11, for [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381).** The bundled root certificates still trusted distrusted emSign intermediates. The CLI verifies servers against this bundle, so it reaches every connection too.
+
+- **`tokio` 1.53.1 to 1.54.1, for [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386).** `AsyncFd::new` and related constructors were unsound. The CLI's own code does not call them; it is updated so the dependency audit stays clean.
+
+- **`clipboard-win` 5.4.1 to 5.4.3.** The old version was yanked. It reaches the CLI on Windows only, through the interactive shell's line editor.
 
 ## [0.6.3] - 2026-10-19
 
