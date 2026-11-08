@@ -1679,7 +1679,7 @@ pub async fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn logs(lines: usize) -> Result<()> {
+pub fn logs(lines: usize, json: bool) -> Result<()> {
     docker_available()?;
     if container_state().is_none() {
         return Err(anyhow!(
@@ -1689,7 +1689,12 @@ pub fn logs(lines: usize) -> Result<()> {
     let n = lines.to_string();
     let out =
         docker(&["logs", "--tail", &n, CONTAINER]).context("Could not read the node's logs")?;
-    println!("{}", out);
+    if json {
+        let v = serde_json::json!({ "lines": out.lines().collect::<Vec<_>>() });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        println!("{}", out);
+    }
     Ok(())
 }
 
