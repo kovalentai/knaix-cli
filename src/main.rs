@@ -1219,16 +1219,26 @@ async fn run() -> Result<()> {
                 let mut stored = config::load_stored_config();
                 stored.api_url = url.clone();
                 config::save_config(&stored)?;
-                ctx.info(&format!(
-                    "{} Updated API URL to {}",
-                    "Info:".blue(),
-                    url.bold()
-                ));
+                if ctx.output_format == "json" {
+                    let v = serde_json::json!({ "apiUrl": url });
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                } else {
+                    ctx.info(&format!(
+                        "{} Updated API URL to {}",
+                        "Info:".blue(),
+                        url.bold()
+                    ));
+                }
             } else {
                 // Report the URL requests actually go to, overrides included.
                 let config = config::load_config();
-                println!("\n{}", "Current Configuration:".bold().underline());
-                println!("  API URL: {}", config.api_url.cyan());
+                if ctx.output_format == "json" {
+                    let v = serde_json::json!({ "apiUrl": config.api_url });
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                } else {
+                    println!("\n{}", "Current Configuration:".bold().underline());
+                    println!("  API URL: {}", config.api_url.cyan());
+                }
             }
         }
         Commands::Metrics { node_id, node } => {
@@ -1316,7 +1326,7 @@ async fn run() -> Result<()> {
             LocalAction::Reset { yes } => local::reset(yes).await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
-            LocalAction::Logs { lines } => local::logs(lines)?,
+            LocalAction::Logs { lines } => local::logs(lines, ctx.output_format == "json")?,
             LocalAction::Connect { daemon, worker } => local::connect(daemon, worker).await?,
             LocalAction::Disconnect => local::disconnect().await?,
         },
