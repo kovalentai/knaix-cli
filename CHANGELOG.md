@@ -2,6 +2,10 @@
 
 All notable changes to the Knaix CLI will be documented in this file.
 
+## [0.7.0] - 2026-11-08
+
+<!-- One paragraph on what this release is about. Delete this comment. -->
+
 ## [0.6.3] - 2026-10-19
 
 Two reasons to take this one. `knaix login` can now sign in without a browser, which also gets you past a sign-in page that cannot finish, as the hosted dashboard's cannot during the invite-only Beta. And it clears five dependency advisories, four of them in the TLS library under every connection the CLI makes. Nothing is removed or renamed, so there is nothing to adapt before upgrading.
