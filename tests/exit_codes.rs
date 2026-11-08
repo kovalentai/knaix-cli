@@ -203,6 +203,25 @@ fn a_missing_docker_is_a_precondition_not_a_generic_failure() {
     assert_eq!(code, 7, "a missing docker should be Precondition");
 }
 
+/// Refusing to write over an existing file is a refusal on purpose, so it is
+/// Denied, as `export` and `init` already answer. It used to be Precondition,
+/// which tells a script the machine is not ready and sends it to start Docker
+/// or a node over a filename that is simply taken.
+#[test]
+fn refusing_to_overwrite_a_report_is_denied() {
+    let home = scratch_home("reportexists");
+    let taken = home.join("report.json");
+    fs::write(&taken, "{}").unwrap();
+
+    let code = code_of(knaix(&home).args(["report", "--out"]).arg(&taken));
+    assert_eq!(code, 6, "an existing --out path should be Denied");
+    assert_eq!(
+        fs::read_to_string(&taken).unwrap(),
+        "{}",
+        "the file must be left alone"
+    );
+}
+
 /// A reader that stops reading must end the process, not crash it.
 ///
 /// Rust ignores SIGPIPE at startup, so writing to a closed pipe became an
