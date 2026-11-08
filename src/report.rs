@@ -295,13 +295,14 @@ pub async fn run(
 
     // Refuse rather than overwrite. `knaix init` already takes this line with
     // .knaix.toml, and a report is written with a path the user typed, which is
-    // exactly where a typo lands on a file they wanted.
+    // exactly where a typo lands on a file they wanted. Denied, as there and in
+    // `export`: nothing about the machine is unready, the path is just taken.
     if std::path::Path::new(&path).exists() {
         return Err(anyhow!(
             "{} already exists. Move it, or pass --out with a different path.",
             path
         ))
-        .coded(Code::Precondition);
+        .coded(Code::Denied);
     }
 
     write_private(&path, &json)

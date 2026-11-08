@@ -1,6 +1,7 @@
 mod bench;
 mod brand;
 mod config;
+mod device;
 mod diagnostics;
 mod doctor;
 mod exit;
@@ -365,6 +366,16 @@ enum Commands {
         action: LocalAction,
     },
 
+    /// Lend this machine to a pooled model, and manage your compute devices
+    ///
+    /// A device runs llama.cpp's rpc-server on loopback, sandboxed, behind a
+    /// gateway that admits only the pool's coordinator, with a ticket the
+    /// control plane signed for this machine. macOS (Apple silicon) and Linux.
+    Device {
+        #[clap(subcommand)]
+        action: device::DeviceAction,
+    },
+
     /// Check everything a command needs, and say what to do about what is wrong
     Doctor {
         /// The node to diagnose (falls back to the default)
@@ -595,6 +606,14 @@ async fn main() -> std::process::ExitCode {
     // `knaix report` can carry it, which is the difference between a crash
     // somebody can act on and one they can only describe.
     install_panic_hook();
+
+    // The device bridge runs inside rpc-server's sandbox, with no network and
+    // an empty home. It must not read the configuration or check for updates,
+    // so it is taken before anything else in the CLI starts.
+    let argv: Vec<String> = std::env::args().collect();
+    if device::bridge::is_bridge(&argv) {
+        return device::bridge::entry(argv).await;
+    }
 
     match run().await {
         Ok(()) => std::process::ExitCode::from(exit::Code::Ok.as_u8()),
@@ -1200,16 +1219,26 @@ async fn run() -> Result<()> {
                 let mut stored = config::load_stored_config();
                 stored.api_url = url.clone();
                 config::save_config(&stored)?;
-                ctx.info(&format!(
-                    "{} Updated API URL to {}",
-                    "Info:".blue(),
-                    url.bold()
-                ));
+                if ctx.output_format == "json" {
+                    let v = serde_json::json!({ "apiUrl": url });
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                } else {
+                    ctx.info(&format!(
+                        "{} Updated API URL to {}",
+                        "Info:".blue(),
+                        url.bold()
+                    ));
+                }
             } else {
                 // Report the URL requests actually go to, overrides included.
                 let config = config::load_config();
-                println!("\n{}", "Current Configuration:".bold().underline());
-                println!("  API URL: {}", config.api_url.cyan());
+                if ctx.output_format == "json" {
+                    let v = serde_json::json!({ "apiUrl": config.api_url });
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                } else {
+                    println!("\n{}", "Current Configuration:".bold().underline());
+                    println!("  API URL: {}", config.api_url.cyan());
+                }
             }
         }
         Commands::Metrics { node_id, node } => {
@@ -1297,10 +1326,11 @@ async fn run() -> Result<()> {
             LocalAction::Reset { yes } => local::reset(yes).await?,
             LocalAction::Down { purge } => local::down(purge)?,
             LocalAction::Status => local::status(ctx.output_format == "json").await?,
-            LocalAction::Logs { lines } => local::logs(lines)?,
+            LocalAction::Logs { lines } => local::logs(lines, ctx.output_format == "json")?,
             LocalAction::Connect { daemon, worker } => local::connect(daemon, worker).await?,
             LocalAction::Disconnect => local::disconnect().await?,
         },
+        Commands::Device { action } => device::dispatch(&ctx, action).await?,
         Commands::Up => {
             nodes::up(&ctx).await?;
         }

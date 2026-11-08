@@ -1,0 +1,2 @@
+# Hashed byte for byte by a test, so git must never rewrite its line endings.
+tests/fixtures/rpc-tunnel-test-vectors.json -text
