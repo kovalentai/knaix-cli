@@ -3306,7 +3306,7 @@ pub async fn get_logs_for(ctx: &KnaixContext, target: &Target, lines: usize) -> 
     match target {
         // The node is a container on this machine; its logs are docker's, and
         // going through a control plane to reach them would be absurd.
-        Target::Local { .. } => crate::local::logs(lines),
+        Target::Local { .. } => crate::local::logs(lines, ctx.output_format == "json"),
         Target::Remote { uuid } => get_logs(ctx, uuid, lines).await,
     }
 }
@@ -3345,11 +3345,22 @@ pub async fn get_logs(ctx: &KnaixContext, node_id: &str, lines: usize) -> Result
             if resp.status().is_success() {
                 let data: serde_json::Value = resp.json().await.unwrap_or_default();
 
+                if ctx.output_format == "json" {
+                    let lines: Vec<&str> = match &data["logs"] {
+                        serde_json::Value::Array(rows) => {
+                            rows.iter().filter_map(|r| r.as_str()).collect()
+                        }
+                        serde_json::Value::String(s) => s.lines().collect(),
+                        _ => Vec::new(),
+                    };
+                    let v = serde_json::json!({ "lines": lines });
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    return Ok(());
+                }
                 println!(
                     "\n{}",
                     format!("--- Logs: {} (last {}) ---", node_id, lines).dimmed()
                 );
-
                 if let Some(rows) = data["logs"].as_array() {
                     for row in rows {
                         if let Some(msg) = row.as_str() {
@@ -3634,11 +3645,17 @@ fn memory_file_path(memory_dir: &std::path::Path, file_name: &str) -> Result<std
     Ok(path)
 }
 
-pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
+pub async fn view_memory(ctx: &KnaixContext, node_id: &str, file: Option<&str>) -> Result<()> {
+    let json = ctx.output_format == "json";
     let home_dir = home::home_dir().unwrap_or_else(|| std::path::Path::new(".").to_path_buf());
     let memory_dir = home_dir.join(".knaix").join("memory").join(node_id);
 
     if !memory_dir.exists() {
+        if json {
+            let v = serde_json::json!({ "node": node_id, "files": [] });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            return Ok(());
+        }
         println!(
             "{} No notes saved for node {}. In the REPL, {} saves one.",
             "Info:".blue(),
@@ -3663,6 +3680,12 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
             .await
             .context("Failed to read memory file")?;
 
+        if json {
+            let v = serde_json::json!({ "node": node_id, "file": file_name, "contents": contents });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            return Ok(());
+        }
+
         println!(
             "\n{} Notes for node {} ({})\n",
             "●".magenta(),
@@ -3675,13 +3698,15 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
 
         println!("\n{}", "--- End ---".dimmed());
     } else {
-        println!(
-            "\n{} Notes for node {} ({})",
-            "●".magenta(),
-            node_id.bold(),
-            memory_dir.display().to_string().dimmed()
-        );
-        println!("{}\n", "knaix memory --file <filename> reads one.".dimmed());
+        if !json {
+            println!(
+                "\n{} Notes for node {} ({})",
+                "●".magenta(),
+                node_id.bold(),
+                memory_dir.display().to_string().dimmed()
+            );
+            println!("{}\n", "knaix memory --file <filename> reads one.".dimmed());
+        }
 
         let mut entries = tokio::fs::read_dir(&memory_dir).await?;
         let mut files = Vec::new();
@@ -3701,6 +3726,12 @@ pub async fn view_memory(_ctx: &KnaixContext, node_id: &str, file: Option<&str>)
             }
         }
 
+        if json {
+            files.sort();
+            let v = serde_json::json!({ "node": node_id, "files": files });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            return Ok(());
+        }
         if files.is_empty() {
             println!("  No files found.");
         } else {

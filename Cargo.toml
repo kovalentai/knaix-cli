@@ -1,6 +1,6 @@
 [package]
 name = "knaix"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 description = "The command-line client for Kovalent AI: provision nodes, ingest documents, and chat over a zero-trust mesh."
 authors = ["Kovalent AI"]
@@ -42,6 +42,10 @@ globset = "0.4.19"
 toml = "0.8"
 clap_complete = "4.6.7"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+# Ed25519 verification of tunnel tickets (`knaix device`). Already in the tree
+# through rustls, so it adds no new code to audit; a device never holds a
+# signing key.
+ring = "0.17"
 
 # SIGPIPE back to the kernel at startup (see restore_sigpipe), and sysctl for
 # the machine's memory on macOS.
