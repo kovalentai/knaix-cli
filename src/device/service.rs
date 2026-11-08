@@ -118,6 +118,7 @@ fn quiet(cmd: &mut Command) -> bool {
 }
 
 fn uid() -> u32 {
+    #[cfg(unix)]
     {
         unsafe { libc::getuid() }
     }
