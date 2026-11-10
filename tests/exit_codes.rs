@@ -424,6 +424,26 @@ fn a_failed_sign_in_names_the_path_that_needs_no_control_plane() {
     );
 }
 
+/// A script cannot answer a password prompt, so it is told to use a token
+/// rather than left waiting on one.
+#[test]
+fn a_terminal_sign_in_with_no_terminal_points_at_a_token() {
+    let home = scratch_home("loginnotty");
+
+    let out = knaix(&home)
+        .args(["login", "--no-browser"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected Usage: {stderr}");
+    assert!(
+        stderr.contains("KNAIX_TOKEN"),
+        "named no way forward: {stderr}"
+    );
+}
+
 /// The note belongs to the auth failure, not to one command.
 #[test]
 fn the_no_account_note_is_not_particular_to_one_command() {
