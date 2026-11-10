@@ -502,7 +502,7 @@ async fn heartbeat_loop(
                 });
                 // 15 s, then backing off to 2 minutes while the control plane
                 // is away; the gateway keeps serving open pools meanwhile.
-                wait = Duration::from_secs((15u64 << failures.min(3)).min(120));
+                wait = Duration::from_secs(15 << failures.min(3));
             }
         }
     }
