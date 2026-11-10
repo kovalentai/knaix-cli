@@ -232,8 +232,10 @@ fn bench_reports_an_unreachable_node_before_it_ingests_anything() {
 fn doctor_does_not_hang_on_a_wedged_docker_daemon() {
     let home = scratch_home("wedged");
     write_config(&home, r#"{"default_node_id":"local"}"#);
-    // Accepts the call and never returns, the way a wedged daemon does.
-    let bin = fake_docker(&home, "sleep 900");
+    // Accepts the call and never returns, the way a wedged daemon does. `exec`,
+    // so killing docker ends the sleep too: a sleep left behind holds whatever
+    // pipes it inherited, and a test reading one waits out all 900 seconds.
+    let bin = fake_docker(&home, "exec sleep 900");
 
     let started = std::time::Instant::now();
     let out = run(knaix(&home)

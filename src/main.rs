@@ -19,6 +19,8 @@ mod report;
 mod selftest;
 mod shell;
 mod stdin_arg;
+#[cfg(test)]
+mod testing;
 mod top;
 mod update;
 mod upload_filter;

@@ -287,6 +287,12 @@ mod tests {
             Some("device_unauthorized")
         );
         assert_eq!(error_message(&serde_json::json!({})), None);
+        // A blank field says nothing, so the next one speaks.
+        assert_eq!(
+            error_message(&serde_json::json!({"details": "  ", "message": "Too many devices"}))
+                .as_deref(),
+            Some("Too many devices")
+        );
     }
 
     #[test]
@@ -294,5 +300,308 @@ mod tests {
         let b: Beat = serde_json::from_str(r#"{"success":true,"nextHeartbeatSeconds":15,"warnings":[],"ticketKeyId":"c1d40ab1863aca6e"}"#).unwrap();
         assert_eq!(b.ticket_key_id.as_deref(), Some("c1d40ab1863aca6e"));
         assert_eq!(b.next_heartbeat_seconds, Some(15));
+    }
+
+    use crate::exit::code_of;
+    use crate::testing::{fake_api, Call};
+    use serde_json::{json, Value};
+
+    fn report() -> Report {
+        Report {
+            backend: "cuda".into(),
+            total_memory_bytes: 24,
+            usable_memory_bytes: 20,
+            llama_build: None,
+            rpc_endpoint: Some("100.64.0.9:47100".into()),
+        }
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    #[tokio::test]
+    async fn enrolment_sends_this_machine_with_the_session_and_reads_the_answer() {
+        let api = fake_api(vec![(
+            "POST /api/compute/devices",
+            201,
+            json!({"device": {"id": "d1"}, "token": "kvd_t",
+                   "ticketKey": {"keyId": "k1", "publicKeyPem": "pem"}, "warnings": ["w"]}),
+        )])
+        .await;
+
+        let e = enroll(&client(), &api.url, "sess", "studio", &report())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (e.device["id"].as_str(), e.token.as_str()),
+            (Some("d1"), "kvd_t")
+        );
+        assert_eq!(
+            e.ticket_key,
+            Some(TicketKey {
+                key_id: "k1".into(),
+                public_key_pem: "pem".into()
+            })
+        );
+        assert_eq!(e.warnings, ["w"]);
+        let call = &api.calls()[0];
+        assert_eq!(call.auth.as_deref(), Some("Bearer sess"));
+        assert_eq!(call.body["name"], "studio");
+        assert_eq!(call.body["platform"], std::env::consts::OS);
+        assert_eq!(call.body["usableMemoryBytes"], 20);
+    }
+
+    #[tokio::test]
+    async fn a_refused_enrolment_says_why_and_a_plan_refusal_says_which_plans() {
+        let refused = |status, body: Value| async move {
+            let api = fake_api(vec![("POST /api/compute/devices", status, body)]).await;
+            enroll(&client(), &api.url, "s", "n", &report())
+                .await
+                .unwrap_err()
+        };
+
+        let err = refused(403, json!({"error": "Your plan does not include this"})).await;
+        assert_eq!(code_of(&err), Code::Auth);
+        assert!(err
+            .to_string()
+            .starts_with("Your plan does not include pooled inference."));
+
+        let err = refused(
+            400,
+            json!({"details": "An account holds at most 32 devices"}),
+        )
+        .await;
+        assert_eq!(code_of(&err), Code::Error);
+        assert_eq!(
+            err.to_string(),
+            "Enrolling this machine failed: An account holds at most 32 devices"
+        );
+
+        let err = refused(500, Value::Null).await;
+        assert_eq!(err.to_string(), "Enrolling this machine failed: HTTP 500");
+
+        let err = refused(201, json!({"unexpected": true})).await;
+        assert_eq!(err.to_string(), "The enrolment answer was not understood");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_is_signed_by_the_device_and_a_removed_device_is_told() {
+        let api = fake_api(vec![(
+            "POST /api/compute/devices/heartbeat",
+            200,
+            json!({"nextHeartbeatSeconds": 15}),
+        )])
+        .await;
+        let beat = heartbeat(&client(), &api.url, "kvd_t", &report())
+            .await
+            .unwrap();
+        assert_eq!(beat.next_heartbeat_seconds, Some(15));
+        assert_eq!(
+            api.calls(),
+            [Call {
+                route: "POST /api/compute/devices/heartbeat".into(),
+                auth: Some("Bearer kvd_t".into()),
+                body: serde_json::to_value(report()).unwrap(),
+            }]
+        );
+
+        let gone = fake_api(vec![(
+            "POST /api/compute/devices/heartbeat",
+            401,
+            Value::Null,
+        )])
+        .await;
+        let err = heartbeat(&client(), &gone.url, "kvd_t", &report())
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), Code::Auth);
+        assert!(err
+            .to_string()
+            .contains("run `knaix device join` to enrol it again"));
+
+        let down = fake_api(vec![(
+            "POST /api/compute/devices/heartbeat",
+            500,
+            Value::Null,
+        )])
+        .await;
+        let err = heartbeat(&client(), &down.url, "kvd_t", &report())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "The heartbeat was refused: HTTP 500");
+
+        // An answer it cannot read is still a heartbeat that landed.
+        let odd = fake_api(vec![(
+            "POST /api/compute/devices/heartbeat",
+            200,
+            json!("ok"),
+        )])
+        .await;
+        let beat = heartbeat(&client(), &odd.url, "kvd_t", &report())
+            .await
+            .unwrap();
+        assert_eq!(beat.next_heartbeat_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn listing_reads_the_accounts_devices_or_says_why_not() {
+        let api = fake_api(vec![(
+            "GET /api/compute/devices",
+            200,
+            json!({"devices": []}),
+        )])
+        .await;
+        assert_eq!(
+            list(&client(), &api.url, "s").await.unwrap(),
+            json!({"devices": []})
+        );
+        assert_eq!(api.calls()[0].auth.as_deref(), Some("Bearer s"));
+
+        let api = fake_api(vec![(
+            "GET /api/compute/devices",
+            401,
+            json!({"error": "expired"}),
+        )])
+        .await;
+        let err = list(&client(), &api.url, "s").await.unwrap_err();
+        assert_eq!(
+            (code_of(&err), err.to_string()),
+            (Code::Auth, "Listing devices failed: expired".into())
+        );
+
+        let api = fake_api(vec![("GET /api/compute/devices", 200, Value::Null)]).await;
+        let err = list(&client(), &api.url, "s").await.unwrap_err();
+        assert_eq!(err.to_string(), "The device list was not understood");
+    }
+
+    #[tokio::test]
+    async fn removing_a_device_that_is_already_gone_is_success() {
+        let api = fake_api(vec![("DELETE /api/compute/devices/d1", 204, Value::Null)]).await;
+        remove(&client(), &api.url, "s", "d1").await.unwrap();
+        assert_eq!(api.calls()[0].auth.as_deref(), Some("Bearer s"));
+
+        let api = fake_api(vec![]).await;
+        remove(&client(), &api.url, "s", "d1").await.unwrap();
+
+        let api = fake_api(vec![("DELETE /api/compute/devices/d1", 500, Value::Null)]).await;
+        let err = remove(&client(), &api.url, "s", "d1").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Removing the device from your account failed: HTTP 500"
+        );
+    }
+
+    async fn join_key_answer(status: u16, body: Value) -> Result<JoinKey> {
+        let api = fake_api(vec![("POST /api/compute/join-key", status, body)]).await;
+        join_key(&client(), &api.url, "s").await
+    }
+
+    #[tokio::test]
+    async fn a_join_key_must_carry_the_compute_tag() {
+        assert_eq!(
+            join_key_answer(200, json!({"authKey": "tskey-1", "tag": "tag:c-acme"}))
+                .await
+                .unwrap(),
+            JoinKey::Managed {
+                auth_key: "tskey-1".into(),
+                tag: "tag:c-acme".into()
+            }
+        );
+        for body in [
+            json!({"authKey": "tskey-1", "tag": "tag:admin"}),
+            json!({"authKey": "", "tag": "tag:c-acme"}),
+            json!({}),
+        ] {
+            let err = join_key_answer(200, body).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "The control plane returned a join key without the compute tag"
+            );
+        }
+        let err = join_key_answer(200, Value::Null).await.unwrap_err();
+        assert_eq!(err.to_string(), "The join key answer was not understood");
+    }
+
+    #[tokio::test]
+    async fn an_account_on_its_own_tailnet_gets_no_key() {
+        assert_eq!(
+            join_key_answer(409, json!({"error": "This account uses its own tailnet"}))
+                .await
+                .unwrap(),
+            JoinKey::OwnTailnet
+        );
+        let err = join_key_answer(409, json!({"error": "Tailnet not provisioned"}))
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            "No tailnet is set up for this account yet: Tailnet not provisioned"
+        );
+        let err = join_key_answer(500, Value::Null).await.unwrap_err();
+        assert_eq!(err.to_string(), "Getting a tailnet key failed: HTTP 500");
+    }
+
+    #[tokio::test]
+    async fn the_ticket_key_is_public_and_its_outage_is_explained() {
+        let api = fake_api(vec![(
+            "GET /api/compute/ticket-key",
+            200,
+            json!({"keyId": "k1", "publicKeyPem": "pem"}),
+        )])
+        .await;
+        let key = ticket_key(&client(), &api.url).await.unwrap();
+        assert_eq!(
+            key,
+            TicketKey {
+                key_id: "k1".into(),
+                public_key_pem: "pem".into()
+            }
+        );
+        assert_eq!(
+            api.calls()[0].auth,
+            None,
+            "the key is fetched without a session"
+        );
+
+        let off = fake_api(vec![("GET /api/compute/ticket-key", 503, Value::Null)]).await;
+        let err = ticket_key(&client(), &off.url).await.unwrap_err();
+        assert_eq!(code_of(&err), Code::Unavailable);
+        assert!(err
+            .to_string()
+            .starts_with("The control plane is not issuing tunnel tickets"));
+
+        let missing = fake_api(vec![]).await;
+        let err = ticket_key(&client(), &missing.url).await.unwrap_err();
+        assert_eq!(
+            (code_of(&err), err.to_string()),
+            (
+                Code::NotFound,
+                "Fetching the ticket key failed: HTTP 404".into()
+            )
+        );
+
+        let odd = fake_api(vec![("GET /api/compute/ticket-key", 200, json!({}))]).await;
+        let err = ticket_key(&client(), &odd.url).await.unwrap_err();
+        assert_eq!(err.to_string(), "The ticket key answer was not understood");
+    }
+
+    #[tokio::test]
+    async fn an_api_that_is_not_listening_is_unavailable() {
+        let dead = "http://127.0.0.1:9";
+        let errors = [
+            enroll(&client(), dead, "s", "n", &report()).await.err(),
+            heartbeat(&client(), dead, "t", &report()).await.err(),
+            list(&client(), dead, "s").await.err(),
+            remove(&client(), dead, "s", "d").await.err(),
+            join_key(&client(), dead, "s").await.err(),
+            ticket_key(&client(), dead).await.err(),
+        ];
+        for err in errors.into_iter().map(Option::unwrap) {
+            assert_eq!(code_of(&err), Code::Unavailable);
+            assert_eq!(err.to_string(), "Could not reach the Kovalent API");
+        }
     }
 }
