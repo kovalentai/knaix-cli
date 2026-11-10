@@ -102,19 +102,23 @@ pub fn find() -> Option<PathBuf> {
         "/usr/local/bin/tailscale",
         "/usr/bin/tailscale",
     ];
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("tailscale");
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    candidates.iter().map(PathBuf::from).find(|p| p.is_file())
+    find_in(std::env::var_os("PATH"), &candidates)
+}
+
+fn find_in(path: Option<std::ffi::OsString>, candidates: &[&str]) -> Option<PathBuf> {
+    path.iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("tailscale"))
+        .chain(candidates.iter().map(PathBuf::from))
+        .find(|p| p.is_file())
 }
 
 pub fn require() -> Result<PathBuf> {
-    find()
+    installed(find())
+}
+
+fn installed(found: Option<PathBuf>) -> Result<PathBuf> {
+    found
         .ok_or_else(|| {
             anyhow!("Tailscale is not installed. Install it from https://tailscale.com/download, then run this again.")
         })
@@ -139,6 +143,11 @@ pub fn status(bin: &Path) -> Result<Status> {
 /// change accounts without restating every non-default flag; the caller has
 /// already asked the owner before switching a machine that was on a tailnet.
 pub fn up_with_key(bin: &Path, auth_key: &str, hostname: &str) -> Result<()> {
+    up_with_key_as(needs_sudo().then_some("sudo"), bin, auth_key, hostname)
+}
+
+/// `up_with_key`, run through `elevate` (sudo) when it is given.
+fn up_with_key_as(elevate: Option<&str>, bin: &Path, auth_key: &str, hostname: &str) -> Result<()> {
     let dir = crate::device::state::device_dir()?;
     let key_file = dir.join(format!(".tailscale-key.{}", std::process::id()));
     crate::device::state::write_private(&key_file, auth_key.as_bytes())?;
@@ -149,8 +158,8 @@ pub fn up_with_key(bin: &Path, auth_key: &str, hostname: &str) -> Result<()> {
         "--reset".into(),
         "--timeout=60s".into(),
     ];
-    let mut cmd = if needs_sudo() {
-        let mut c = Command::new("sudo");
+    let mut cmd = if let Some(elevate) = elevate {
+        let mut c = Command::new(elevate);
         args.insert(0, bin.display().to_string());
         c.args(&args);
         c
@@ -258,5 +267,167 @@ mod tests {
         assert_eq!(node_tag_for("tag:c-acme").as_deref(), Some("tag:u-acme"));
         assert_eq!(node_tag_for("tag:u-acme"), None);
         assert_eq!(node_tag_for("tag:c-"), None);
+    }
+
+    use crate::config::ScratchHome;
+    use crate::exit::code_of;
+
+    #[cfg(unix)]
+    use crate::testing::{args_of, fake_tool};
+
+    #[test]
+    fn the_cli_is_found_on_the_path_before_the_usual_places() {
+        let home = ScratchHome::new();
+        let (on_path, app) = (home.0.join("bin"), home.0.join("app/Tailscale"));
+        std::fs::create_dir_all(&on_path).unwrap();
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(on_path.join("tailscale"), "").unwrap();
+        std::fs::write(&app, "").unwrap();
+        let path = Some(std::env::join_paths([&home.0, &on_path]).unwrap());
+        let app_str = app.to_str().unwrap();
+
+        assert_eq!(find_in(path, &[app_str]), Some(on_path.join("tailscale")));
+        assert_eq!(
+            find_in(None, &["/no/such/tailscale", app_str]),
+            Some(app.clone())
+        );
+        assert_eq!(find_in(None, &["/no/such/tailscale"]), None);
+        // This machine's answer, whichever it is, agrees with `require`.
+        assert_eq!(find().is_some(), require().is_ok());
+    }
+
+    #[test]
+    fn a_machine_without_tailscale_is_told_where_to_get_it() {
+        let err = installed(None).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert!(
+            err.to_string().contains("https://tailscale.com/download"),
+            "{err}"
+        );
+        assert_eq!(installed(Some("/t".into())).unwrap(), PathBuf::from("/t"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_reads_the_client_even_when_it_exits_non_zero_logged_out() {
+        let home = ScratchHome::new();
+        let ts = fake_tool(
+            &home.0,
+            "tailscale",
+            r#"echo '{"BackendState":"NeedsLogin","Self":{"TailscaleIPs":[]}}'; exit 1"#,
+        );
+        let s = status(Path::new(&ts)).unwrap();
+        assert_eq!(
+            (s.backend_state.as_str(), s.running()),
+            ("NeedsLogin", false)
+        );
+        assert_eq!(args_of(&ts), ["status --json"]);
+
+        let err = status(&home.0.join("missing")).unwrap_err();
+        assert_eq!(err.to_string(), "Could not run tailscale status");
+    }
+
+    /// A tailscale that keeps a copy of the key file it was pointed at, and
+    /// that file's permissions, beside itself.
+    #[cfg(unix)]
+    fn key_reading_tailscale(home: &Path, name: &str, exit: i32) -> String {
+        fake_tool(
+            home,
+            name,
+            &format!(
+                r#"f=$(echo "$@" | sed -n 's/.*--auth-key=file:\([^ ]*\).*/\1/p')
+cat "$f" > "$0.key"; ls -l "$f" | cut -c1-10 > "$0.mode"; exit {exit}"#
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_join_key_reaches_tailscale_only_in_a_private_file_that_is_then_deleted() {
+        let home = ScratchHome::new();
+        let ts = key_reading_tailscale(&home.0, "tailscale", 0);
+
+        up_with_key_as(None, Path::new(&ts), "tskey-secret", "studio").unwrap();
+
+        let args = args_of(&ts).concat();
+        let key_file = crate::device::state::device_dir()
+            .unwrap()
+            .join(format!(".tailscale-key.{}", std::process::id()));
+        assert_eq!(
+            args,
+            format!(
+                "up --auth-key=file:{} --hostname=studio --reset --timeout=60s",
+                key_file.display()
+            )
+        );
+        assert!(
+            !args.contains("tskey-secret"),
+            "the key was on the command line"
+        );
+        let read = |ext: &str| std::fs::read_to_string(format!("{ts}.{ext}")).unwrap();
+        assert_eq!(read("key"), "tskey-secret");
+        assert_eq!(read("mode").trim(), "-rw-------");
+        assert!(!key_file.exists(), "the key file outlived the call");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailscale_up_runs_under_sudo_when_asked_and_a_failure_still_deletes_the_key() {
+        let home = ScratchHome::new();
+        let ts = key_reading_tailscale(&home.0, "tailscale", 1);
+        let sudo = fake_tool(&home.0, "sudo", r#"exec "$@""#);
+        let key_file = crate::device::state::device_dir()
+            .unwrap()
+            .join(format!(".tailscale-key.{}", std::process::id()));
+
+        let err =
+            up_with_key_as(Some(&sudo), Path::new(&ts), "tskey-secret", "studio").unwrap_err();
+
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert!(
+            err.to_string().starts_with("tailscale up did not finish."),
+            "{err}"
+        );
+        assert!(args_of(&sudo)[0].starts_with(&format!("{ts} up --auth-key=file:")));
+        assert_eq!(
+            std::fs::read_to_string(format!("{ts}.key")).unwrap(),
+            "tskey-secret"
+        );
+        assert!(!key_file.exists());
+
+        let err = up_with_key_as(None, &home.0.join("missing"), "k", "h").unwrap_err();
+        assert_eq!(err.to_string(), "Could not run tailscale up");
+        assert!(!key_file.exists());
+    }
+
+    #[test]
+    fn only_linux_needs_root_to_bring_tailscale_up() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(needs_sudo(), unsafe { libc::geteuid() } != 0);
+        #[cfg(not(target_os = "linux"))]
+        assert!(!needs_sudo());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn whois_names_the_peers_tags_or_nothing_when_it_cannot_say() {
+        let home = ScratchHome::new();
+        let ts = fake_tool(
+            &home.0,
+            "tailscale",
+            r#"echo '{"Node":{"Tags":["tag:u-acme"]}}'"#,
+        );
+        assert_eq!(
+            whois_tags(Path::new(&ts), "100.64.0.7").await,
+            Some(vec!["tag:u-acme".to_string()])
+        );
+        assert_eq!(args_of(&ts), ["whois --json 100.64.0.7"]);
+
+        let refusing = fake_tool(&home.0, "tailscale-no", "exit 1");
+        assert_eq!(whois_tags(Path::new(&refusing), "100.64.0.7").await, None);
+        assert_eq!(
+            whois_tags(&home.0.join("missing"), "100.64.0.7").await,
+            None
+        );
     }
 }
