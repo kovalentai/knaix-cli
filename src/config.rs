@@ -91,6 +91,12 @@ pub fn home() -> Option<PathBuf> {
     home_dir()
 }
 
+/// Whether this test runs under a `ScratchHome`.
+#[cfg(test)]
+pub(crate) fn in_scratch_home() -> bool {
+    TEST_HOME.with(|h| h.borrow().is_some())
+}
+
 /// Returns the full path to the .knaix/config.json file.
 pub fn get_config_path() -> PathBuf {
     let mut path = home().expect("Could not find home directory");
