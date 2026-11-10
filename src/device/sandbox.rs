@@ -320,44 +320,59 @@ pub fn session_env() -> Vec<(String, String)> {
 
 /// Choose the strongest sandbox this machine can actually run.
 pub fn choose(p: &Paths, env: &[(String, String)]) -> Result<Plan> {
-    if cfg!(target_os = "macos") {
-        let plan = sandbox_exec_plan(p, env);
-        if probe(&plan, &p.binary.display().to_string()) {
-            return Ok(plan);
-        }
-        return Err(anyhow!(
-            "macOS refused to start the rpc-server sandbox (sandbox-exec). The device will not run rpc-server without it."
-        ))
-        .coded(Code::Precondition);
-    }
-    if cfg!(target_os = "linux") {
-        let exe = p.exe.display().to_string();
-        // Resolved to absolute paths here, because rpc-server is started
-        // with a minimal PATH that need not contain wherever these live.
-        if let Some(program) = which("systemd-run") {
-            let mut systemd = systemd_plan(p, env, &session_env());
-            systemd.program = program.display().to_string();
-            if probe(&systemd, &exe) {
-                return Ok(systemd);
+    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("/home"));
+    choose_on(std::env::consts::OS, p, env, &home, &which, &probe)
+}
+
+/// `choose`, given the OS, the home to hide, how to find a wrapper and how to
+/// probe a plan.
+fn choose_on(
+    os: &str,
+    p: &Paths,
+    env: &[(String, String)],
+    home: &Path,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+    works: &dyn Fn(&Plan, &str) -> bool,
+) -> Result<Plan> {
+    match os {
+        "macos" => {
+            let plan = sandbox_exec_plan(p, env);
+            if works(&plan, &p.binary.display().to_string()) {
+                return Ok(plan);
             }
+            Err(anyhow!(
+                "macOS refused to start the rpc-server sandbox (sandbox-exec). The device will not run rpc-server without it."
+            ))
+            .coded(Code::Precondition)
         }
-        if let Some(program) = which("bwrap") {
-            let home = home::home_dir().unwrap_or_else(|| PathBuf::from("/home"));
-            let mut bwrap = bwrap_plan(p, env, &home);
-            bwrap.program = program.display().to_string();
-            if probe(&bwrap, &exe) {
-                return Ok(bwrap);
+        "linux" => {
+            let exe = p.exe.display().to_string();
+            // Resolved to absolute paths here, because rpc-server is started
+            // with a minimal PATH that need not contain wherever these live.
+            if let Some(program) = find("systemd-run") {
+                let mut systemd = systemd_plan(p, env, &session_env());
+                systemd.program = program.display().to_string();
+                if works(&systemd, &exe) {
+                    return Ok(systemd);
+                }
             }
+            if let Some(program) = find("bwrap") {
+                let mut bwrap = bwrap_plan(p, env, home);
+                bwrap.program = program.display().to_string();
+                if works(&bwrap, &exe) {
+                    return Ok(bwrap);
+                }
+            }
+            Err(anyhow!(
+                "No sandbox is available for rpc-server. Enable systemd user sessions with user namespaces, or install bubblewrap (`bwrap`), then run this again."
+            ))
+            .coded(Code::Precondition)
         }
-        return Err(anyhow!(
-            "No sandbox is available for rpc-server. Enable systemd user sessions with user namespaces, or install bubblewrap (`bwrap`), then run this again."
+        _ => Err(anyhow!(
+            "Compute devices are not supported on this platform yet."
         ))
-        .coded(Code::Precondition);
+        .coded(Code::Precondition),
     }
-    Err(anyhow!(
-        "Compute devices are not supported on this platform yet."
-    ))
-    .coded(Code::Precondition)
 }
 
 fn which(program: &str) -> Option<PathBuf> {
@@ -369,10 +384,14 @@ fn which(program: &str) -> Option<PathBuf> {
 
 /// Stop a systemd-run unit left from an earlier run, so its socket is free.
 pub fn stop_unit(unit: &str) {
-    if !cfg!(target_os = "linux") {
+    stop_unit_on(std::env::consts::OS, "systemctl", unit);
+}
+
+fn stop_unit_on(os: &str, systemctl: &str, unit: &str) {
+    if os != "linux" {
         return;
     }
-    let _ = Command::new("systemctl")
+    let _ = Command::new(systemctl)
         .args(["--user", "stop", &format!("{unit}.service")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -383,6 +402,11 @@ pub fn stop_unit(unit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::config::ScratchHome;
+    use crate::exit::{code_of, Code};
+    #[cfg(unix)]
+    use crate::testing::{args_of, fake_tool};
 
     struct Fixture {
         binary: PathBuf,
@@ -549,5 +573,190 @@ mod tests {
         let profile = sandbox_exec_profile(&paths(&f));
         assert!(profile.contains(r#"\")"#));
         assert!(!profile.contains(r#"(subpath "/Users/x") (allow"#));
+    }
+
+    /// What `choose_on` probed: each plan's kind and what followed the wrapper.
+    type Probed = std::cell::RefCell<Vec<(Kind, String, String)>>;
+
+    fn choose_with(os: &str, found: &[&str], working: &[Kind], probed: &Probed) -> Result<Plan> {
+        let f = linux();
+        let p = paths(&f);
+        let find = |name: &str| {
+            found
+                .contains(&name)
+                .then(|| PathBuf::from(format!("/opt/{name}")))
+        };
+        let works = |plan: &Plan, first_inner: &str| {
+            probed.borrow_mut().push((
+                plan.kind.clone(),
+                plan.program.clone(),
+                first_inner.to_string(),
+            ));
+            working.contains(&plan.kind)
+        };
+        choose_on(os, &p, &[], Path::new("/home/maya"), &find, &works)
+    }
+
+    #[test]
+    fn macos_gets_sandbox_exec_or_nothing() {
+        let probed = Probed::default();
+        let plan = choose_with("macos", &[], &[Kind::SandboxExec], &probed).unwrap();
+        assert_eq!(plan.kind.as_str(), "sandbox-exec");
+        assert_eq!(plan.program, "/usr/bin/sandbox-exec");
+        // Probed with rpc-server replaced, not the bridge.
+        assert_eq!(
+            probed.take(),
+            [(
+                Kind::SandboxExec,
+                "/usr/bin/sandbox-exec".into(),
+                linux().binary.display().to_string()
+            )]
+        );
+
+        let e = choose_with("macos", &[], &[], &probed).unwrap_err();
+        assert_eq!(code_of(&e), Code::Precondition);
+        assert!(e
+            .to_string()
+            .contains("refused to start the rpc-server sandbox"));
+    }
+
+    #[test]
+    fn linux_prefers_systemd_then_bubblewrap_each_by_its_full_path() {
+        let exe = linux().exe.display().to_string();
+        let probed = Probed::default();
+        let both = ["systemd-run", "bwrap"];
+
+        let plan = choose_with("linux", &both, &[Kind::Systemd, Kind::Bwrap], &probed).unwrap();
+        assert_eq!(plan.kind.as_str(), "systemd");
+        assert_eq!(plan.program, "/opt/systemd-run");
+        assert_eq!(
+            probed.take(),
+            [(Kind::Systemd, "/opt/systemd-run".into(), exe.clone())]
+        );
+
+        // A systemd that cannot apply its policy falls back to bubblewrap,
+        // which hides the home it was given.
+        let plan = choose_with("linux", &both, &[Kind::Bwrap], &probed).unwrap();
+        assert_eq!(plan.kind.as_str(), "bwrap");
+        assert_eq!(plan.program, "/opt/bwrap");
+        assert!(plan.args.join(" ").contains("--tmpfs /home/maya"));
+        assert_eq!(
+            probed.take(),
+            [
+                (Kind::Systemd, "/opt/systemd-run".into(), exe.clone()),
+                (Kind::Bwrap, "/opt/bwrap".into(), exe.clone()),
+            ]
+        );
+
+        let plan = choose_with("linux", &["bwrap"], &[Kind::Bwrap], &probed).unwrap();
+        assert_eq!(plan.kind, Kind::Bwrap);
+        assert_eq!(probed.take().len(), 1, "systemd-run is not there to probe");
+    }
+
+    #[test]
+    fn linux_without_a_working_sandbox_and_other_systems_are_refused() {
+        let probed = Probed::default();
+        for found in [&[][..], &["systemd-run", "bwrap"][..]] {
+            let e = choose_with("linux", found, &[], &probed).unwrap_err();
+            assert_eq!(code_of(&e), Code::Precondition);
+            assert!(e.to_string().contains("No sandbox is available"), "{e}");
+        }
+        assert_eq!(probed.take().len(), 2, "each wrapper found was probed");
+
+        let e = choose_with("freebsd", &["bwrap"], &[Kind::Bwrap], &probed).unwrap_err();
+        assert_eq!(code_of(&e), Code::Precondition);
+        assert!(e.to_string().contains("not supported on this platform"));
+        assert!(probed.take().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn truth() -> &'static str {
+        if Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_runs_the_wrapper_around_true_under_its_own_unit() {
+        let home = ScratchHome::new();
+        let f = linux();
+        let p = paths(&f);
+        let exe = f.exe.display().to_string();
+        let mut plan = systemd_plan(&p, &[], &[]);
+        plan.program = fake_tool(&home.0, "systemd-run", "exit 0");
+        assert!(probe(&plan, &exe));
+        let line = args_of(&plan.program).pop().unwrap();
+        let args: Vec<&str> = line.split(' ').collect();
+        assert_eq!(args.last(), Some(&truth()));
+        assert!(args
+            .contains(&format!("--unit=knaix-rpc-server-probe-{}", std::process::id()).as_str()));
+        assert!(
+            !args.contains(&"--unit=knaix-rpc-server"),
+            "never the live unit"
+        );
+        assert!(!args.contains(&"--pipe"));
+        assert!(
+            !line.contains("device bridge"),
+            "the bridge is replaced: {line}"
+        );
+        assert!(args.contains(&"PrivateNetwork=yes"), "the policy is kept");
+
+        // A wrapper that fails, and a plan without what the probe replaces.
+        let mut bwrap = bwrap_plan(&p, &[], Path::new("/home/maya"));
+        bwrap.program = fake_tool(&home.0, "bwrap", "exit 1");
+        assert!(!probe(&bwrap, &exe));
+        let line = args_of(&bwrap.program).pop().unwrap();
+        assert!(
+            line.contains("--unshare-net") && line.ends_with(truth()),
+            "{line}"
+        );
+        assert!(!probe(&bwrap, "/not/in/the/plan"));
+        assert_eq!(args_of(&bwrap.program).len(), 1, "nothing ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_with_an_environment_passes_only_that_and_a_minimal_path() {
+        let home = ScratchHome::new();
+        let f = linux();
+        let p = paths(&f);
+        let tool = fake_tool(&home.0, "sandbox-exec", "env > \"$0.env\"");
+        let read_env = || std::fs::read_to_string(format!("{tool}.env")).unwrap();
+
+        let mut plan = sandbox_exec_plan(&p, &[("LLAMA_CACHE".into(), "/c".into())]);
+        plan.program = tool.clone();
+        assert!(probe(&plan, &f.binary.display().to_string()));
+        let env = read_env();
+        assert!(env.contains("LLAMA_CACHE=/c\n"), "{env}");
+        assert!(
+            env.contains("PATH=/usr/bin:/bin:/usr/sbin:/sbin\n"),
+            "{env}"
+        );
+        assert!(
+            !env.contains("HOME="),
+            "the device's environment is cleared: {env}"
+        );
+
+        // With none to give, the wrapper keeps the device's own.
+        plan.env.clear();
+        assert!(probe(&plan, &f.binary.display().to_string()));
+        assert!(read_env().contains("HOME="));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_unit_is_stopped_only_on_linux() {
+        let home = ScratchHome::new();
+        let systemctl = fake_tool(&home.0, "systemctl", "exit 0");
+        stop_unit_on("macos", &systemctl, "knaix-rpc-server");
+        assert!(args_of(&systemctl).is_empty());
+        stop_unit_on("linux", &systemctl, "knaix-rpc-server");
+        assert_eq!(
+            args_of(&systemctl),
+            ["--user stop knaix-rpc-server.service"]
+        );
     }
 }

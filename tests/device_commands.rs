@@ -627,3 +627,162 @@ fn logs_show_each_log_with_times_as_ages() {
         "an empty service log is left out: {out}"
     );
 }
+
+/// Install llama.cpp the way `join` leaves it: the binary and the record of
+/// its hash. The tag and build are the ones pinned in `src/device/llama.rs`.
+fn install_llama(home: &Path, variant: &str) {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home.join(format!(".knaix/llama/b11669-{variant}"));
+    fs::create_dir_all(&dir).unwrap();
+    // A stand-in that exits at once: rpc-server never comes up.
+    let binary = b"#!/bin/sh\nexit 1\n";
+    let path = dir.join("ggml-rpc-server");
+    fs::write(&path, binary).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let sha: String = Sha256::digest(binary)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let record = json!({
+        "tag": "b11669",
+        "build": "11669-620d222",
+        "variant": variant,
+        "files": [["ggml-rpc-server", sha]],
+    });
+    fs::write(dir.join("install.json"), record.to_string()).unwrap();
+}
+
+/// A Tailscale on the PATH, up at 127.0.0.1 with `tags`.
+fn tailscale(home: &Path, tags: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let status = json!({
+        "BackendState": "Running",
+        "Self": {"TailscaleIPs": ["127.0.0.1"], "Tags": tags},
+    });
+    let path = home.join("empty-path/tailscale");
+    fs::write(&path, format!("#!/bin/sh\necho '{status}'\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn run_is_refused_until_each_precondition_holds() {
+    let home = scratch_home("run-refused");
+    let device_run = || run(knaix(&home).args(["device", "run"]));
+    let refused = |want: &str, code: i32| {
+        let (got, _, err) = device_run();
+        assert_eq!(got, code, "{err}");
+        assert!(err.contains(want), "wanted {want:?}: {err}");
+    };
+
+    refused("not a compute device. Run `knaix device join` first.", 7);
+
+    enrol(&home, "http://127.0.0.1:9", json!({}));
+    {
+        let device = running_device(&home, json!({}));
+        refused(
+            &format!("already running on this machine (process {})", device.0),
+            7,
+        );
+    }
+    // As a device that exits leaves it.
+    fs::remove_file(home.join(".knaix/device/runtime.json")).unwrap();
+
+    enrol(
+        &home,
+        "http://127.0.0.1:9",
+        json!({"variant": "plan9-arm64"}),
+    );
+    refused("does not know the llama.cpp build 'plan9-arm64'", 7);
+
+    enrol(&home, "http://127.0.0.1:9", json!({}));
+    refused("llama.cpp b11669 is not installed", 7);
+
+    install_llama(&home, "macos-arm64");
+    enrol(
+        &home,
+        "http://127.0.0.1:9",
+        json!({"ticket_key_pem": KEY_PEM}),
+    );
+    refused("The pinned ticket key does not match its recorded id", 6);
+
+    let pinned = json!({"ticket_key_id": KEY_ID, "ticket_key_pem": KEY_PEM});
+    enrol(&home, "http://127.0.0.1:9", pinned.clone());
+    tailscale(&home, &["tag:c-other"]);
+    refused(
+        "no longer on Kovalent's tailnet with its device tag (tag:c-acme)",
+        7,
+    );
+
+    tailscale(&home, &["tag:c-acme"]);
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut on_taken = pinned;
+    on_taken["gateway_port"] = json!(port);
+    enrol(&home, "http://127.0.0.1:9", on_taken);
+    refused(&format!("Could not listen on 127.0.0.1:{port}"), 7);
+}
+
+#[test]
+fn run_serves_until_the_control_plane_refuses_it_and_then_stands_down() {
+    let home = scratch_home("run-removed");
+    let (url, calls) = api(vec![(
+        "POST /api/compute/devices/heartbeat",
+        401,
+        json!({}),
+    )]);
+    let port = free_port();
+    enrol(
+        &home,
+        &url,
+        json!({"ticket_key_id": KEY_ID, "ticket_key_pem": KEY_PEM, "gateway_port": port}),
+    );
+    install_llama(&home, "macos-arm64");
+    tailscale(&home, &["tag:c-acme"]);
+    let services = [
+        home.join("Library/LaunchAgents/com.kovalent.knaix-device.plist"),
+        home.join(".config/systemd/user/knaix-device.service"),
+    ];
+    for path in &services {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    let (code, _, err) = run(knaix(&home).args(["device", "run"]));
+
+    assert_eq!(code, 3, "{err}");
+    assert!(
+        err.contains(&format!("Gateway listening on 127.0.0.1:{port}")),
+        "{err}"
+    );
+    assert!(err.contains("no longer recognizes this device"), "{err}");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["POST /api/compute/devices/heartbeat Bearer kvd_secret"]
+    );
+    // Removed from the account: a note for `status`, and no restart.
+    let device = home.join(".knaix/device");
+    assert!(device.join("removed").exists());
+    let log = fs::read_to_string(device.join("gateway.log")).unwrap();
+    assert!(
+        log.contains("removed from the account; stopping the service"),
+        "{log}"
+    );
+    assert!(
+        !device.join("runtime.json").exists(),
+        "a stopped device is not running"
+    );
+    assert_eq!(
+        services.iter().filter(|p| p.exists()).count(),
+        1,
+        "this platform's service is uninstalled; the other's was never its own"
+    );
+}
