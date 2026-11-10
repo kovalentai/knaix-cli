@@ -44,7 +44,7 @@ jobs:
       - name: Test, with coverage floors
         run: |
           cargo llvm-cov --locked --summary-only \
-            --fail-under-lines 53 --fail-under-regions 55 --fail-under-functions 64
+            --fail-under-lines 57 --fail-under-regions 57 --fail-under-functions 65
 
   # A release publishes a Windows binary, but nothing compiled for Windows until
   # the tag was already cut. Code that only fails there -- a Unix-only helper, a
