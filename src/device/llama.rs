@@ -250,6 +250,16 @@ pub async fn ensure_installed(
     variant: &Variant,
     show_progress: bool,
 ) -> Result<PathBuf> {
+    ensure_installed_from(BASE_URL, client, variant, show_progress).await
+}
+
+/// `ensure_installed`, downloading from the releases at `base`.
+async fn ensure_installed_from(
+    base: &str,
+    client: &reqwest::Client,
+    variant: &Variant,
+    show_progress: bool,
+) -> Result<PathBuf> {
     if let Ok(bin) = verify(variant) {
         return Ok(bin);
     }
@@ -261,7 +271,7 @@ pub async fn ensure_installed(
     let result = async {
         for archive in variant.archives {
             let path = staging.join(archive.name);
-            download(client, archive, &path, show_progress).await?;
+            download(client, base, archive, &path, show_progress).await?;
             unpack(&path, &staging.join("unpacked"))?;
             fs::remove_file(&path).ok();
         }
@@ -305,11 +315,12 @@ pub async fn ensure_installed(
 /// hash is the pinned one.
 async fn download(
     client: &reqwest::Client,
+    base: &str,
     archive: &Archive,
     path: &Path,
     show_progress: bool,
 ) -> Result<()> {
-    let url = format!("{BASE_URL}/{TAG}/{}", archive.name);
+    let url = format!("{base}/{TAG}/{}", archive.name);
     let resp = client
         .get(&url)
         // Large archives on a slow link: the client's 30 s whole-request
@@ -382,6 +393,10 @@ fn unpack(archive: &Path, into: &Path) -> Result<()> {
 /// The environment rpc-server needs to find its libraries and its cache, and
 /// nothing else of the caller's: no tokens, no cloud credentials.
 pub fn runtime_env(install: &Path, cache: &Path) -> Vec<(String, String)> {
+    runtime_env_on(std::env::consts::OS, install, cache)
+}
+
+fn runtime_env_on(os: &str, install: &Path, cache: &Path) -> Vec<(String, String)> {
     let mut env = vec![
         ("LLAMA_CACHE".to_string(), cache.display().to_string()),
         ("HOME".to_string(), cache.display().to_string()),
@@ -390,7 +405,7 @@ pub fn runtime_env(install: &Path, cache: &Path) -> Vec<(String, String)> {
             "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
         ),
     ];
-    if cfg!(target_os = "linux") {
+    if os == "linux" {
         env.push(("LD_LIBRARY_PATH".to_string(), install.display().to_string()));
     }
     env
@@ -466,5 +481,266 @@ mod tests {
             .iter()
             .all(|(k, _)| !k.contains("TOKEN") && !k.starts_with("AWS")));
         assert!(env.iter().any(|(k, v)| k == "LLAMA_CACHE" && v == "/c"));
+    }
+
+    use crate::config::ScratchHome;
+    use crate::exit::code_of;
+    use crate::testing::serve_files;
+
+    /// A release archive like llama.cpp's: one top-level directory holding the
+    /// server, a library and a link to it, and a file the device does not need.
+    #[cfg(unix)]
+    fn tarball(home: &Path) -> Vec<u8> {
+        let top = home.join("pack/llama-b11669-bin");
+        fs::create_dir_all(&top).unwrap();
+        fs::write(top.join(BINARY), "#!/bin/sh\n").unwrap();
+        fs::write(top.join("libggml-base.so"), "lib").unwrap();
+        std::os::unix::fs::symlink("libggml-base.so", top.join("libggml-base.so.0")).unwrap();
+        fs::write(top.join("llama-server"), "not needed").unwrap();
+        let out = home.join("pack/archive.tar.gz");
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(&out)
+            .arg("-C")
+            .arg(home.join("pack"))
+            .arg("llama-b11669-bin")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        fs::read(out).unwrap()
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        crate::device::ticket::hex(&Sha256::digest(bytes))
+    }
+
+    /// A variant with one archive, pinned to `sha256`.
+    fn variant(id: &str, sha256: String, bytes: u64) -> &'static Variant {
+        let name: &'static str = Box::leak(format!("llama-{TAG}-{id}.tar.gz").into_boxed_str());
+        let archives =
+            Box::leak(vec![a(name, Box::leak(sha256.into_boxed_str()), bytes)].into_boxed_slice());
+        Box::leak(Box::new(Variant {
+            id: Box::leak(id.to_string().into_boxed_str()),
+            backend: Backend::Cpu,
+            archives,
+        }))
+    }
+
+    async fn host(v: &Variant, status: u16, bytes: Vec<u8>) -> String {
+        serve_files(vec![(
+            format!("/{TAG}/{}", v.archives[0].name),
+            status,
+            bytes,
+        )])
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pinned_archive_installs_only_what_runs_and_hashes_it() {
+        let home = ScratchHome::new();
+        let archive = tarball(&home.0);
+        let v = variant("test-x", digest(&archive), archive.len() as u64);
+        let base = host(v, 200, archive).await;
+
+        let bin = ensure_installed_from(&base, &reqwest::Client::new(), v, true)
+            .await
+            .unwrap();
+
+        let dir = install_dir(v);
+        assert_eq!(bin, dir.join(BINARY));
+        let record: InstallRecord =
+            serde_json::from_str(&fs::read_to_string(record_path(&dir)).unwrap()).unwrap();
+        let names: Vec<&str> = record.files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [BINARY, "libggml-base.so"],
+            "links are not hashed, unneeded files not kept"
+        );
+        assert_eq!(record.files[0].1, sha256_file(&bin).unwrap());
+        assert!(
+            dir.join("libggml-base.so.0").exists(),
+            "the library link is kept"
+        );
+        assert!(!dir.join("llama-server").exists());
+        assert!(fs::read_dir(install_root()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".staging")));
+
+        // Installed and unchanged: nothing is downloaded again.
+        let again =
+            ensure_installed_from("http://127.0.0.1:9", &reqwest::Client::new(), v, false).await;
+        assert_eq!(again.unwrap(), bin);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_changed_install_is_refused_and_reinstalled() {
+        let home = ScratchHome::new();
+        let archive = tarball(&home.0);
+        let v = variant("test-y", digest(&archive), archive.len() as u64);
+        let base = host(v, 200, archive).await;
+        let bin = ensure_installed_from(&base, &reqwest::Client::new(), v, false)
+            .await
+            .unwrap();
+
+        fs::write(&bin, "#!/bin/sh\necho tampered\n").unwrap();
+        let err = verify(v).unwrap_err();
+        assert_eq!(code_of(&err), Code::Denied);
+        assert!(
+            err.to_string().starts_with(&format!("{BINARY} in ")),
+            "{err}"
+        );
+        assert!(err.to_string().ends_with(
+            "changed since it was installed. Run `knaix device join` again to reinstall it."
+        ));
+
+        ensure_installed_from(&base, &reqwest::Client::new(), v, false)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&bin).unwrap(), "#!/bin/sh\n");
+    }
+
+    #[tokio::test]
+    async fn an_archive_that_is_not_the_pinned_one_installs_nothing() {
+        let _home = ScratchHome::new();
+        let v = variant("test-z", "0".repeat(64), 5);
+        let base = host(v, 200, b"other".to_vec()).await;
+
+        let err = ensure_installed_from(&base, &reqwest::Client::new(), v, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(code_of(&err), Code::Denied);
+        assert!(
+            err.to_string()
+                .contains("does not match its pinned checksum"),
+            "{err}"
+        );
+        assert!(!install_dir(v).exists());
+        assert!(!install_root()
+            .join(format!(".staging-{}", std::process::id()))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn a_download_that_fails_says_which_archive_and_why() {
+        let _home = ScratchHome::new();
+        let v = variant("test-w", "0".repeat(64), 5);
+        let missing = host(v, 404, Vec::new()).await;
+        let client = reqwest::Client::new();
+
+        let err = ensure_installed_from(&missing, &client, v, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), Code::Unavailable);
+        assert_eq!(
+            err.to_string(),
+            format!("Downloading {} failed: 404 Not Found", v.archives[0].name)
+        );
+
+        let err = ensure_installed_from("http://127.0.0.1:9", &client, v, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Could not download {}", v.archives[0].name)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_tar_cannot_unpack_is_an_error() {
+        let _home = ScratchHome::new();
+        let junk = b"not a tarball".to_vec();
+        let v = variant("test-v", digest(&junk), junk.len() as u64);
+        let base = host(v, 200, junk).await;
+        let err = ensure_installed_from(&base, &reqwest::Client::new(), v, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("tar could not unpack"), "{err}");
+    }
+
+    #[test]
+    fn an_install_record_that_is_missing_wrong_or_incomplete_is_refused() {
+        let _home = ScratchHome::new();
+        let v = variant("test-u", "0".repeat(64), 1);
+        let err = verify(v).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            format!("llama.cpp {TAG} is not installed for this machine.")
+        );
+
+        let dir = install_dir(v);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(record_path(&dir), "junk").unwrap();
+        assert_eq!(
+            verify(v).unwrap_err().to_string(),
+            "The llama.cpp install record is unreadable"
+        );
+
+        let write = |build: &str, files: Vec<(String, String)>| {
+            let r = InstallRecord {
+                tag: TAG.into(),
+                build: build.into(),
+                variant: v.id.into(),
+                files,
+            };
+            fs::write(record_path(&dir), serde_json::to_string(&r).unwrap()).unwrap();
+        };
+        write("1-old", vec![]);
+        let err = verify(v).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            format!("The installed llama.cpp is 1-old (test-u), not the pinned {BUILD} (test-u).")
+        );
+
+        write(BUILD, vec![("libggml-base.so".into(), "x".into())]);
+        assert_eq!(
+            verify(v).unwrap_err().to_string(),
+            format!("The llama.cpp install has no {BINARY}.")
+        );
+
+        write(BUILD, vec![(BINARY.into(), "x".into())]);
+        assert!(verify(v)
+            .unwrap_err()
+            .to_string()
+            .starts_with("Could not read"));
+    }
+
+    #[test]
+    fn only_linux_is_told_where_the_libraries_are() {
+        let on = |os| runtime_env_on(os, Path::new("/opt/llama"), Path::new("/c"));
+        assert!(on("linux").contains(&("LD_LIBRARY_PATH".into(), "/opt/llama".into())));
+        assert!(on("macos").iter().all(|(k, _)| k != "LD_LIBRARY_PATH"));
+        assert_eq!(
+            runtime_env(Path::new("/i"), Path::new("/c")),
+            runtime_env_on(std::env::consts::OS, Path::new("/i"), Path::new("/c"))
+        );
+    }
+
+    #[test]
+    fn every_supported_machine_has_its_archive() {
+        for (os, arch, backend, id) in [
+            ("macos", "x86_64", Backend::Cpu, "macos-x64"),
+            ("linux", "x86_64", Backend::Cpu, "ubuntu-x64"),
+            ("linux", "aarch64", Backend::Cpu, "ubuntu-arm64"),
+            ("linux", "x86_64", Backend::Vulkan, "ubuntu-vulkan-x64"),
+            ("linux", "x86_64", Backend::Rocm, "ubuntu-rocm-10.0-x64"),
+        ] {
+            assert_eq!(variant_for(os, arch, backend).unwrap().id, id);
+        }
+        assert_eq!(
+            a("n", "s", 1),
+            Archive {
+                name: "n",
+                sha256: "s",
+                bytes: 1
+            }
+        );
     }
 }
