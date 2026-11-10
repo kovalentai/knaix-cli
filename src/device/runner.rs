@@ -875,24 +875,24 @@ mod tests {
         let ts = fake_tool(&home.0, "tailscale", UP);
 
         let away = fake_api(vec![(HEARTBEAT, 500, json!({"detail": "down"}))]).await;
-        let shared = shared();
+        let failing = shared();
         let stop = async {
             while away.calls().len() < 5 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
-        let (outcome, _) = beat(&device(&away.url, None), &ts, &shared, stop).await;
+        let (outcome, _) = beat(&device(&away.url, None), &ts, &failing, stop).await;
         outcome.unwrap();
         let rt = saved();
         assert!(!rt.last_heartbeat_ok);
         assert!(rt.last_error.unwrap().contains("heartbeat was refused"));
 
         let refused = fake_api(vec![(HEARTBEAT, 401, serde_json::Value::Null)]).await;
-        let shared = super::tests::shared();
+        let again = shared();
         let (outcome, _) = beat(
             &device(&refused.url, None),
             &ts,
-            &shared,
+            &again,
             std::future::pending(),
         )
         .await;
