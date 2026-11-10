@@ -1126,7 +1126,7 @@ mod tests {
                 backend: "metal".into(),
                 variant: "macos-arm64".into(),
                 max_memory_bytes: Some(8 * GIB),
-                compute_tag: Some("tag:c-acme".into()),
+                compute_tag: None,
                 joined_tailnet_by_knaix: false,
                 enrolled_at: 1,
             }
@@ -1217,7 +1217,7 @@ mod tests {
 
         fn joined(compute_tag: Option<&str>, joined_by_us: bool) -> Option<Tailnet> {
             Some(Tailnet {
-                endpoint: "100.64.0.1:47100".into(),
+                endpoint: "100.64.0.1:47201".into(),
                 compute_tag: compute_tag.map(str::to_string),
                 joined_by_us,
             })
@@ -1245,7 +1245,7 @@ mod tests {
                 elevate,
                 joined_before,
                 name,
-                47100,
+                47201,
                 ask,
             )
             .await
@@ -1446,6 +1446,7 @@ mod tests {
             want.gateway_port = 47200;
             want.backend = "cpu".into();
             want.variant = "ubuntu-x64".into();
+            want.compute_tag = Some("tag:c-acme".into());
             want.joined_tailnet_by_knaix = true;
             assert_eq!(d, want, "the cap and name are kept unless given");
             assert_eq!(state::load().unwrap(), Some(want));
@@ -1514,7 +1515,7 @@ mod tests {
                     "totalMemoryBytes": 32 * GIB,
                     "usableMemoryBytes": 24 * GIB,
                     "llamaBuild": llama::BUILD,
-                    "rpcEndpoint": "100.64.0.1:47100",
+                    "rpcEndpoint": "100.64.0.1:47201",
                 })
             );
             let want = state::DeviceState {
