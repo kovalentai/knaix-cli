@@ -23,7 +23,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
@@ -37,8 +37,14 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Test
-        run: cargo test --locked
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Floors only rise: raise them to the measured numbers, rounded down.
+      - name: Test, with coverage floors
+        run: |
+          cargo llvm-cov --locked --summary-only \
+            --fail-under-lines 53 --fail-under-regions 55 --fail-under-functions 64
 
   # A release publishes a Windows binary, but nothing compiled for Windows until
   # the tag was already cut. Code that only fails there -- a Unix-only helper, a
