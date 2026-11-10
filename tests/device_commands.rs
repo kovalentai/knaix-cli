@@ -786,3 +786,119 @@ fn run_serves_until_the_control_plane_refuses_it_and_then_stands_down() {
         "this platform's service is uninstalled; the other's was never its own"
     );
 }
+
+#[test]
+fn join_is_refused_until_the_session_port_cap_and_backend_are_right() {
+    let home = scratch_home("join-refused");
+    let (url, calls) = api(vec![]);
+    let join = |args: &[&str]| {
+        run(knaix(&home)
+            .env("KNAIX_TOKEN", "sess")
+            .env("KNAIX_API_URL", &url)
+            .args(["device", "join"])
+            .args(args))
+    };
+    let refused = |args: &[&str], want: &str, code: i32| {
+        let (got, _, err) = join(args);
+        assert_eq!(got, code, "{args:?}: {err}");
+        assert!(err.contains(want), "{args:?} wanted {want:?}: {err}");
+    };
+
+    let (code, _, err) = run(knaix(&home)
+        .env("KNAIX_API_URL", &url)
+        .args(["device", "join"]));
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("Not logged in"), "{err}");
+    refused(&["--max-memory", "lots"], "'lots' is not a size.", 2);
+    refused(&["--port", "0"], "--port must be a port number, not 0.", 2);
+    refused(&["--backend", "abacus"], "Unknown backend 'abacus'.", 2);
+
+    enrol(&home, &url, json!({}));
+    let device = running_device(&home, json!({}));
+    let (code, out, err) = join(&[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!(
+            "This machine is already lending itself as studio (process {})",
+            device.0
+        )),
+        "{out}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "nothing asked of the account"
+    );
+}
+
+/// The llama.cpp build `join` picks for this machine with nothing to probe.
+fn this_machines_variant() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "macos-arm64",
+        ("macos", _) => "macos-x64",
+        (_, "aarch64") => "ubuntu-arm64",
+        _ => "ubuntu-x64",
+    }
+}
+
+#[test]
+fn join_runs_as_far_as_this_machine_allows() {
+    let home = scratch_home("join");
+    let (url, calls) = api(vec![
+        (
+            "POST /api/compute/devices",
+            201,
+            json!({
+                "device": {"id": DEV},
+                "token": "kvd_new",
+                "ticketKey": {"keyId": KEY_ID, "publicKeyPem": KEY_PEM},
+                "warnings": ["llama_build_unknown", "no_gateway_endpoint"],
+            }),
+        ),
+        ("POST /api/compute/devices/heartbeat", 401, json!({})),
+    ]);
+    install_llama(&home, this_machines_variant());
+    tailscale(&home, &["tag:c-acme"]);
+    let port = free_port();
+
+    let (code, out, err) = run(knaix(&home)
+        .env("KNAIX_TOKEN", "sess")
+        .env("KNAIX_API_URL", &url)
+        .args(["device", "join", "--name", "studio", "--port"])
+        .arg(port.to_string()));
+
+    assert!(out.contains("Hardware: "), "{out}");
+    assert!(out.contains("llama.cpp: 11669-620d222 verified"), "{out}");
+    if cfg!(target_os = "macos") {
+        // sandbox-exec is always there: on to enrolling and serving, until
+        // the control plane refuses the first heartbeat.
+        assert_eq!(code, 3, "{err}");
+        for expected in [
+            "Sandbox: sandbox-exec".to_string(),
+            format!("Tailnet: 127.0.0.1:{port} (tag:c-acme)"),
+            format!("Device: enrolled as studio (ticket key {KEY_ID})"),
+            "Warning: The control plane does not know which llama.cpp build".into(),
+            "studio is lending itself to your pools.".into(),
+        ] {
+            assert!(out.contains(&expected), "missing {expected:?} in:\n{out}");
+        }
+        assert!(!out.contains("gateway is not serving"), "{out}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "POST /api/compute/devices Bearer sess",
+                "POST /api/compute/devices/heartbeat Bearer kvd_new",
+            ]
+        );
+        assert_eq!(record(&home).unwrap()["device_id"], DEV);
+    } else {
+        // With PATH empty there is no systemd-run or bwrap to sandbox
+        // rpc-server, and nothing is enrolled without one.
+        assert_eq!(code, 7, "{err}");
+        assert!(
+            err.contains("No sandbox is available for rpc-server"),
+            "{err}"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(record(&home), None);
+    }
+}
