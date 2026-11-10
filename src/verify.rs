@@ -33,6 +33,20 @@ const CERT_IDENTITY: &str =
     r"^https://github\.com/kovalentai/knaix-cli/\.github/workflows/release\.yml@refs/tags/v.+$";
 const CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
+/// Where the checks look: the release host, and the programs that check a
+/// signature and a build's provenance. Tests point them at stand-ins.
+struct Sources<'a> {
+    releases: &'a str,
+    cosign: &'a str,
+    gh: &'a str,
+}
+
+const PUBLISHED: Sources<'static> = Sources {
+    releases: RELEASES_URL,
+    cosign: "cosign",
+    gh: "gh",
+};
+
 /// What one check concluded.
 ///
 /// `Skipped` carries its reason because a skipped check has to say why in the
@@ -75,19 +89,20 @@ pub struct Check {
     pub outcome: Outcome,
 }
 
-/// The release naming for the machine this is running on.
+/// The release naming for an OS and architecture, as `std::env::consts`
+/// spells them.
 ///
 /// These are the names in the release bucket, which are not the Rust target
 /// triples: the bucket has said `darwin`/`linux` and `arm64`/`x86_64` since the
 /// first release and the installer reads them.
-pub fn platform_slug() -> Result<String> {
-    let os = match std::env::consts::OS {
+pub fn platform_slug(os: &str, arch: &str) -> Result<String> {
+    let os = match os {
         "macos" => "darwin",
         "linux" => "linux",
         "windows" => "windows",
         other => bail!("No published build for this operating system ({other})."),
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "arm64",
         other => bail!("No published build for this architecture ({other})."),
@@ -127,8 +142,8 @@ pub fn digest_file(path: &Path) -> Result<String> {
 }
 
 /// The digest published for a version and platform.
-async fn published_digest(version: &str, artifact: &str) -> Result<String> {
-    let url = format!("{RELEASES_URL}/v{version}/{artifact}.sha256");
+async fn published_digest(releases: &str, version: &str, artifact: &str) -> Result<String> {
+    let url = format!("{releases}/v{version}/{artifact}.sha256");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
@@ -214,8 +229,8 @@ fn staging_dir() -> Result<PathBuf> {
 }
 
 /// Download the signature bundle for an artifact, if one was published.
-async fn fetch_bundle(version: &str, artifact: &str) -> Result<Option<Vec<u8>>> {
-    let url = format!("{RELEASES_URL}/v{version}/{artifact}.cosign.bundle");
+async fn fetch_bundle(releases: &str, version: &str, artifact: &str) -> Result<Option<Vec<u8>>> {
+    let url = format!("{releases}/v{version}/{artifact}.cosign.bundle");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
@@ -235,8 +250,8 @@ async fn fetch_bundle(version: &str, artifact: &str) -> Result<Option<Vec<u8>>> 
 /// Both the identity of the signing workflow and the issuer that vouched for it
 /// are pinned. Without them cosign will verify that *somebody* signed the file,
 /// which is not the question being asked.
-fn cosign_verify(binary: &Path, bundle: &Path) -> Outcome {
-    let output = Command::new("cosign")
+fn cosign_verify(cosign: &str, binary: &Path, bundle: &Path) -> Outcome {
+    let output = Command::new(cosign)
         .arg("verify-blob")
         .arg("--bundle")
         .arg(bundle)
@@ -261,8 +276,8 @@ fn cosign_verify(binary: &Path, bundle: &Path) -> Outcome {
 }
 
 /// Verify the build provenance attestation with the GitHub CLI.
-fn gh_attestation_verify(binary: &Path) -> Outcome {
-    let output = Command::new("gh")
+fn gh_attestation_verify(gh: &str, binary: &Path) -> Outcome {
+    let output = Command::new(gh)
         .arg("attestation")
         .arg("verify")
         .arg(binary)
@@ -301,14 +316,19 @@ fn no_attestation_published(stderr: &str) -> bool {
 }
 
 /// Run every check against one binary.
-async fn run_checks(binary: &Path, version: &str, artifact: &str) -> Result<Vec<Check>> {
+async fn run_checks(
+    binary: &Path,
+    version: &str,
+    artifact: &str,
+    src: &Sources<'_>,
+) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     // The digest is the one check that is never optional. Failing to compute or
     // to fetch it is a failure of the command, not a skipped check, because
     // there is then nothing left that says anything about this file.
     let actual = digest_file(binary)?;
-    let expected = published_digest(version, artifact).await?;
+    let expected = published_digest(src.releases, version, artifact).await?;
     checks.push(Check {
         name: "checksum",
         outcome: if actual == expected {
@@ -320,8 +340,10 @@ async fn run_checks(binary: &Path, version: &str, artifact: &str) -> Result<Vec<
         },
     });
 
-    let bundle = fetch_bundle(version, artifact).await.unwrap_or(None);
-    let signature = match (bundle, tool_available("cosign")) {
+    let bundle = fetch_bundle(src.releases, version, artifact)
+        .await
+        .unwrap_or(None);
+    let signature = match (bundle, tool_available(src.cosign)) {
         (None, _) => Outcome::Skipped(format!(
             "v{version} does not publish a signature for {artifact}"
         )),
@@ -337,7 +359,7 @@ async fn run_checks(binary: &Path, version: &str, artifact: &str) -> Result<Vec<
             let dir = staging_dir()?;
             let path = dir.join(format!("{artifact}.cosign.bundle"));
             std::fs::write(&path, bytes).context("Could not stage the signature bundle")?;
-            let outcome = cosign_verify(binary, &path);
+            let outcome = cosign_verify(src.cosign, binary, &path);
             let _ = std::fs::remove_dir_all(&dir);
             outcome
         }
@@ -347,8 +369,8 @@ async fn run_checks(binary: &Path, version: &str, artifact: &str) -> Result<Vec<
         outcome: signature,
     });
 
-    let provenance = if tool_available("gh") {
-        gh_attestation_verify(binary)
+    let provenance = if tool_available(src.gh) {
+        gh_attestation_verify(src.gh, binary)
     } else {
         Outcome::Skipped("the GitHub CLI is not installed, so provenance was not checked".into())
     };
@@ -386,8 +408,18 @@ pub async fn run(
     version: Option<String>,
     strict: bool,
 ) -> Result<()> {
+    verify(ctx, path, version, strict, &PUBLISHED).await
+}
+
+async fn verify(
+    ctx: &KnaixContext,
+    path: Option<String>,
+    version: Option<String>,
+    strict: bool,
+    src: &Sources<'_>,
+) -> Result<()> {
     let (binary, version) = resolve_target(path, version)?;
-    let slug = platform_slug()?;
+    let slug = platform_slug(std::env::consts::OS, std::env::consts::ARCH)?;
     let artifact = artifact_name(&slug);
     let json = ctx.output_format == "json";
 
@@ -403,19 +435,28 @@ pub async fn run(
         ));
     }
 
-    let checks = run_checks(&binary, &version, &artifact).await?;
+    let checks = run_checks(&binary, &version, &artifact, src).await?;
 
     if json {
-        print_json(&binary, &version, &artifact, &checks)?;
+        let report = json_report(&binary, &version, &artifact, &checks);
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_text(&checks);
+        print!("{}", text_report(&checks));
     }
 
-    conclude(&checks, &version, strict, json)
+    if let Some(line) = conclude(&checks, &version, strict, json)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
-fn print_json(binary: &Path, version: &str, artifact: &str, checks: &[Check]) -> Result<()> {
-    let body = serde_json::json!({
+fn json_report(
+    binary: &Path,
+    version: &str,
+    artifact: &str,
+    checks: &[Check],
+) -> serde_json::Value {
+    serde_json::json!({
         "binary": binary.display().to_string(),
         "version": version,
         "artifact": artifact,
@@ -425,22 +466,20 @@ fn print_json(binary: &Path, version: &str, artifact: &str, checks: &[Check]) ->
             "detail": c.outcome.detail(),
         })).collect::<Vec<_>>(),
         "verified": is_verified(checks, false),
-    });
-    println!("{}", serde_json::to_string_pretty(&body)?);
-    Ok(())
+    })
 }
 
-fn print_text(checks: &[Check]) {
-    println!();
+fn text_report(checks: &[Check]) -> String {
+    let mut out = String::from("\n");
     for check in checks {
-        println!(
-            "  {} {:<12} {}",
+        out += &format!(
+            "  {} {:<12} {}\n",
             check.outcome.mark(),
             check.name.bold(),
             check.outcome.detail().dimmed()
         );
     }
-    println!();
+    out + "\n"
 }
 
 /// Whether the binary is verified.
@@ -456,12 +495,12 @@ fn is_verified(checks: &[Check], strict: bool) -> bool {
     })
 }
 
-/// Decide the outcome, and say so in the text output.
+/// Decide the outcome, and the closing line the text output ends with.
 ///
-/// `json` suppresses the closing line only: the document already carries
+/// `json` has no closing line: the document already carries
 /// `verified`, and a sentence printed after it would leave stdout unparseable.
 /// Failures still return an error, which is written to stderr.
-fn conclude(checks: &[Check], version: &str, strict: bool, json: bool) -> Result<()> {
+fn conclude(checks: &[Check], version: &str, strict: bool, json: bool) -> Result<Option<String>> {
     let failed: Vec<&Check> = checks
         .iter()
         .filter(|c| matches!(c.outcome, Outcome::Failed(_)))
@@ -500,24 +539,23 @@ fn conclude(checks: &[Check], version: &str, strict: bool, json: bool) -> Result
     }
 
     if json {
-        return Ok(());
+        return Ok(None);
     }
 
-    if skipped.is_empty() {
-        println!(
+    Ok(Some(if skipped.is_empty() {
+        format!(
             "{} Verified: checksum, signature and provenance.",
             "✓".green()
-        );
+        )
     } else {
         // Say what was not established, rather than letting a partial result
         // read as a full one.
-        println!(
+        format!(
             "{} Checksum verified. Not checked: {}.",
             "✓".green(),
             skipped.join(", ")
-        );
-    }
-    Ok(())
+        )
+    }))
 }
 
 #[cfg(test)]
@@ -683,5 +721,428 @@ mod tests {
         assert!(CERT_IDENTITY.starts_with('^'));
         assert!(CERT_IDENTITY.ends_with('$'));
         assert!(CERT_IDENTITY.contains("kovalentai/knaix-cli"));
+    }
+
+    #[test]
+    fn every_supported_platform_has_its_release_name_and_others_are_refused() {
+        let slug = |os, arch| platform_slug(os, arch).map_err(|e| e.to_string());
+        assert_eq!(slug("macos", "aarch64").unwrap(), "darwin-arm64");
+        assert_eq!(slug("linux", "x86_64").unwrap(), "linux-x86_64");
+        assert_eq!(slug("windows", "x86_64").unwrap(), "windows-x86_64");
+        assert_eq!(
+            slug("freebsd", "x86_64").unwrap_err(),
+            "No published build for this operating system (freebsd)."
+        );
+        assert_eq!(
+            slug("linux", "riscv64").unwrap_err(),
+            "No published build for this architecture (riscv64)."
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_version_is_checked_as_given() {
+        let (path, version) = resolve_target(Some("./knaix".into()), Some("0.5.0".into())).unwrap();
+        assert_eq!(
+            (path, version.as_str()),
+            (PathBuf::from("./knaix"), "0.5.0")
+        );
+    }
+
+    #[test]
+    fn the_closing_line_says_what_was_not_checked() {
+        let all = vec![
+            check("checksum", Outcome::Passed("a".into())),
+            check("signature", Outcome::Passed("b".into())),
+        ];
+        let partial = vec![
+            check("checksum", Outcome::Passed("a".into())),
+            check("signature", Outcome::Skipped("b".into())),
+            check("provenance", Outcome::Skipped("c".into())),
+        ];
+        let line = |c: &[Check]| conclude(c, "0.5.0", false, false).unwrap().unwrap();
+        assert!(line(&all).ends_with("Verified: checksum, signature and provenance."));
+        assert!(line(&partial).ends_with("Checksum verified. Not checked: signature, provenance."));
+        assert_eq!(conclude(&all, "0.5.0", false, true).unwrap(), None);
+    }
+
+    fn mixed() -> Vec<Check> {
+        vec![
+            check("checksum", Outcome::Passed("matches".into())),
+            check("signature", Outcome::Failed("bad signature".into())),
+            check("provenance", Outcome::Skipped("no gh".into())),
+        ]
+    }
+
+    #[test]
+    fn the_text_report_marks_each_check_with_its_detail() {
+        let report = text_report(&mixed());
+        let lines: Vec<&str> = report.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+        for (line, (mark, name, detail)) in lines.iter().zip([
+            ("✓", "checksum", "matches"),
+            ("✗", "signature", "bad signature"),
+            ("-", "provenance", "no gh"),
+        ]) {
+            assert!(
+                line.contains(mark) && line.contains(name) && line.contains(detail),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_json_report_names_every_check_and_the_verdict() {
+        let report = json_report(Path::new("/bin/knaix"), "0.5.0", "knaix-x", &mixed());
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "binary": "/bin/knaix",
+                "version": "0.5.0",
+                "artifact": "knaix-x",
+                "checks": [
+                    {"name": "checksum", "status": "passed", "detail": "matches"},
+                    {"name": "signature", "status": "failed", "detail": "bad signature"},
+                    {"name": "provenance", "status": "skipped", "detail": "no gh"},
+                ],
+                "verified": false,
+            })
+        );
+    }
+
+    use crate::config::ScratchHome;
+    use axum::{http::StatusCode, http::Uri, Router};
+    use std::collections::HashMap;
+
+    /// A release host serving `files` by path, each with a status and body.
+    /// Anything else answers 404, as a missing key would.
+    async fn releases(files: Vec<(String, u16, Vec<u8>)>) -> String {
+        let files: HashMap<String, (u16, Vec<u8>)> =
+            files.into_iter().map(|(p, s, b)| (p, (s, b))).collect();
+        let app = Router::new().fallback(move |uri: Uri| async move {
+            let (status, body) = files.get(uri.path()).cloned().unwrap_or((404, Vec::new()));
+            (StatusCode::from_u16(status).unwrap(), body)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        origin
+    }
+
+    fn digest_at(status: u16, body: &str) -> Vec<(String, u16, Vec<u8>)> {
+        vec![(
+            "/v1.0.0/knaix-x.sha256".into(),
+            status,
+            body.as_bytes().to_vec(),
+        )]
+    }
+
+    const HEX: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+    #[tokio::test]
+    async fn the_published_digest_is_read_from_the_sidecar_lowercased() {
+        let host = releases(digest_at(
+            200,
+            &format!("{}  knaix-x\n", HEX.to_uppercase()),
+        ))
+        .await;
+        assert_eq!(
+            published_digest(&host, "1.0.0", "knaix-x").await.unwrap(),
+            HEX
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_cannot_be_read_says_why() {
+        let missing = |status| async move {
+            let host = releases(digest_at(status, "")).await;
+            published_digest(&host, "1.0.0", "knaix-x")
+                .await
+                .unwrap_err()
+        };
+        // The bucket answers 403 for a key that is not there.
+        for status in [403, 404] {
+            let err = missing(status).await;
+            assert_eq!(crate::exit::code_of(&err), Code::NotFound);
+            assert_eq!(
+                err.to_string(),
+                "No published build of v1.0.0 for this platform (knaix-x)."
+            );
+        }
+        let err = missing(500).await;
+        assert_eq!(crate::exit::code_of(&err), Code::Unavailable);
+        assert!(err
+            .to_string()
+            .ends_with("answered 500 Internal Server Error. Could not read the published digest."));
+
+        let host = releases(digest_at(200, "not-a-digest")).await;
+        let err = published_digest(&host, "1.0.0", "knaix-x")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().ends_with("is not a SHA-256 value."),
+            "{err}"
+        );
+
+        let err = published_digest("http://127.0.0.1:9", "1.0.0", "knaix-x")
+            .await
+            .unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_is_fetched_only_when_published() {
+        let path = "/v1.0.0/knaix-x.cosign.bundle".to_string();
+        let host = releases(vec![(path, 200, b"bundle".to_vec())]).await;
+        assert_eq!(
+            fetch_bundle(&host, "1.0.0", "knaix-x").await.unwrap(),
+            Some(b"bundle".to_vec())
+        );
+        assert_eq!(fetch_bundle(&host, "2.0.0", "knaix-x").await.unwrap(), None);
+        assert_eq!(
+            fetch_bundle("http://127.0.0.1:9", "1.0.0", "knaix-x")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A stand-in for cosign or gh: answers the version probe, records the rest
+    /// of its arguments next to itself, then fails with `stderr` unless `exit`
+    /// is 0.
+    #[cfg(unix)]
+    fn fake_tool(dir: &Path, name: &str, exit: i32, stderr: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version|version) exit 0;; esac\n\
+                 echo \"$@\" > \"$0.args\"\nprintf '%s\\n' '{stderr}' >&2\nexit {exit}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A thread forking while the file was open for writing makes the first
+        // exec fail with "text file busy" until that child execs in turn.
+        for _ in 0..100 {
+            match Command::new(&path).arg("--version").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    fn args_of(tool: &str) -> String {
+        std::fs::read_to_string(format!("{tool}.args")).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cosign_is_asked_for_this_repositorys_release_identity() {
+        let home = ScratchHome::new();
+        let ok = fake_tool(&home.0, "cosign-ok", 0, "");
+        let bad = fake_tool(
+            &home.0,
+            "cosign-bad",
+            1,
+            "Error: none of the signatures matched",
+        );
+        let (binary, bundle) = (Path::new("/tmp/knaix"), Path::new("/tmp/knaix.bundle"));
+
+        assert_eq!(
+            cosign_verify(&ok, binary, bundle),
+            Outcome::Passed(format!(
+                "signed by the release workflow of {REPO}, verified by cosign"
+            ))
+        );
+        assert_eq!(
+            args_of(&ok).trim(),
+            format!(
+                "verify-blob --bundle /tmp/knaix.bundle --certificate-identity-regexp \
+                 {CERT_IDENTITY} --certificate-oidc-issuer {CERT_ISSUER} /tmp/knaix"
+            )
+        );
+        assert_eq!(
+            cosign_verify(&bad, binary, bundle),
+            Outcome::Failed(
+                "cosign rejected the signature: Error: none of the signatures matched".into()
+            )
+        );
+        let missing = home.0.join("no-cosign").to_string_lossy().into_owned();
+        assert!(matches!(
+            cosign_verify(&missing, binary, bundle),
+            Outcome::Skipped(r) if r.starts_with("could not run cosign")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provenance_tells_a_missing_attestation_from_a_bad_one() {
+        let home = ScratchHome::new();
+        let binary = Path::new("/tmp/knaix");
+        let ok = fake_tool(&home.0, "gh-ok", 0, "");
+        let none = fake_tool(&home.0, "gh-none", 1, "Error: HTTP 404: Not Found");
+        let bad = fake_tool(&home.0, "gh-bad", 1, "Error: verification failed");
+
+        assert_eq!(
+            gh_attestation_verify(&ok, binary),
+            Outcome::Passed(format!("built by GitHub Actions in {REPO}"))
+        );
+        assert_eq!(
+            args_of(&ok).trim(),
+            format!("attestation verify /tmp/knaix --repo {REPO}")
+        );
+        assert_eq!(
+            gh_attestation_verify(&none, binary),
+            Outcome::Skipped("this release does not publish build provenance".into())
+        );
+        assert_eq!(
+            gh_attestation_verify(&bad, binary),
+            Outcome::Failed("attestation not verified: Error: verification failed".into())
+        );
+        let missing = home.0.join("no-gh").to_string_lossy().into_owned();
+        assert!(matches!(
+            gh_attestation_verify(&missing, binary),
+            Outcome::Skipped(r) if r.starts_with("could not run gh")
+        ));
+    }
+
+    /// A binary, and a release host publishing `digest` and, when `bundle`, a
+    /// signature for it, under the name this machine would download.
+    async fn published(
+        home: &ScratchHome,
+        digest: Option<String>,
+        bundle: bool,
+    ) -> (PathBuf, String, String) {
+        let binary = home.0.join("knaix");
+        std::fs::write(&binary, b"knaix binary").unwrap();
+        let artifact =
+            artifact_name(&platform_slug(std::env::consts::OS, std::env::consts::ARCH).unwrap());
+        let digest = digest.unwrap_or_else(|| digest_file(&binary).unwrap());
+        let mut files = vec![(
+            format!("/v1.0.0/{artifact}.sha256"),
+            200,
+            digest.into_bytes(),
+        )];
+        if bundle {
+            files.push((
+                format!("/v1.0.0/{artifact}.cosign.bundle"),
+                200,
+                b"bundle".to_vec(),
+            ));
+        }
+        (binary, artifact, releases(files).await)
+    }
+
+    fn outcomes(checks: &[Check]) -> Vec<(&str, &str)> {
+        checks.iter().map(|c| (c.name, c.outcome.word())).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_published_signed_attested_binary_passes_every_check() {
+        let home = ScratchHome::new();
+        let (binary, artifact, host) = published(&home, None, true).await;
+        let cosign = fake_tool(&home.0, "cosign", 0, "");
+        let gh = fake_tool(&home.0, "gh", 0, "");
+        let src = Sources {
+            releases: &host,
+            cosign: &cosign,
+            gh: &gh,
+        };
+
+        let checks = run_checks(&binary, "1.0.0", &artifact, &src).await.unwrap();
+
+        assert_eq!(
+            outcomes(&checks),
+            [
+                ("checksum", "passed"),
+                ("signature", "passed"),
+                ("provenance", "passed")
+            ]
+        );
+        // cosign was handed the bundle the host published, staged on disk.
+        let staged = args_of(&cosign);
+        assert!(
+            staged.contains(&format!("{artifact}.cosign.bundle")),
+            "{staged}"
+        );
+
+        let ctx = KnaixContext::new("text".into());
+        let path = Some(binary.to_string_lossy().into_owned());
+        verify(&ctx, path.clone(), Some("1.0.0".into()), true, &src)
+            .await
+            .unwrap();
+        let json = KnaixContext::new("json".into());
+        verify(&json, path, Some("1.0.0".into()), true, &src)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_binary_that_differs_from_the_release_is_refused() {
+        let home = ScratchHome::new();
+        let (binary, artifact, host) = published(&home, Some(HEX.into()), false).await;
+        let missing = home.0.join("none").to_string_lossy().into_owned();
+        let src = Sources {
+            releases: &host,
+            cosign: &missing,
+            gh: &missing,
+        };
+
+        let checks = run_checks(&binary, "1.0.0", &artifact, &src).await.unwrap();
+        assert_eq!(
+            outcomes(&checks),
+            [
+                ("checksum", "failed"),
+                ("signature", "skipped"),
+                ("provenance", "skipped")
+            ]
+        );
+        assert_eq!(
+            checks[0].outcome.detail(),
+            format!(
+                "SHA-256 is {}, but v1.0.0 publishes {HEX}",
+                digest_file(&binary).unwrap()
+            )
+        );
+        assert_eq!(
+            checks[1].outcome.detail(),
+            format!("v1.0.0 does not publish a signature for {artifact}")
+        );
+        assert_eq!(
+            checks[2].outcome.detail(),
+            "the GitHub CLI is not installed, so provenance was not checked"
+        );
+
+        let ctx = KnaixContext::new("text".into());
+        let path = Some(binary.to_string_lossy().into_owned());
+        let err = verify(&ctx, path, Some("1.0.0".into()), false, &src)
+            .await
+            .unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), Code::Denied);
+    }
+
+    #[tokio::test]
+    async fn a_published_signature_without_cosign_is_skipped_and_says_so() {
+        let home = ScratchHome::new();
+        let (binary, artifact, host) = published(&home, None, true).await;
+        let missing = home.0.join("none").to_string_lossy().into_owned();
+        let src = Sources {
+            releases: &host,
+            cosign: &missing,
+            gh: &missing,
+        };
+
+        let checks = run_checks(&binary, "1.0.0", &artifact, &src).await.unwrap();
+        assert_eq!(checks[0].outcome.word(), "passed");
+        assert_eq!(
+            checks[1].outcome,
+            Outcome::Skipped("cosign is not installed, so the signature was not checked".into())
+        );
     }
 }
