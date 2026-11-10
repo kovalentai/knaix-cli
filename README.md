@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/knaix-logo.png" alt="" width="88" />
+<img src="assets/kovalent-logo.svg" alt="" width="88" />
 
 # Knaix
 
