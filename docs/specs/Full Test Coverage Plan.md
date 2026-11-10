@@ -45,3 +45,12 @@ Left for later: the three `dialoguer` prompts need a pseudo-terminal, which need
 - The stand-in scripts are Unix only, so the Windows job skips those tests.
 
 Left: the permission-hardening warning in `save_config` cannot fire on a filesystem that supports permissions, and the test helper's retry for a script still open for writing runs only when that race happens.
+
+## PR 4: The device's control plane, state and commands
+
+**Goal:** `device/api.rs` and `device/state.rs` to all but what cannot run in a test, and the `status`, `ls`, `leave`, `rekey` and `logs` commands covered end to end. `join`, the runner and the sandbox follow in their own PR.
+
+- **A shared fake control plane.** `testing::fake_api` answers `"METHOD /path"` routes and records each call's route, authorization and body, for any module's unit tests.
+- **The commands run through the binary,** with HOME a scratch directory and PATH empty. `leave` and `rekey` stop services by asking launchd or systemd by name; with neither on the PATH, no test can stop a real device on the machine running it. A `sleep` process stands in for the running device, so stopping one is observed, not assumed.
+- **Cases:** every route's path, session and refusals, including a removed device's heartbeat, a join key without the compute tag, an account on its own tailnet, and the ticket key's outage; the record and runtime files, their permissions, unreadable and unremovable records, log rotation, and the socket directory refusing a link or a path too long; status running, failing, stopped and removed; ls with and without devices or a session; leave with and without the account, with `--purge`, and unconfirmed; rekey pinning, refusing a key that is not what it claims, and unconfirmed; logs with ages.
+- The command tests are Unix only, as device commands are.
