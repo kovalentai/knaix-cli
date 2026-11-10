@@ -471,5 +471,8 @@ fn verifying_a_file_that_is_not_there_is_not_found() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(5), "expected NotFound: {stderr}");
-    assert!(stderr.contains("/nonexistent/knaix"), "did not name the file: {stderr}");
+    assert!(
+        stderr.contains("/nonexistent/knaix"),
+        "did not name the file: {stderr}"
+    );
 }
