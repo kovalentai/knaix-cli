@@ -63,3 +63,13 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 - **Programs are arguments too.** The service manager, `sudo`, the GPU probe and the release host are passed in, so tests drive stand-in scripts and a loopback host. `config::home()` follows `ScratchHome`, so the service's files land in the test's home.
 - **Shared helpers.** `testing::fake_tool` writes a stand-in program that records each call's arguments, and `testing::serve_files` serves bytes by path. The verify tests now use both.
 - **Cases:** the launchd agent and systemd unit written, loaded, restarted and removed, and refused; the stable link chosen over a versioned path; Tailscale found on the PATH first, its status read logged out, the join key passed only through a private file that is then deleted, with and without sudo; GPU detection's order, the driver floor and a probe that hangs; the pinned archive installing only what runs, a changed install refused and reinstalled, an archive with the wrong checksum installing nothing, and each failed download.
+
+## PR 6: The running device
+
+**Goal:** `device/runner.rs` and `device/sandbox.rs`, the long-running half of a device and the choice of sandbox for rpc-server, to all but what cannot run in a test. `device join` follows in PR 7, using these.
+
+- **The OS and the programs are arguments.** The sandbox chooser takes the OS, how to find a program and how to probe a plan, so the macOS, Linux and unsupported branches all run on either platform, and no test starts a real `systemd-run` or `bwrap`. Stopping a leftover systemd unit takes the OS and `systemctl` the same way.
+- **One run of rpc-server is split from finding it.** Starting the plan, waiting for it to answer, and stopping it are their own function, driven in tests by `sh` and `sleep` with the test holding the port. Checking the binary and choosing the sandbox stay with the real install.
+- **The heartbeat stops on a future it is given.** `run` passes the shutdown signal; tests pass a channel, so a test never signals its own process. Waking the loop early, as rpc-server's changes do, makes the beats fast.
+- **Through the binary,** `knaix device run` is refused until each precondition holds, then runs until the control plane refuses its heartbeat, and the service leaves the removed marker.
+- **Cases:** each sandbox picked or refused on each OS, a probe that truncates the plan before rpc-server, renames the systemd unit and drops `--pipe`; the tailnet address waited for and given up on; rpc-server that answers, exits before it does, or is stopped, with its output in the log; heartbeats that succeed, see the ticket key rotate once, offer nothing, fail and back off, are refused, or find the tailnet address changed.
