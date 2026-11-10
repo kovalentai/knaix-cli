@@ -67,3 +67,59 @@ pub async fn fake_api(routes: Vec<(&str, u16, Value)>) -> FakeApi {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     FakeApi { url, calls }
 }
+
+/// A host serving `files` by path, each with a status and body; anything else
+/// answers 404, as a missing key would. Returns its origin.
+pub async fn serve_files(files: Vec<(String, u16, Vec<u8>)>) -> String {
+    let files: HashMap<String, (u16, Vec<u8>)> =
+        files.into_iter().map(|(p, s, b)| (p, (s, b))).collect();
+    let app = Router::new().fallback(move |uri: Uri| async move {
+        let (status, body) = files.get(uri.path()).cloned().unwrap_or((404, Vec::new()));
+        (StatusCode::from_u16(status).unwrap(), body)
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    origin
+}
+
+/// A stand-in program at `dir/name`, returned as its path. It answers a
+/// version probe (how helpers are asked whether they are installed), records
+/// every other call's arguments as one line in `<path>.args`, then runs `body`
+/// as shell.
+#[cfg(unix)]
+pub fn fake_tool(dir: &std::path::Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version|version) exit 0;; esac\n\
+             echo \"$@\" >> \"$0.args\"\n{body}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A thread forking while the file was open for writing makes the first
+    // exec fail with "text file busy" until that child execs in turn.
+    for _ in 0..100 {
+        match Command::new(&path).arg("--version").status() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => break,
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// The arguments of each call a `fake_tool` received, in order.
+#[cfg(unix)]
+pub fn args_of(tool: &str) -> Vec<String> {
+    std::fs::read_to_string(format!("{tool}.args"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
