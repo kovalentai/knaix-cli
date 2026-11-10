@@ -1069,6 +1069,9 @@ mod tests {
     fn warnings_read_as_sentences() {
         assert!(explain_warning("llama_build_below_floor:8585").contains("8585"));
         assert!(explain_warning("no_gateway_endpoint").contains("gateway"));
+        assert!(
+            explain_warning("llama_build_blocked").starts_with("This llama.cpp build is blocked")
+        );
         assert_eq!(explain_warning("something_new"), "something_new");
     }
 

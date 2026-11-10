@@ -812,6 +812,11 @@ fn join_is_refused_until_the_session_port_cap_and_backend_are_right() {
     refused(&["--max-memory", "lots"], "'lots' is not a size.", 2);
     refused(&["--port", "0"], "--port must be a port number, not 0.", 2);
     refused(&["--backend", "abacus"], "Unknown backend 'abacus'.", 2);
+    refused(
+        &["--backend", "cuda"],
+        "No NVIDIA GPU answered nvidia-smi on this machine.",
+        7,
+    );
 
     enrol(&home, &url, json!({}));
     let device = running_device(&home, json!({}));
