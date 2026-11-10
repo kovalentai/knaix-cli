@@ -989,8 +989,8 @@ mod tests {
     async fn the_browser_callback_saves_the_session_and_shows_the_success_page() {
         let _home = ScratchHome::new();
         let api = health_api().await;
-        let page = Arc::new(Mutex::new(String::new()));
-        let shown = page.clone();
+        let tab = Arc::new(Mutex::new(None));
+        let opened = tab.clone();
 
         // Stand in for the browser: follow the callback the sign-in page would.
         let browser = move |auth_url: String| {
@@ -998,10 +998,9 @@ mod tests {
             assert_eq!(auth.path(), "/cli-auth", "the API's own sign-in page");
             let (_, callback) = auth.query_pairs().find(|(k, _)| k == "callback").unwrap();
             let callback = format!("{callback}&token=jwt&username=diego");
-            tokio::spawn(async move {
-                *shown.lock().unwrap() =
-                    reqwest::get(callback).await.unwrap().text().await.unwrap();
-            });
+            *opened.lock().unwrap() = Some(tokio::spawn(async move {
+                reqwest::get(callback).await.unwrap().text().await.unwrap()
+            }));
             Ok(())
         };
         browser_login(&api, browser, std::time::Duration::from_secs(10))
@@ -1009,7 +1008,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(saved(), (Some("jwt".into()), Some("diego".into())));
-        assert!(page.lock().unwrap().contains("<span>Authenticated</span>"));
+        let page = tab.lock().unwrap().take().unwrap();
+        assert!(page.await.unwrap().contains("<span>Authenticated</span>"));
     }
 
     /// A machine with no browser to open.
