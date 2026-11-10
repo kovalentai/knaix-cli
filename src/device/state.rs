@@ -114,10 +114,21 @@ pub fn rpc_cache_dir() -> Result<PathBuf> {
 /// provides is short and private; without one, a directory in the system temp
 /// that this user owns and no one else can enter.
 pub fn rpc_socket_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    private_socket_dir(socket_dir_in(runtime))
+}
+
+/// The socket directory under `runtime`, systemd's per-user directory, when
+/// there is one.
+fn socket_dir_in(runtime: Option<PathBuf>) -> PathBuf {
+    match runtime {
         Some(base) if base.is_dir() => base.join("knaix-device"),
         _ => std::env::temp_dir().join(format!("knaix-device-{}", user_id())),
-    };
+    }
+}
+
+/// `dir`, created if need be, once it is a short, private directory of ours.
+fn private_socket_dir(dir: PathBuf) -> Result<PathBuf> {
     create_private_dir(&dir)?;
     #[cfg(unix)]
     {
@@ -331,5 +342,138 @@ mod tests {
         assert_eq!(ago(0, 3 * 3600), "3 h ago");
         assert_eq!(ago(0, 3 * 86_400), "3 days ago");
         assert_eq!(ago(200, 100), "0 s ago");
+    }
+
+    use crate::config::ScratchHome;
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_record_is_saved_loaded_and_forgotten_under_the_knaix_home() {
+        let home = ScratchHome::new();
+        assert_eq!(state_path(), home.0.join(".knaix/device.json"));
+        assert_eq!(load().unwrap(), None);
+
+        save(&sample()).unwrap();
+        assert_eq!(load().unwrap(), Some(sample()));
+        #[cfg(unix)]
+        assert_eq!(mode(&state_path()), 0o600);
+
+        remove().unwrap();
+        assert_eq!(load().unwrap(), None);
+        remove().unwrap();
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_or_removed_says_so() {
+        let _home = ScratchHome::new();
+        fs::write(state_path(), "{ not json").unwrap();
+        let err = load().unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("is not a device record this version can read"),
+            "{err}"
+        );
+
+        // A directory where the file belongs can be neither read nor removed.
+        fs::remove_file(state_path()).unwrap();
+        fs::create_dir(state_path()).unwrap();
+        assert!(load()
+            .unwrap_err()
+            .to_string()
+            .starts_with("Could not read"));
+        assert_eq!(
+            remove().unwrap_err().to_string(),
+            "Could not remove the device record"
+        );
+    }
+
+    #[test]
+    fn the_runtime_file_round_trips_and_junk_reads_as_none() {
+        let _home = ScratchHome::new();
+        assert_eq!(load_runtime(), None);
+        let rt = Runtime {
+            pid: 42,
+            gateway: Some("100.64.0.9:47100".into()),
+            ..Runtime::default()
+        };
+        save_runtime(&rt).unwrap();
+        assert_eq!(load_runtime(), Some(rt));
+        remove_runtime();
+        assert_eq!(load_runtime(), None);
+
+        fs::write(runtime_path().unwrap(), "junk").unwrap();
+        assert_eq!(load_runtime(), None);
+    }
+
+    #[test]
+    fn the_device_files_live_in_one_private_directory() {
+        let home = ScratchHome::new();
+        let dir = home.0.join(".knaix/device");
+        assert_eq!(device_dir().unwrap(), dir);
+        assert_eq!(gateway_log_path().unwrap(), dir.join("gateway.log"));
+        assert_eq!(rpc_log_path().unwrap(), dir.join("rpc-server.log"));
+        assert_eq!(service_log_path().unwrap(), dir.join("service.log"));
+        assert_eq!(rpc_cache_dir().unwrap(), dir.join("rpc-cache"));
+        #[cfg(unix)]
+        assert_eq!((mode(&dir), mode(&dir.join("rpc-cache"))), (0o700, 0o700));
+    }
+
+    #[test]
+    fn a_log_starts_afresh_past_five_megabytes_and_keeps_the_last_one() {
+        let home = ScratchHome::new();
+        let log = home.0.join("gateway.log");
+        append_log(&log, "refused: bad ticket");
+        let line = fs::read_to_string(&log).unwrap();
+        assert!(line.ends_with(" refused: bad ticket\n"), "{line:?}");
+        #[cfg(unix)]
+        assert_eq!(mode(&log), 0o600);
+
+        fs::write(&log, vec![b'x'; 5 * 1024 * 1024 + 1]).unwrap();
+        append_log(&log, "next");
+        assert_eq!(
+            fs::metadata(log.with_extension("log.1")).unwrap().len(),
+            5 * 1024 * 1024 + 1
+        );
+        assert!(fs::read_to_string(&log).unwrap().ends_with(" next\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_directory_must_be_short_private_and_ours() {
+        let home = ScratchHome::new();
+        let dir = private_socket_dir(home.0.join("sock")).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+
+        // A link could point the socket somewhere another user controls.
+        let link = home.0.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let err = private_socket_dir(link).unwrap_err();
+        assert!(err
+            .to_string()
+            .ends_with("is not a private directory owned by you; remove it and run this again."));
+
+        let long = home.0.join("x".repeat(100));
+        let err = private_socket_dir(long).unwrap_err();
+        assert!(err.to_string().ends_with("is too long for a Unix socket."));
+
+        // The real one: the runtime directory, or one of ours in the temp dir.
+        assert!(rpc_socket_dir().unwrap().is_dir());
+    }
+
+    #[test]
+    fn the_socket_lives_in_the_runtime_directory_when_there_is_one() {
+        let home = ScratchHome::new();
+        assert_eq!(
+            socket_dir_in(Some(home.0.clone())),
+            home.0.join("knaix-device")
+        );
+        let fallback = std::env::temp_dir().join(format!("knaix-device-{}", user_id()));
+        assert_eq!(socket_dir_in(None), fallback);
+        assert_eq!(socket_dir_in(Some(home.0.join("missing"))), fallback);
     }
 }
