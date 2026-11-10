@@ -84,6 +84,11 @@ fn plist_path() -> Result<PathBuf> {
 }
 
 fn unit_path() -> Result<PathBuf> {
+    // A test's unit goes under its scratch home, never the real config directory.
+    #[cfg(test)]
+    if crate::config::in_scratch_home() {
+        return unit_path_under(None);
+    }
     unit_path_under(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
 }
 
@@ -351,10 +356,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn on_linux_the_unit_is_written_enabled_restarted_and_removed() {
-        if std::env::var_os("XDG_CONFIG_HOME").is_some() {
-            // The unit would go to the real config directory, not the scratch home.
-            return;
-        }
         let home = ScratchHome::new();
         let systemctl = fake_tool(&home.0, "systemctl", "exit 0");
         let systemd = manager("linux", &systemctl);
