@@ -77,16 +77,19 @@ WantedBy=default.target
 }
 
 fn plist_path() -> Result<PathBuf> {
-    let home = home::home_dir().context("Could not find the home directory")?;
+    let home = crate::config::home().context("Could not find the home directory")?;
     Ok(home
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist")))
 }
 
 fn unit_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home::home_dir().map(|h| h.join(".config")))
+    unit_path_under(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+}
+
+fn unit_path_under(config: Option<PathBuf>) -> Result<PathBuf> {
+    let base = config
+        .or_else(|| crate::config::home().map(|h| h.join(".config")))
         .context("Could not find the config directory")?;
     Ok(base.join("systemd/user").join(UNIT))
 }
@@ -96,16 +99,17 @@ fn unit_path() -> Result<PathBuf> {
 /// the running process resolves to, which the next upgrade deletes.
 pub fn service_exe() -> Result<PathBuf> {
     let current = std::env::current_exe().context("Could not find the knaix binary")?;
+    Ok(stable_link(current, std::env::var_os("PATH")))
+}
+
+/// The first `knaix` on `path` that is the same file as `current`, else `current`.
+fn stable_link(current: PathBuf, path: Option<std::ffi::OsString>) -> PathBuf {
     let canonical = std::fs::canonicalize(&current).unwrap_or(current.clone());
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("knaix");
-            if std::fs::canonicalize(&candidate).ok().as_ref() == Some(&canonical) {
-                return Ok(candidate);
-            }
-        }
-    }
-    Ok(current)
+    path.iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("knaix"))
+        .find(|candidate| std::fs::canonicalize(candidate).ok().as_ref() == Some(&canonical))
+        .unwrap_or(current)
 }
 
 fn quiet(cmd: &mut Command) -> bool {
@@ -128,98 +132,124 @@ fn uid() -> u32 {
     }
 }
 
-pub fn install() -> Result<PathBuf> {
-    let exe = service_exe()?;
-    if cfg!(target_os = "macos") {
-        {
-            let path = plist_path()?;
-            let log = crate::device::state::service_log_path()?;
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, launchd_plist(&exe, &log))?;
-            let domain = format!("gui/{}", uid());
-            // Replace a loaded copy, so a changed binary path takes effect.
-            quiet(Command::new("launchctl").args(["bootout", &format!("{domain}/{LABEL}")]));
-            let ok = quiet(Command::new("launchctl").args([
-                "bootstrap",
-                &domain,
-                &path.display().to_string(),
-            ]));
-            if !ok {
-                return Err(anyhow!(
-                    "launchd would not load {}. Run `launchctl bootstrap {domain} {}` to see why.",
-                    path.display(),
-                    path.display()
-                ))
-                .coded(Code::Precondition);
-            }
-            return Ok(path);
-        }
-    }
-    if cfg!(target_os = "linux") {
-        let path = unit_path()?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, systemd_unit(&exe))?;
-        quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
-        let ok = quiet(Command::new("systemctl").args(["--user", "enable", "--now", UNIT]));
-        if !ok {
-            return Err(anyhow!(
-                "systemd would not start {UNIT}. Run `systemctl --user status {UNIT}` to see why."
-            ))
-            .coded(Code::Precondition);
-        }
-        return Ok(path);
-    }
-    Err(anyhow!("--daemon is only supported on macOS and Linux.")).coded(Code::Precondition)
+/// The service manager for one OS, by the program that drives it: launchd's
+/// `launchctl` or systemd's `systemctl`. Tests drive a stand-in.
+pub struct Manager<'a> {
+    pub os: &'a str,
+    pub program: &'a str,
 }
 
-/// Stop and remove the service. Missing is fine: leaving wants it gone.
+/// This machine's.
+pub fn system() -> Manager<'static> {
+    let os = std::env::consts::OS;
+    let program = if os == "macos" {
+        "launchctl"
+    } else {
+        "systemctl"
+    };
+    Manager { os, program }
+}
+
+pub fn install() -> Result<PathBuf> {
+    system().install()
+}
+
 pub fn uninstall() -> Result<bool> {
-    if cfg!(target_os = "macos") {
-        {
-            let path = plist_path()?;
-            quiet(Command::new("launchctl").args(["bootout", &format!("gui/{}/{LABEL}", uid())]));
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-    if cfg!(target_os = "linux") {
-        let path = unit_path()?;
-        quiet(Command::new("systemctl").args(["--user", "disable", "--now", UNIT]));
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    system().uninstall()
 }
 
 pub fn installed() -> bool {
-    if cfg!(target_os = "macos") {
-        return plist_path().map(|p| p.exists()).unwrap_or(false);
-    }
-    if cfg!(target_os = "linux") {
-        return unit_path().map(|p| p.exists()).unwrap_or(false);
-    }
-    false
+    system().installed()
 }
 
-/// Restart the service so it picks up a changed key or record.
 pub fn restart() -> bool {
-    if cfg!(target_os = "macos") {
-        return quiet(Command::new("launchctl").args([
-            "kickstart",
-            "-k",
-            &format!("gui/{}/{LABEL}", uid()),
-        ]));
+    system().restart()
+}
+
+impl Manager<'_> {
+    fn run(&self, args: &[&str]) -> bool {
+        quiet(Command::new(self.program).args(args))
     }
-    if cfg!(target_os = "linux") {
-        return quiet(Command::new("systemctl").args(["--user", "restart", UNIT]));
+
+    pub fn install(&self) -> Result<PathBuf> {
+        let exe = service_exe()?;
+        match self.os {
+            "macos" => {
+                let path = plist_path()?;
+                let log = crate::device::state::service_log_path()?;
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(&path, launchd_plist(&exe, &log))?;
+                let domain = format!("gui/{}", uid());
+                // Replace a loaded copy, so a changed binary path takes effect.
+                self.run(&["bootout", &format!("{domain}/{LABEL}")]);
+                if !self.run(&["bootstrap", &domain, &path.display().to_string()]) {
+                    return Err(anyhow!(
+                        "launchd would not load {}. Run `launchctl bootstrap {domain} {}` to see why.",
+                        path.display(),
+                        path.display()
+                    ))
+                    .coded(Code::Precondition);
+                }
+                Ok(path)
+            }
+            "linux" => {
+                let path = unit_path()?;
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(&path, systemd_unit(&exe))?;
+                self.run(&["--user", "daemon-reload"]);
+                if !self.run(&["--user", "enable", "--now", UNIT]) {
+                    return Err(anyhow!(
+                        "systemd would not start {UNIT}. Run `systemctl --user status {UNIT}` to see why."
+                    ))
+                    .coded(Code::Precondition);
+                }
+                Ok(path)
+            }
+            _ => Err(anyhow!("--daemon is only supported on macOS and Linux."))
+                .coded(Code::Precondition),
+        }
     }
-    false
+
+    /// Stop and remove the service. Missing is fine: leaving wants it gone.
+    pub fn uninstall(&self) -> Result<bool> {
+        let path = match self.os {
+            "macos" => {
+                self.run(&["bootout", &format!("gui/{}/{LABEL}", uid())]);
+                plist_path()?
+            }
+            "linux" => {
+                self.run(&["--user", "disable", "--now", UNIT]);
+                unit_path()?
+            }
+            _ => return Ok(false),
+        };
+        if !path.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path)?;
+        if self.os == "linux" {
+            self.run(&["--user", "daemon-reload"]);
+        }
+        Ok(true)
+    }
+
+    pub fn installed(&self) -> bool {
+        match self.os {
+            "macos" => plist_path(),
+            "linux" => unit_path(),
+            _ => return false,
+        }
+        .is_ok_and(|p| p.exists())
+    }
+
+    /// Restart the service so it picks up a changed key or record.
+    pub fn restart(&self) -> bool {
+        match self.os {
+            "macos" => self.run(&["kickstart", "-k", &format!("gui/{}/{LABEL}", uid())]),
+            "linux" => self.run(&["--user", "restart", UNIT]),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +279,185 @@ mod tests {
         assert!(u.contains(r#"ExecStart="/home/m/my tools/knaix" device run"#));
         assert!(u.contains("Restart=always"));
         assert!(u.contains("WantedBy=default.target"));
+    }
+
+    use crate::config::ScratchHome;
+    use crate::exit::{code_of, Code};
+
+    #[cfg(unix)]
+    use crate::testing::{args_of, fake_tool};
+
+    #[cfg(unix)]
+    fn manager<'a>(os: &'a str, program: &'a str) -> Manager<'a> {
+        Manager { os, program }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_macos_the_agent_is_written_loaded_restarted_and_removed() {
+        let home = ScratchHome::new();
+        let launchctl = fake_tool(&home.0, "launchctl", "exit 0");
+        let launchd = manager("macos", &launchctl);
+        let domain = format!("gui/{}", uid());
+
+        let plist = launchd.install().unwrap();
+
+        assert_eq!(
+            plist,
+            home.0.join(format!("Library/LaunchAgents/{LABEL}.plist"))
+        );
+        let written = std::fs::read_to_string(&plist).unwrap();
+        assert!(written.contains(&format!(
+            "<string>{}</string>",
+            service_exe().unwrap().display()
+        )));
+        assert!(written.contains(".knaix/device/service.log"), "{written}");
+        assert_eq!(
+            args_of(&launchctl),
+            [
+                format!("bootout {domain}/{LABEL}"),
+                format!("bootstrap {domain} {}", plist.display())
+            ]
+        );
+        assert!(launchd.installed());
+
+        assert!(launchd.restart());
+        assert_eq!(
+            args_of(&launchctl)[2],
+            format!("kickstart -k {domain}/{LABEL}")
+        );
+
+        assert!(launchd.uninstall().unwrap());
+        assert_eq!(args_of(&launchctl)[3], format!("bootout {domain}/{LABEL}"));
+        assert!(!plist.exists() && !launchd.installed());
+        assert!(
+            !launchd.uninstall().unwrap(),
+            "removing it twice is not a second removal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_launchd_will_not_load_says_how_to_see_why() {
+        let home = ScratchHome::new();
+        let launchctl = fake_tool(&home.0, "launchctl", "exit 1");
+        let err = manager("macos", &launchctl).install().unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert!(
+            err.to_string().starts_with("launchd would not load "),
+            "{err}"
+        );
+        assert!(!manager("macos", &launchctl).restart());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_linux_the_unit_is_written_enabled_restarted_and_removed() {
+        if std::env::var_os("XDG_CONFIG_HOME").is_some() {
+            // The unit would go to the real config directory, not the scratch home.
+            return;
+        }
+        let home = ScratchHome::new();
+        let systemctl = fake_tool(&home.0, "systemctl", "exit 0");
+        let systemd = manager("linux", &systemctl);
+
+        let unit = systemd.install().unwrap();
+
+        assert_eq!(unit, home.0.join(".config/systemd/user").join(UNIT));
+        let written = std::fs::read_to_string(&unit).unwrap();
+        assert!(written.contains(&format!(
+            "ExecStart=\"{}\" device run",
+            service_exe().unwrap().display()
+        )));
+        assert_eq!(
+            args_of(&systemctl),
+            [
+                "--user daemon-reload".to_string(),
+                format!("--user enable --now {UNIT}")
+            ]
+        );
+        assert!(systemd.installed());
+
+        assert!(systemd.restart());
+        assert!(systemd.uninstall().unwrap());
+        assert_eq!(
+            args_of(&systemctl)[2..],
+            [
+                format!("--user restart {UNIT}"),
+                format!("--user disable --now {UNIT}"),
+                "--user daemon-reload".to_string(),
+            ]
+        );
+        assert!(!unit.exists() && !systemd.installed());
+        assert!(!systemd.uninstall().unwrap());
+
+        let failing = fake_tool(&home.0, "systemctl-no", "exit 1");
+        let err = manager("linux", &failing).install().unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "systemd would not start {UNIT}. Run `systemctl --user status {UNIT}` to see why."
+            )
+        );
+    }
+
+    #[test]
+    fn elsewhere_there_is_no_service_to_manage() {
+        let _home = ScratchHome::new();
+        let other = Manager {
+            os: "windows",
+            program: "none",
+        };
+        let err = other.install().unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            "--daemon is only supported on macOS and Linux."
+        );
+        assert!(!other.uninstall().unwrap());
+        assert!(!other.installed());
+        assert!(!other.restart());
+    }
+
+    #[test]
+    fn the_unit_goes_under_the_config_directory_systemd_reads() {
+        let home = ScratchHome::new();
+        assert_eq!(
+            unit_path_under(Some(PathBuf::from("/xdg"))).unwrap(),
+            PathBuf::from("/xdg/systemd/user").join(UNIT)
+        );
+        assert_eq!(
+            unit_path_under(None).unwrap(),
+            home.0.join(".config/systemd/user").join(UNIT)
+        );
+    }
+
+    #[test]
+    fn this_machines_manager_is_the_one_its_os_ships() {
+        let m = system();
+        assert_eq!(m.os, std::env::consts::OS);
+        assert_eq!(m.program == "launchctl", cfg!(target_os = "macos"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_service_starts_the_stable_link_on_the_path_when_there_is_one() {
+        let home = ScratchHome::new();
+        let versioned = home.0.join("Cellar/knaix/0.7.0/bin/knaix");
+        std::fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        std::fs::write(&versioned, "").unwrap();
+        let bin = home.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&versioned, bin.join("knaix")).unwrap();
+        let path = |dirs: &[&Path]| Some(std::env::join_paths(dirs).unwrap());
+
+        assert_eq!(
+            stable_link(versioned.clone(), path(&[&home.0, &bin])),
+            bin.join("knaix")
+        );
+        assert_eq!(stable_link(versioned.clone(), path(&[&home.0])), versioned);
+        assert_eq!(stable_link(versioned.clone(), None), versioned);
+        assert!(service_exe().unwrap().exists());
     }
 }
