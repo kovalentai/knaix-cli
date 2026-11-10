@@ -457,3 +457,22 @@ fn the_no_account_note_is_not_particular_to_one_command() {
         "listing nodes lost the note"
     );
 }
+
+/// A path that is not there is reported before anything is downloaded, with the
+/// code that says so.
+#[test]
+fn verifying_a_file_that_is_not_there_is_not_found() {
+    let home = scratch_home("verifymissing");
+
+    let out = knaix(&home)
+        .args(["verify", "/nonexistent/knaix", "--version", "1.0.0"])
+        .output()
+        .expect("failed to run knaix");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "expected NotFound: {stderr}");
+    assert!(
+        stderr.contains("/nonexistent/knaix"),
+        "did not name the file: {stderr}"
+    );
+}

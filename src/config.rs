@@ -199,3 +199,42 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_config_reads_back_and_only_its_owner_can_read_it() {
+        let _home = ScratchHome::new();
+        let config = Config {
+            token: Some("secret".into()),
+            ..Config::default()
+        };
+        save_config(&config).unwrap();
+
+        assert_eq!(load_stored_config().token.as_deref(), Some("secret"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(get_config_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_replaced_is_an_error_and_is_left_alone() {
+        let _home = ScratchHome::new();
+        // A non-empty directory where the file belongs: nothing can rename onto it.
+        let occupied = get_config_path().join("occupied");
+        fs::create_dir_all(&occupied).unwrap();
+
+        let err = save_config(&Config::default()).unwrap_err();
+
+        assert!(err.to_string().starts_with("Failed to move"), "{err}");
+        assert!(occupied.exists());
+    }
+}
