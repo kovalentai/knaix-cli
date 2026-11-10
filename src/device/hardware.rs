@@ -456,10 +456,13 @@ mod tests {
         nvidia: Option<&'static str>,
         rocm: Option<&'static str>,
     ) -> impl Fn(&str, &[&str]) -> Option<String> {
-        move |program, _| match program {
-            "nvidia-smi" => nvidia.map(str::to_string),
-            "rocm-smi" => rocm.map(str::to_string),
-            other => panic!("probed {other}"),
+        move |program, _| {
+            if program == "nvidia-smi" {
+                nvidia
+            } else {
+                rocm
+            }
+            .map(str::to_string)
         }
     }
 

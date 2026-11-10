@@ -141,11 +141,13 @@ pub struct Manager<'a> {
 
 /// This machine's.
 pub fn system() -> Manager<'static> {
-    let os = std::env::consts::OS;
-    let program = if os == "macos" {
-        "launchctl"
-    } else {
-        "systemctl"
+    manager_for(std::env::consts::OS)
+}
+
+fn manager_for(os: &str) -> Manager<'_> {
+    let program = match os {
+        "macos" => "launchctl",
+        _ => "systemctl",
     };
     Manager { os, program }
 }
@@ -434,10 +436,10 @@ mod tests {
     }
 
     #[test]
-    fn this_machines_manager_is_the_one_its_os_ships() {
-        let m = system();
-        assert_eq!(m.os, std::env::consts::OS);
-        assert_eq!(m.program == "launchctl", cfg!(target_os = "macos"));
+    fn each_os_is_managed_by_the_program_it_ships() {
+        assert_eq!(manager_for("macos").program, "launchctl");
+        assert_eq!(manager_for("linux").program, "systemctl");
+        assert_eq!(system().os, std::env::consts::OS);
     }
 
     #[cfg(unix)]
