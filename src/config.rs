@@ -82,13 +82,18 @@ impl Drop for ScratchHome {
     }
 }
 
+/// The user's home directory, or the test's scratch one under `ScratchHome`.
+pub fn home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(h) = TEST_HOME.with(|h| h.borrow().clone()) {
+        return Some(h);
+    }
+    home_dir()
+}
+
 /// Returns the full path to the .knaix/config.json file.
 pub fn get_config_path() -> PathBuf {
-    #[cfg(test)]
-    let home = TEST_HOME.with(|h| h.borrow().clone()).or_else(home_dir);
-    #[cfg(not(test))]
-    let home = home_dir();
-    let mut path = home.expect("Could not find home directory");
+    let mut path = home().expect("Could not find home directory");
     path.push(".knaix");
     if !path.exists() {
         fs::create_dir_all(&path).expect("Could not create config directory");

@@ -810,23 +810,7 @@ mod tests {
     }
 
     use crate::config::ScratchHome;
-    use axum::{http::StatusCode, http::Uri, Router};
-    use std::collections::HashMap;
-
-    /// A release host serving `files` by path, each with a status and body.
-    /// Anything else answers 404, as a missing key would.
-    async fn releases(files: Vec<(String, u16, Vec<u8>)>) -> String {
-        let files: HashMap<String, (u16, Vec<u8>)> =
-            files.into_iter().map(|(p, s, b)| (p, (s, b))).collect();
-        let app = Router::new().fallback(move |uri: Uri| async move {
-            let (status, body) = files.get(uri.path()).cloned().unwrap_or((404, Vec::new()));
-            (StatusCode::from_u16(status).unwrap(), body)
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        origin
-    }
+    use crate::testing::serve_files as releases;
 
     fn digest_at(status: u16, body: &str) -> Vec<(String, u16, Vec<u8>)> {
         vec![(
@@ -906,39 +890,18 @@ mod tests {
         );
     }
 
-    /// A stand-in for cosign or gh: answers the version probe, records the rest
-    /// of its arguments next to itself, then fails with `stderr` unless `exit`
-    /// is 0.
+    /// A stand-in for cosign or gh that fails with `stderr` unless `exit` is 0.
     #[cfg(unix)]
     fn fake_tool(dir: &Path, name: &str, exit: i32, stderr: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\ncase \"$1\" in --version|version) exit 0;; esac\n\
-                 echo \"$@\" > \"$0.args\"\nprintf '%s\\n' '{stderr}' >&2\nexit {exit}\n"
-            ),
+        crate::testing::fake_tool(
+            dir,
+            name,
+            &format!("printf '%s\\n' '{stderr}' >&2\nexit {exit}"),
         )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A thread forking while the file was open for writing makes the first
-        // exec fail with "text file busy" until that child execs in turn.
-        for _ in 0..100 {
-            match Command::new(&path).arg("--version").status() {
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                _ => break,
-            }
-        }
-        path.to_string_lossy().into_owned()
     }
 
     #[cfg(unix)]
-    fn args_of(tool: &str) -> String {
-        std::fs::read_to_string(format!("{tool}.args")).unwrap()
-    }
+    use crate::testing::args_of;
 
     #[cfg(unix)]
     #[test]
@@ -960,11 +923,11 @@ mod tests {
             ))
         );
         assert_eq!(
-            args_of(&ok).trim(),
-            format!(
+            args_of(&ok),
+            [format!(
                 "verify-blob --bundle /tmp/knaix.bundle --certificate-identity-regexp \
                  {CERT_IDENTITY} --certificate-oidc-issuer {CERT_ISSUER} /tmp/knaix"
-            )
+            )]
         );
         assert_eq!(
             cosign_verify(&bad, binary, bundle),
@@ -993,8 +956,8 @@ mod tests {
             Outcome::Passed(format!("built by GitHub Actions in {REPO}"))
         );
         assert_eq!(
-            args_of(&ok).trim(),
-            format!("attestation verify /tmp/knaix --repo {REPO}")
+            args_of(&ok),
+            [format!("attestation verify /tmp/knaix --repo {REPO}")]
         );
         assert_eq!(
             gh_attestation_verify(&none, binary),
@@ -1066,7 +1029,7 @@ mod tests {
             ]
         );
         // cosign was handed the bundle the host published, staged on disk.
-        let staged = args_of(&cosign);
+        let staged = args_of(&cosign).concat();
         assert!(
             staged.contains(&format!("{artifact}.cosign.bundle")),
             "{staged}"

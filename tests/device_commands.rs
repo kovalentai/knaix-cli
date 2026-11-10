@@ -525,6 +525,42 @@ fn rekey_pins_the_served_key_and_stops_the_device_holding_the_old_one() {
     assert!(out.contains("Nothing to do."), "{out}");
 }
 
+/// With a background service installed, rekeying restarts it instead of
+/// stopping the device. Which manager is asked is out of reach here (PATH is
+/// empty); what is checked is that the service, not a stop, is the path taken.
+#[test]
+fn rekey_restarts_the_background_service_rather_than_stopping_it() {
+    let home = scratch_home("rekey-service");
+    let (url, _) = api(vec![(
+        "GET /api/compute/ticket-key",
+        200,
+        json!({"keyId": KEY_ID, "publicKeyPem": KEY_PEM}),
+    )]);
+    enrol(&home, &url, json!({}));
+    let device = running_device(&home, json!({}));
+    for service in [
+        "Library/LaunchAgents/com.kovalent.knaix-device.plist",
+        ".config/systemd/user/knaix-device.service",
+    ] {
+        let path = home.join(service);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    let (code, out, err) = run(knaix(&home).args(["device", "rekey", "--yes"]));
+
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("Restarted the background service with the new key."),
+        "{out}"
+    );
+    assert!(!out.contains("Stopped the running device"), "{out}");
+    assert!(
+        alive(device.0),
+        "the service restarts the device; rekey must not stop it"
+    );
+}
+
 #[test]
 fn rekey_refuses_a_key_that_is_not_what_it_claims() {
     let home = scratch_home("rekey-bad");
