@@ -47,9 +47,48 @@ fn default_api_url() -> String {
     "https://api.kovalentai.com".to_string()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Set by `ScratchHome`, so a test's saves never reach the real ~/.knaix.
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Points this thread's config at a fresh, empty directory until dropped.
+///
+/// Per thread, not per process: setting HOME would race every other test.
+/// An async test needs tokio's default current-thread runtime for the same
+/// reason.
+#[cfg(test)]
+pub(crate) struct ScratchHome(pub PathBuf);
+
+#[cfg(test)]
+impl ScratchHome {
+    pub(crate) fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("knaix-home-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("could not create a scratch home");
+        TEST_HOME.with(|h| *h.borrow_mut() = Some(dir.clone()));
+        ScratchHome(dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        TEST_HOME.with(|h| *h.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Returns the full path to the .knaix/config.json file.
 pub fn get_config_path() -> PathBuf {
-    let mut path = home_dir().expect("Could not find home directory");
+    #[cfg(test)]
+    let home = TEST_HOME.with(|h| h.borrow().clone()).or_else(home_dir);
+    #[cfg(not(test))]
+    let home = home_dir();
+    let mut path = home.expect("Could not find home directory");
     path.push(".knaix");
     if !path.exists() {
         fs::create_dir_all(&path).expect("Could not create config directory");
