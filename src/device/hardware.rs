@@ -205,7 +205,7 @@ pub fn parse_size(raw: &str) -> Result<u64> {
 }
 
 /// Run a probe with a deadline; None when the tool is absent or fails.
-fn probe(program: &str, args: &[&str]) -> Option<String> {
+fn probe(program: &str, args: &[&str], wait: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -213,7 +213,7 @@ fn probe(program: &str, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
@@ -233,7 +233,10 @@ fn probe(program: &str, args: &[&str]) -> Option<String> {
     Some(out)
 }
 
-fn nvidia() -> Option<(Vec<Gpu>, Option<u32>)> {
+/// Asks a tool for its output; None when it is absent or fails.
+type Probe<'a> = &'a dyn Fn(&str, &[&str]) -> Option<String>;
+
+fn nvidia(probe: Probe) -> Option<(Vec<Gpu>, Option<u32>)> {
     let out = probe(
         "nvidia-smi",
         &[
@@ -245,7 +248,7 @@ fn nvidia() -> Option<(Vec<Gpu>, Option<u32>)> {
     (!parsed.0.is_empty()).then_some(parsed)
 }
 
-fn rocm() -> Option<Vec<Gpu>> {
+fn rocm(probe: Probe) -> Option<Vec<Gpu>> {
     let out = probe("rocm-smi", &["--showmeminfo", "vram", "--json"])?;
     let gpus = parse_rocm(&out);
     (!gpus.is_empty()).then_some(gpus)
@@ -272,9 +275,22 @@ fn describe(gpus: &[Gpu]) -> String {
 
 /// Detect what this machine offers, or use the backend the owner asked for.
 pub fn detect(requested: Option<Backend>, max: Option<u64>) -> Result<Offer> {
+    let probe = |program: &str, args: &[&str]| probe(program, args, Duration::from_secs(10));
     let ram = crate::hardware::total_memory();
+    detect_with(requested, max, ram, apple_silicon(), &probe)
+}
+
+/// `detect`, given the machine: its RAM, whether it is Apple silicon, and how
+/// to ask the GPU tools.
+fn detect_with(
+    requested: Option<Backend>,
+    max: Option<u64>,
+    ram: u64,
+    apple: bool,
+    probe: Probe,
+) -> Result<Offer> {
     let (backend, gpus, detail) = match requested {
-        Some(Backend::Metal) | None if apple_silicon() => {
+        Some(Backend::Metal) | None if apple => {
             (Backend::Metal, Vec::new(), "Apple silicon".to_string())
         }
         Some(Backend::Metal) => {
@@ -283,7 +299,7 @@ pub fn detect(requested: Option<Backend>, max: Option<u64>) -> Result<Offer> {
         Some(Backend::Cpu) => (Backend::Cpu, Vec::new(), "CPU".to_string()),
         Some(Backend::Vulkan) => (Backend::Vulkan, Vec::new(), "Vulkan".to_string()),
         Some(Backend::Cuda) => {
-            let (gpus, driver) = nvidia()
+            let (gpus, driver) = nvidia(probe)
                 .ok_or_else(|| anyhow!("No NVIDIA GPU answered nvidia-smi on this machine."))
                 .coded(Code::Precondition)?;
             check_driver(driver)?;
@@ -291,18 +307,18 @@ pub fn detect(requested: Option<Backend>, max: Option<u64>) -> Result<Offer> {
             (Backend::Cuda, gpus, d)
         }
         Some(Backend::Rocm) => {
-            let gpus = rocm()
+            let gpus = rocm(probe)
                 .ok_or_else(|| anyhow!("No AMD GPU answered rocm-smi on this machine. The ROCm build needs ROCm installed."))
                 .coded(Code::Precondition)?;
             let d = describe(&gpus);
             (Backend::Rocm, gpus, d)
         }
         None => {
-            if let Some((gpus, driver)) = nvidia() {
+            if let Some((gpus, driver)) = nvidia(probe) {
                 check_driver(driver)?;
                 let d = describe(&gpus);
                 (Backend::Cuda, gpus, d)
-            } else if let Some(gpus) = rocm() {
+            } else if let Some(gpus) = rocm(probe) {
                 let d = describe(&gpus);
                 (Backend::Rocm, gpus, d)
             } else {
@@ -427,5 +443,192 @@ mod tests {
     fn backends_parse_by_name() {
         assert_eq!(Backend::parse("CUDA").unwrap(), Backend::Cuda);
         assert!(Backend::parse("tpu").is_err());
+    }
+
+    use crate::exit::{code_of, Code};
+
+    const RTX: &str = "24564, 23000, 575.57.08, NVIDIA GeForce RTX 4090\n";
+    const OLD_DRIVER: &str = "24564, 23000, 535.10.01, NVIDIA GeForce RTX 3090\n";
+    const RADEON: &str = r#"{"card0": {"VRAM Total Memory (B)": "17163091968", "VRAM Total Used Memory (B)": "1163091968"}}"#;
+
+    /// A machine whose `nvidia-smi` and `rocm-smi` answer as given, or are absent.
+    fn machine(
+        nvidia: Option<&'static str>,
+        rocm: Option<&'static str>,
+    ) -> impl Fn(&str, &[&str]) -> Option<String> {
+        move |program, _| match program {
+            "nvidia-smi" => nvidia.map(str::to_string),
+            "rocm-smi" => rocm.map(str::to_string),
+            other => panic!("probed {other}"),
+        }
+    }
+
+    fn offer(
+        requested: Option<Backend>,
+        apple: bool,
+        gpus: impl Fn(&str, &[&str]) -> Option<String>,
+    ) -> Result<Offer> {
+        detect_with(requested, Some(64 * GIB), 64 * GIB, apple, &gpus)
+    }
+
+    #[test]
+    fn a_mac_offers_metal_and_only_a_mac_can() {
+        let o = offer(None, true, machine(None, None)).unwrap();
+        assert_eq!(
+            (o.backend, o.detail.as_str()),
+            (Backend::Metal, "Apple silicon")
+        );
+        assert_eq!(
+            offer(Some(Backend::Metal), true, machine(None, None))
+                .unwrap()
+                .backend,
+            Backend::Metal
+        );
+
+        let err = offer(Some(Backend::Metal), false, machine(None, None)).unwrap_err();
+        assert_eq!(
+            (code_of(&err), err.to_string()),
+            (Code::Usage, "Metal needs a Mac with Apple silicon.".into())
+        );
+    }
+
+    #[test]
+    fn a_named_backend_is_used_without_probing_for_another() {
+        let cpu = offer(Some(Backend::Cpu), false, machine(None, None)).unwrap();
+        assert_eq!(
+            (cpu.backend, cpu.detail.as_str(), cpu.usable_bytes),
+            (Backend::Cpu, "CPU", 32 * GIB)
+        );
+        let vulkan = offer(Some(Backend::Vulkan), false, machine(None, None)).unwrap();
+        assert_eq!(
+            (vulkan.backend, vulkan.detail.as_str()),
+            (Backend::Vulkan, "Vulkan")
+        );
+    }
+
+    #[test]
+    fn cuda_needs_an_nvidia_gpu_on_a_recent_enough_driver() {
+        let o = offer(Some(Backend::Cuda), false, machine(Some(RTX), None)).unwrap();
+        assert_eq!(
+            (o.backend, o.detail.as_str()),
+            (Backend::Cuda, "NVIDIA GeForce RTX 4090")
+        );
+
+        let err = offer(Some(Backend::Cuda), false, machine(None, None)).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert_eq!(
+            err.to_string(),
+            "No NVIDIA GPU answered nvidia-smi on this machine."
+        );
+        // A tool that answers with no GPU in it is no GPU.
+        assert!(offer(
+            Some(Backend::Cuda),
+            false,
+            machine(Some("No devices were found\n"), None)
+        )
+        .is_err());
+
+        let err = offer(Some(Backend::Cuda), false, machine(Some(OLD_DRIVER), None)).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert!(
+            err.to_string()
+                .starts_with("The NVIDIA driver is version 535"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rocm_needs_an_amd_gpu() {
+        let o = offer(Some(Backend::Rocm), false, machine(None, Some(RADEON))).unwrap();
+        assert_eq!((o.backend, o.detail.as_str()), (Backend::Rocm, "card0"));
+        let err = offer(Some(Backend::Rocm), false, machine(None, Some("{}"))).unwrap_err();
+        assert_eq!(code_of(&err), Code::Precondition);
+        assert!(
+            err.to_string().starts_with("No AMD GPU answered rocm-smi"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn detection_prefers_nvidia_then_amd_then_the_cpu() {
+        assert_eq!(
+            offer(None, false, machine(Some(RTX), Some(RADEON)))
+                .unwrap()
+                .backend,
+            Backend::Cuda
+        );
+        assert_eq!(
+            offer(None, false, machine(None, Some(RADEON)))
+                .unwrap()
+                .backend,
+            Backend::Rocm
+        );
+        assert_eq!(
+            offer(None, false, machine(None, None)).unwrap().backend,
+            Backend::Cpu
+        );
+        assert!(offer(None, false, machine(Some(OLD_DRIVER), None)).is_err());
+    }
+
+    #[test]
+    fn gpus_are_described_by_name_and_count() {
+        let gpu = |name: &str| Gpu {
+            name: name.into(),
+            total_bytes: 0,
+            free_bytes: 0,
+        };
+        assert_eq!(describe(&[]), "");
+        assert_eq!(describe(&[gpu("A"), gpu("B")]), "A, B");
+        assert_eq!(describe(&[gpu("A"), gpu("A")]), "2 × A");
+    }
+
+    #[test]
+    fn junk_rocm_output_reads_as_no_gpus() {
+        assert!(parse_rocm("[1, 2]").is_empty());
+        assert!(parse_rocm(r#"{"card0": {}}"#).is_empty());
+        let (gpus, _) = parse_nvidia("x, y, 575.1, Name\n");
+        assert!(gpus.is_empty());
+    }
+
+    #[test]
+    fn every_backend_has_the_name_it_parses_from() {
+        for b in [
+            Backend::Metal,
+            Backend::Cuda,
+            Backend::Rocm,
+            Backend::Vulkan,
+            Backend::Cpu,
+        ] {
+            assert_eq!(Backend::parse(b.as_str()).unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn this_machine_offers_something() {
+        let o = detect(Some(Backend::Cpu), None).unwrap();
+        assert_eq!(o.total_bytes, crate::hardware::total_memory());
+        let auto = detect(None, None).unwrap();
+        assert_eq!(auto.backend == Backend::Metal, apple_silicon());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_gives_up_on_a_tool_that_fails_or_hangs() {
+        use crate::testing::fake_tool;
+        let home = crate::config::ScratchHome::new();
+        let wait = Duration::from_millis(300);
+        let ok = fake_tool(&home.0, "ok", "echo answer");
+        let failing = fake_tool(&home.0, "failing", "echo partial; exit 1");
+        let hung = fake_tool(&home.0, "hung", "exec sleep 30");
+
+        assert_eq!(probe(&ok, &["--q"], wait).as_deref(), Some("answer\n"));
+        assert_eq!(probe(&failing, &[], wait), None);
+        assert_eq!(probe("/no/such/tool", &[], wait), None);
+        let started = std::time::Instant::now();
+        assert_eq!(probe(&hung, &[], wait), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited out the hung tool"
+        );
     }
 }
