@@ -142,12 +142,14 @@ pub fn status(bin: &Path) -> Result<Status> {
 /// local process could read it. `--reset` because `tailscale up` refuses to
 /// change accounts without restating every non-default flag; the caller has
 /// already asked the owner before switching a machine that was on a tailnet.
-pub fn up_with_key(bin: &Path, auth_key: &str, hostname: &str) -> Result<()> {
-    up_with_key_as(needs_sudo().then_some("sudo"), bin, auth_key, hostname)
-}
-
-/// `up_with_key`, run through `elevate` (sudo) when it is given.
-fn up_with_key_as(elevate: Option<&str>, bin: &Path, auth_key: &str, hostname: &str) -> Result<()> {
+///
+/// Run through `elevate` (`sudo`) when it is given; see [`elevate`].
+pub fn up_with_key(
+    elevate: Option<&str>,
+    bin: &Path,
+    auth_key: &str,
+    hostname: &str,
+) -> Result<()> {
     let dir = crate::device::state::device_dir()?;
     let key_file = dir.join(format!(".tailscale-key.{}", std::process::id()));
     crate::device::state::write_private(&key_file, auth_key.as_bytes())?;
@@ -181,14 +183,16 @@ fn up_with_key_as(elevate: Option<&str>, bin: &Path, auth_key: &str, hostname: &
 }
 
 /// On Linux, `tailscale up` needs root unless the user is Tailscale's operator.
-fn needs_sudo() -> bool {
+/// What `tailscale up` needs to run through on this machine, if anything.
+/// Only Linux needs root for it, and then only when knaix runs as a user.
+pub fn elevate() -> Option<&'static str> {
     #[cfg(target_os = "linux")]
     {
-        unsafe { libc::geteuid() != 0 }
+        (unsafe { libc::geteuid() != 0 }).then_some("sudo")
     }
     #[cfg(not(target_os = "linux"))]
     {
-        false
+        None
     }
 }
 
@@ -347,7 +351,7 @@ cat "$f" > "$0.key"; ls -l "$f" | cut -c1-10 > "$0.mode"; exit {exit}"#
         let home = ScratchHome::new();
         let ts = key_reading_tailscale(&home.0, "tailscale", 0);
 
-        up_with_key_as(None, Path::new(&ts), "tskey-secret", "studio").unwrap();
+        up_with_key(None, Path::new(&ts), "tskey-secret", "studio").unwrap();
 
         let args = args_of(&ts).concat();
         let key_file = crate::device::state::device_dir()
@@ -380,8 +384,7 @@ cat "$f" > "$0.key"; ls -l "$f" | cut -c1-10 > "$0.mode"; exit {exit}"#
             .unwrap()
             .join(format!(".tailscale-key.{}", std::process::id()));
 
-        let err =
-            up_with_key_as(Some(&sudo), Path::new(&ts), "tskey-secret", "studio").unwrap_err();
+        let err = up_with_key(Some(&sudo), Path::new(&ts), "tskey-secret", "studio").unwrap_err();
 
         assert_eq!(code_of(&err), Code::Precondition);
         assert!(
@@ -395,7 +398,7 @@ cat "$f" > "$0.key"; ls -l "$f" | cut -c1-10 > "$0.mode"; exit {exit}"#
         );
         assert!(!key_file.exists());
 
-        let err = up_with_key_as(None, &home.0.join("missing"), "k", "h").unwrap_err();
+        let err = up_with_key(None, &home.0.join("missing"), "k", "h").unwrap_err();
         assert_eq!(err.to_string(), "Could not run tailscale up");
         assert!(!key_file.exists());
     }
@@ -403,9 +406,9 @@ cat "$f" > "$0.key"; ls -l "$f" | cut -c1-10 > "$0.mode"; exit {exit}"#
     #[test]
     fn only_linux_needs_root_to_bring_tailscale_up() {
         #[cfg(target_os = "linux")]
-        assert_eq!(needs_sudo(), unsafe { libc::geteuid() } != 0);
+        assert_eq!(elevate().is_some(), unsafe { libc::geteuid() } != 0);
         #[cfg(not(target_os = "linux"))]
-        assert!(!needs_sudo());
+        assert_eq!(elevate(), None);
     }
 
     #[cfg(unix)]

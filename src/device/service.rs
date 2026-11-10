@@ -152,10 +152,6 @@ fn manager_for(os: &str) -> Manager<'_> {
     Manager { os, program }
 }
 
-pub fn install() -> Result<PathBuf> {
-    system().install()
-}
-
 pub fn uninstall() -> Result<bool> {
     system().uninstall()
 }
