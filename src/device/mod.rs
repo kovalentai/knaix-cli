@@ -232,27 +232,7 @@ async fn join(
         return Ok(());
     }
 
-    let mut existing = state::load()?;
-    // A record whose device was removed from the account (from the dashboard,
-    // say) would only be refused at the first heartbeat. Enrol afresh instead.
-    if let Some(d) = &existing {
-        if d.api_url == api_url {
-            if let Ok(list) = api::list(&ctx.client, &api_url, &session).await {
-                let known = list["devices"]
-                    .as_array()
-                    .is_some_and(|ds| ds.iter().any(|x| x["id"] == d.device_id.as_str()));
-                if !known {
-                    ctx.info(&format!(
-                        "  {} {} is no longer in your account; enrolling it again",
-                        "Device:".dimmed(),
-                        d.name
-                    ));
-                    state::remove()?;
-                    existing = None;
-                }
-            }
-        }
-    }
+    let existing = unless_removed(ctx, &api_url, &session, state::load()?).await?;
     let requested = backend
         .as_deref()
         .map(hardware::Backend::parse)
@@ -314,13 +294,111 @@ async fn join(
     ctx.info(&format!("  {} {}", "Sandbox:".dimmed(), plan.kind.as_str()));
 
     // 4. The tailnet.
-    let ts = tailnet::require()?;
-    let mut status = tailnet::status(&ts)?;
-    let mut joined_by_us = existing.as_ref().is_some_and(|d| d.joined_tailnet_by_knaix);
+    let Some(net) = connect_tailnet(
+        ctx,
+        &session,
+        &api_url,
+        &tailnet::require()?,
+        tailnet::elevate(),
+        existing.as_ref().is_some_and(|d| d.joined_tailnet_by_knaix),
+        name.as_deref(),
+        port,
+        &|prompt, refuse| confirm(prompt, yes, refuse),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // 5. Enrol, unless this machine already is a device of this account.
+    let device = enrol(
+        ctx, &session, &api_url, existing, name, max, port, &offer, variant, net,
+    )
+    .await?;
+
+    // 6. Start.
+    if daemon {
+        return background(ctx, &device.name, &service::system());
+    }
+    ctx.info(&format!(
+        "\n{} {} is lending itself to your pools. Press Ctrl-C to stop; run with {} to keep it running in the background.",
+        "✓".green(),
+        device.name.bold(),
+        "--daemon".cyan()
+    ));
+    let quiet = ctx.quiet;
+    runner::run(&move |line: &str| {
+        if !quiet {
+            println!("{line}");
+        }
+    })
+    .await
+}
+
+/// `existing`, unless the account no longer lists it. A record whose device was
+/// removed from the account (from the dashboard, say) would only be refused at
+/// the first heartbeat, so it is forgotten and the machine enrolled afresh.
+/// Kept when the account cannot be asked: the heartbeat will tell.
+async fn unless_removed(
+    ctx: &KnaixContext,
+    api_url: &str,
+    session: &str,
+    existing: Option<state::DeviceState>,
+) -> Result<Option<state::DeviceState>> {
+    let Some(d) = existing else { return Ok(None) };
+    if d.api_url != api_url {
+        return Ok(Some(d));
+    }
+    let Ok(list) = api::list(&ctx.client, api_url, session).await else {
+        return Ok(Some(d));
+    };
+    let known = list["devices"]
+        .as_array()
+        .is_some_and(|ds| ds.iter().any(|x| x["id"] == d.device_id.as_str()));
+    if known {
+        return Ok(Some(d));
+    }
+    ctx.info(&format!(
+        "  {} {} is no longer in your account; enrolling it again",
+        "Device:".dimmed(),
+        d.name
+    ));
+    state::remove()?;
+    Ok(None)
+}
+
+/// Where this machine is on the tailnet, as joining found or made it.
+#[derive(Debug, PartialEq)]
+struct Tailnet {
+    /// The gateway's address, `<tailnet IPv4>:<port>`.
+    endpoint: String,
+    /// The account's compute tag on Kovalent's tailnet; None on its own.
+    compute_tag: Option<String>,
+    /// Whether knaix put this machine on the tailnet, so `leave` takes it off.
+    joined_by_us: bool,
+}
+
+/// Put this machine on the account's tailnet, unless it already is. None when
+/// the owner declines to switch it from another tailnet. `ask` asks the owner
+/// (`prompt`), or refuses with `refuse` when it cannot.
+#[allow(clippy::too_many_arguments)]
+async fn connect_tailnet(
+    ctx: &KnaixContext,
+    session: &str,
+    api_url: &str,
+    ts: &std::path::Path,
+    elevate: Option<&str>,
+    joined_before: bool,
+    name: Option<&str>,
+    port: u16,
+    ask: &dyn Fn(&str, &str) -> Result<bool>,
+) -> Result<Option<Tailnet>> {
+    let mut status = tailnet::status(ts)?;
+    let mut joined_by_us = joined_before;
     let compute_tag: Option<String> = if let Some(tag) = status.compute_tag() {
         Some(tag.to_string())
     } else {
-        match api::join_key(&ctx.client, &api_url, &session).await? {
+        match api::join_key(&ctx.client, api_url, session).await? {
             api::JoinKey::OwnTailnet => {
                 if !status.running() {
                     return Err(anyhow!(
@@ -336,11 +414,10 @@ async fn join(
                         .tailnet
                         .clone()
                         .unwrap_or_else(|| "another tailnet".into());
-                    let go = confirm(
+                    let go = ask(
                         &format!(
                             "Tailscale here is connected to {on}. Switch it to Kovalent's network as a device? It disconnects from {on}."
                         ),
-                        yes,
                         &format!("Tailscale here is connected to {on}, and joining would switch it."),
                     )?;
                     if !go {
@@ -350,17 +427,17 @@ async fn join(
                             "{} Nothing changed. Use a machine that is not on another tailnet, or run this again with --yes to switch.",
                             "Info:".blue()
                         );
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
-                let display = name.clone().unwrap_or_else(hostname);
+                let display = name.map(str::to_string).unwrap_or_else(hostname);
                 ctx.info(&format!(
                     "  {} connecting with the device tag",
                     "Tailnet:".dimmed()
                 ));
-                tailnet::up_with_key(&ts, &auth_key, &tailscale_hostname(&display))?;
+                tailnet::up_with_key(elevate, ts, &auth_key, &tailscale_hostname(&display))?;
                 joined_by_us = true;
-                status = tailnet::status(&ts)?;
+                status = tailnet::status(ts)?;
                 if status.compute_tag() != Some(tag.as_str()) || !status.running() {
                     return Err(anyhow!(
                         "Tailscale connected, but not with the device tag {tag}. Run `tailscale status` to check, then run this again."
@@ -382,8 +459,29 @@ async fn join(
         endpoint,
         compute_tag.as_deref().unwrap_or("your own tailnet")
     ));
+    Ok(Some(Tailnet {
+        endpoint,
+        compute_tag,
+        joined_by_us,
+    }))
+}
 
-    // 5. Enrol, unless this machine already is a device of this account.
+/// The device record for this machine: `existing` brought up to date when it
+/// belongs to this control plane, else a new enrolment. Saved either way, and
+/// a note that an earlier device was removed is cleared.
+#[allow(clippy::too_many_arguments)]
+async fn enrol(
+    ctx: &KnaixContext,
+    session: &str,
+    api_url: &str,
+    existing: Option<state::DeviceState>,
+    name: Option<String>,
+    max: Option<u64>,
+    port: u16,
+    offer: &hardware::Offer,
+    variant: &llama::Variant,
+    net: Tailnet,
+) -> Result<state::DeviceState> {
     let device = match existing {
         Some(mut d) if d.api_url == api_url => {
             d.gateway_port = port;
@@ -392,10 +490,10 @@ async fn join(
             if max.is_some() {
                 d.max_memory_bytes = max;
             }
-            d.compute_tag = compute_tag.clone();
-            d.joined_tailnet_by_knaix = joined_by_us;
-            if let Some(n) = &name {
-                d.name = n.clone();
+            d.compute_tag = net.compute_tag;
+            d.joined_tailnet_by_knaix = net.joined_by_us;
+            if let Some(n) = name {
+                d.name = n;
             }
             state::save(&d)?;
             ctx.info(&format!("  {} already enrolled as {}", "Device:".dimmed(), d.name.bold()));
@@ -415,9 +513,9 @@ async fn join(
                 total_memory_bytes: offer.total_bytes,
                 usable_memory_bytes: offer.usable_bytes,
                 llama_build: Some(llama::BUILD.into()),
-                rpc_endpoint: Some(endpoint.clone()),
+                rpc_endpoint: Some(net.endpoint),
             };
-            let enrolled = api::enroll(&ctx.client, &api_url, &session, &display, &report).await?;
+            let enrolled = api::enroll(&ctx.client, api_url, session, &display, &report).await?;
             let device_id = enrolled.device["id"].as_str().unwrap_or_default().to_string();
             let key = match &enrolled.ticket_key {
                 Some(k) => ticket::PinnedKey::from_pem(&k.public_key_pem)
@@ -430,7 +528,7 @@ async fn join(
                 // A device without a key could never verify a ticket. Take it
                 // back out rather than leave an enrolment nothing can use.
                 if !device_id.is_empty() {
-                    let _ = api::remove(&ctx.client, &api_url, &session, &device_id).await;
+                    let _ = api::remove(&ctx.client, api_url, session, &device_id).await;
                 }
                 return Err(anyhow!(
                     "The control plane is not issuing tunnel tickets right now, so this machine was not enrolled. Try again later."
@@ -441,15 +539,15 @@ async fn join(
                 device_id,
                 token: enrolled.token,
                 name: display,
-                api_url: api_url.clone(),
+                api_url: api_url.to_string(),
                 ticket_key_id: key.key_id,
                 ticket_key_pem: key.public_key_pem,
                 gateway_port: port,
                 backend: offer.backend.as_str().into(),
                 variant: variant.id.into(),
                 max_memory_bytes: max,
-                compute_tag: compute_tag.clone(),
-                joined_tailnet_by_knaix: joined_by_us,
+                compute_tag: net.compute_tag,
+                joined_tailnet_by_knaix: net.joined_by_us,
                 enrolled_at: state::now_unix(),
             };
             state::save(&d)?;
@@ -468,42 +566,30 @@ async fn join(
     if let Some(m) = removed_marker() {
         let _ = std::fs::remove_file(m);
     }
+    Ok(device)
+}
 
-    // 6. Start.
-    if daemon {
-        let path = service::install()?;
-        ctx.info(&format!(
-            "\n{} {} is lending itself in the background ({}).",
-            "✓".green(),
-            device.name.bold(),
-            path.display()
-        ));
-        ctx.info(&format!(
-            "  {} shows how it is doing; {} stops it and removes it from your account.",
-            brand::cmd("device status"),
-            brand::cmd("device leave")
-        ));
-        if cfg!(target_os = "linux") {
-            ctx.info(&format!(
-                "  To keep it running while you are logged out, run {}.",
-                "loginctl enable-linger $USER".cyan()
-            ));
-        }
-        return Ok(());
-    }
+/// Install the background service through `manager` and say how to manage it.
+fn background(ctx: &KnaixContext, name: &str, manager: &service::Manager) -> Result<()> {
+    let path = manager.install()?;
     ctx.info(&format!(
-        "\n{} {} is lending itself to your pools. Press Ctrl-C to stop; run with {} to keep it running in the background.",
+        "\n{} {} is lending itself in the background ({}).",
         "✓".green(),
-        device.name.bold(),
-        "--daemon".cyan()
+        name.bold(),
+        path.display()
     ));
-    let quiet = ctx.quiet;
-    runner::run(&move |line: &str| {
-        if !quiet {
-            println!("{line}");
-        }
-    })
-    .await
+    ctx.info(&format!(
+        "  {} shows how it is doing; {} stops it and removes it from your account.",
+        brand::cmd("device status"),
+        brand::cmd("device leave")
+    ));
+    if manager.os == "linux" {
+        ctx.info(&format!(
+            "  To keep it running while you are logged out, run {}.",
+            "loginctl enable-linger $USER".cyan()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_service() -> Result<()> {
@@ -983,6 +1069,9 @@ mod tests {
     fn warnings_read_as_sentences() {
         assert!(explain_warning("llama_build_below_floor:8585").contains("8585"));
         assert!(explain_warning("no_gateway_endpoint").contains("gateway"));
+        assert!(
+            explain_warning("llama_build_blocked").starts_with("This llama.cpp build is blocked")
+        );
         assert_eq!(explain_warning("something_new"), "something_new");
     }
 
@@ -993,5 +1082,551 @@ mod tests {
             format!("{:>12}  refused 1.2.3.4: expired", "1 min ago")
         );
         assert_eq!(humanize("plain line", 0), "plain line");
+    }
+
+    /// `join`'s parts, against a fake control plane and a stand-in Tailscale.
+    #[cfg(unix)]
+    mod joining {
+        use super::*;
+        use crate::config::{Config, ScratchHome};
+        use crate::exit::code_of;
+        use crate::testing::{args_of, fake_api, fake_tool, Call};
+        use std::cell::RefCell;
+
+        /// The ticket key in the RPC tunnel test vectors.
+        const KEY_ID: &str = "c1d40ab1863aca6e";
+        const KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAt6E/WRc+E5MpT+ohkHoqZeZG0Y3Hv1hE7bAlp5ykVFY=\n-----END PUBLIC KEY-----\n";
+        const DEVICES: &str = "GET /api/compute/devices";
+        const JOIN_KEY: &str = "POST /api/compute/join-key";
+        const ENROLL: &str = "POST /api/compute/devices";
+        const GIB: u64 = 1 << 30;
+
+        fn ctx(api_url: &str) -> KnaixContext {
+            KnaixContext {
+                config: Config {
+                    token: Some("sess".into()),
+                    api_url: api_url.into(),
+                    ..Config::default()
+                },
+                client: reqwest::Client::new(),
+                output_format: "text".into(),
+                quiet: true,
+            }
+        }
+
+        fn device(api_url: &str) -> state::DeviceState {
+            state::DeviceState {
+                device_id: "dev-1".into(),
+                token: "kvd_secret".into(),
+                name: "studio".into(),
+                api_url: api_url.into(),
+                ticket_key_id: KEY_ID.into(),
+                ticket_key_pem: KEY_PEM.into(),
+                gateway_port: 47100,
+                backend: "metal".into(),
+                variant: "macos-arm64".into(),
+                max_memory_bytes: Some(8 * GIB),
+                compute_tag: None,
+                joined_tailnet_by_knaix: false,
+                enrolled_at: 1,
+            }
+        }
+
+        fn routes(calls: &[Call]) -> Vec<&str> {
+            calls.iter().map(|c| c.route.as_str()).collect()
+        }
+
+        /// `record` as `unless_removed` leaves it, asking the account at `api`.
+        async fn checked(
+            api: &str,
+            record: Option<state::DeviceState>,
+        ) -> Option<state::DeviceState> {
+            unless_removed(&ctx(api), api, "sess", record)
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_device_the_account_still_lists_is_kept_and_one_it_does_not_is_forgotten() {
+            let _home = ScratchHome::new();
+            let listed =
+                fake_api(vec![(DEVICES, 200, json!({"devices": [{"id": "dev-1"}]}))]).await;
+            let unlisted =
+                fake_api(vec![(DEVICES, 200, json!({"devices": [{"id": "other"}]}))]).await;
+            let failing = fake_api(vec![(DEVICES, 500, json!({}))]).await;
+
+            assert_eq!(checked(&listed.url, None).await, None);
+            assert!(listed.calls().is_empty(), "nothing to ask about");
+            assert_eq!(
+                checked(&listed.url, Some(device(&listed.url))).await,
+                Some(device(&listed.url))
+            );
+            assert_eq!(listed.calls()[0].auth.as_deref(), Some("Bearer sess"));
+            let unknown = checked(&failing.url, Some(device(&failing.url))).await;
+            assert_eq!(
+                unknown,
+                Some(device(&failing.url)),
+                "the heartbeat will tell"
+            );
+            // Enrolled with another control plane: not this account's to ask.
+            let elsewhere = checked(&unlisted.url, Some(device("http://elsewhere"))).await;
+            assert_eq!(elsewhere, Some(device("http://elsewhere")));
+            assert!(unlisted.calls().is_empty());
+
+            state::save(&device(&unlisted.url)).unwrap();
+            assert_eq!(
+                checked(&unlisted.url, Some(device(&unlisted.url))).await,
+                None
+            );
+            assert_eq!(state::load().unwrap(), None, "and its record is gone");
+        }
+
+        fn status(backend_state: &str, ips: &[&str], tags: &[&str]) -> Value {
+            json!({
+                "BackendState": backend_state,
+                "Self": {"TailscaleIPs": ips, "Tags": tags},
+                "CurrentTailnet": {"Name": "home.example"},
+            })
+        }
+
+        /// A Tailscale reporting `before`, and `after` once `up` has run.
+        fn tailscale(dir: &std::path::Path, before: Value, after: Value) -> String {
+            fake_tool(
+                dir,
+                "tailscale",
+                &format!(
+                    "case \"$1\" in\n\
+                     status) if [ -e \"$0.up\" ]; then echo '{after}'; else echo '{before}'; fi ;;\n\
+                     up) touch \"$0.up\" ;;\n\
+                     esac"
+                ),
+            )
+        }
+
+        fn managed() -> (&'static str, u16, Value) {
+            (
+                JOIN_KEY,
+                200,
+                json!({"authKey": "tskey-secret", "tag": "tag:c-acme"}),
+            )
+        }
+
+        fn tagged() -> Value {
+            status("Running", &["fd7a::1", "100.64.0.1"], &["tag:c-acme"])
+        }
+
+        fn joined(compute_tag: Option<&str>, joined_by_us: bool) -> Option<Tailnet> {
+            Some(Tailnet {
+                endpoint: "100.64.0.1:47201".into(),
+                compute_tag: compute_tag.map(str::to_string),
+                joined_by_us,
+            })
+        }
+
+        /// Never asked: the case at hand has nothing to confirm.
+        fn unasked(_: &str, _: &str) -> Result<bool> {
+            panic!("asked to switch tailnets");
+        }
+
+        async fn connect(
+            api: &str,
+            ts: &str,
+            elevate: Option<&str>,
+            joined_before: bool,
+            name: Option<&str>,
+            ask: &dyn Fn(&str, &str) -> Result<bool>,
+        ) -> Result<Option<Tailnet>> {
+            let at = std::path::Path::new(ts);
+            connect_tailnet(
+                &ctx(api),
+                "sess",
+                api,
+                at,
+                elevate,
+                joined_before,
+                name,
+                47201,
+                ask,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_machine_already_tagged_or_on_the_accounts_own_tailnet_joins_as_it_is() {
+            let home = ScratchHome::new();
+            let own = json!({"error": "This account uses its own tailnet"});
+            let api = fake_api(vec![(JOIN_KEY, 409, own)]).await;
+
+            let ts = tailscale(&home.0, tagged(), json!({}));
+            let net = connect(&api.url, &ts, None, true, None, &unasked).await;
+            assert_eq!(net.unwrap(), joined(Some("tag:c-acme"), true));
+            assert_eq!(args_of(&ts), ["status --json"]);
+            assert!(api.calls().is_empty(), "a tagged machine needs no key");
+
+            let ts = tailscale(&home.0, status("Running", &["100.64.0.1"], &[]), json!({}));
+            let net = connect(&api.url, &ts, None, false, None, &unasked).await;
+            assert_eq!(net.unwrap(), joined(None, false));
+            assert_eq!(routes(&api.calls()), [JOIN_KEY]);
+            assert_eq!(api.calls()[0].auth.as_deref(), Some("Bearer sess"));
+
+            let ts = tailscale(&home.0, status("NeedsLogin", &[], &[]), json!({}));
+            let err = connect(&api.url, &ts, None, false, None, &unasked)
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::Precondition);
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("This account uses its own tailnet. Connect"),
+                "{msg}"
+            );
+
+            let v6_only = status("Running", &["fd7a::1"], &["tag:c-acme"]);
+            let ts = tailscale(&home.0, v6_only, json!({}));
+            let err = connect(&api.url, &ts, None, false, None, &unasked)
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::Precondition);
+            assert!(
+                err.to_string().starts_with("Tailscale has no IPv4 address"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_machine_off_any_tailnet_joins_kovalents_with_the_key() {
+            let home = ScratchHome::new();
+            let api = fake_api(vec![managed()]).await;
+            let ts = tailscale(&home.0, status("NeedsLogin", &[], &[]), tagged());
+            let sudo = fake_tool(&home.0, "sudo", "exec \"$@\"");
+
+            let net = connect(
+                &api.url,
+                &ts,
+                Some(&sudo),
+                false,
+                Some("Maya's Studio"),
+                &unasked,
+            )
+            .await;
+
+            assert_eq!(net.unwrap(), joined(Some("tag:c-acme"), true));
+            let up = &args_of(&sudo)[0];
+            assert!(up.starts_with(&format!("{ts} up --auth-key=file:")), "{up}");
+            assert!(
+                up.ends_with(" --hostname=maya-s-studio --reset --timeout=60s"),
+                "{up}"
+            );
+            assert_eq!(
+                args_of(&ts),
+                ["status --json", &up[ts.len() + 1..], "status --json"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_join_without_a_name_uses_the_hostname_and_one_without_the_tag_is_refused() {
+            let home = ScratchHome::new();
+            let api = fake_api(vec![managed()]).await;
+            let untagged = status("Running", &["100.64.0.1"], &["tag:other"]);
+            let ts = tailscale(&home.0, status("Stopped", &[], &[]), untagged);
+
+            let err = connect(&api.url, &ts, None, false, None, &unasked)
+                .await
+                .unwrap_err();
+
+            assert_eq!(code_of(&err), Code::Precondition);
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("Tailscale connected, but not with the device tag tag:c-acme."),
+                "{msg}"
+            );
+            let up = &args_of(&ts)[1];
+            let name = tailscale_hostname(&hostname());
+            assert!(up.contains(&format!(" --hostname={name} ")), "{up}");
+        }
+
+        #[tokio::test]
+        async fn a_machine_on_another_tailnet_switches_only_when_the_owner_agrees() {
+            let home = ScratchHome::new();
+            let api = fake_api(vec![managed()]).await;
+            let ts = tailscale(&home.0, status("Running", &["100.101.0.7"], &[]), tagged());
+            // Answered in turn: no, cannot ask, yes.
+            let answers = RefCell::new(vec![
+                Ok(true),
+                Err(anyhow!("no terminal")).coded(Code::Denied),
+                Ok(false),
+            ]);
+            let asked = RefCell::new(Vec::new());
+            let ask = |prompt: &str, refuse: &str| {
+                asked
+                    .borrow_mut()
+                    .push((prompt.to_string(), refuse.to_string()));
+                answers.borrow_mut().pop().unwrap()
+            };
+
+            let net = connect(&api.url, &ts, None, false, Some("studio"), &ask).await;
+            assert_eq!(net.unwrap(), None);
+            assert_eq!(args_of(&ts), ["status --json"], "declining changes nothing");
+            let (prompt, refuse) = asked.borrow()[0].clone();
+            assert!(
+                prompt.starts_with("Tailscale here is connected to home.example. Switch it"),
+                "{prompt}"
+            );
+            assert_eq!(
+                refuse,
+                "Tailscale here is connected to home.example, and joining would switch it."
+            );
+
+            let err = connect(&api.url, &ts, None, false, Some("studio"), &ask)
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::Denied);
+            assert_eq!(args_of(&ts).len(), 2, "nor does being unable to ask");
+
+            let net = connect(&api.url, &ts, None, false, Some("studio"), &ask).await;
+            assert_eq!(net.unwrap(), joined(Some("tag:c-acme"), true));
+            assert!(args_of(&ts)[3].starts_with("up --auth-key=file:"));
+            assert_eq!(asked.borrow().len(), 3);
+        }
+
+        fn offer() -> hardware::Offer {
+            hardware::Offer {
+                backend: hardware::Backend::Cpu,
+                total_bytes: 32 * GIB,
+                usable_bytes: 24 * GIB,
+                detail: "CPU".into(),
+            }
+        }
+
+        fn variant() -> &'static llama::Variant {
+            llama::variant_for("linux", "x86_64", hardware::Backend::Cpu).unwrap()
+        }
+
+        /// `enrol` for the machine at 100.64.0.1, on port 47200.
+        async fn enrolled(
+            api: &str,
+            existing: Option<state::DeviceState>,
+            name: Option<&str>,
+            max: Option<u64>,
+        ) -> Result<state::DeviceState> {
+            let net = joined(Some("tag:c-acme"), true).unwrap();
+            let name = name.map(str::to_string);
+            enrol(
+                &ctx(api),
+                "sess",
+                api,
+                existing,
+                name,
+                max,
+                47200,
+                &offer(),
+                variant(),
+                net,
+            )
+            .await
+        }
+
+        fn removed_note() -> std::path::PathBuf {
+            let note = removed_marker().unwrap();
+            std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+            std::fs::write(&note, "1").unwrap();
+            note
+        }
+
+        #[tokio::test]
+        async fn an_existing_device_of_this_control_plane_is_brought_up_to_date() {
+            let _home = ScratchHome::new();
+            let api = fake_api(vec![]).await;
+            let note = removed_note();
+
+            let d = enrolled(&api.url, Some(device(&api.url)), None, None)
+                .await
+                .unwrap();
+
+            let mut want = device(&api.url);
+            want.gateway_port = 47200;
+            want.backend = "cpu".into();
+            want.variant = "ubuntu-x64".into();
+            want.compute_tag = Some("tag:c-acme".into());
+            want.joined_tailnet_by_knaix = true;
+            assert_eq!(d, want, "the cap and name are kept unless given");
+            assert_eq!(state::load().unwrap(), Some(want));
+            assert!(!note.exists(), "a device again, so no longer removed");
+
+            let d = enrolled(&api.url, Some(d), Some("garage"), Some(4 * GIB))
+                .await
+                .unwrap();
+            assert_eq!(
+                (d.name.as_str(), d.max_memory_bytes),
+                ("garage", Some(4 * GIB))
+            );
+            assert_eq!(state::load().unwrap(), Some(d));
+            assert!(api.calls().is_empty(), "nothing to enrol");
+        }
+
+        #[tokio::test]
+        async fn a_device_of_another_control_plane_must_leave_it_first() {
+            let _home = ScratchHome::new();
+            let api = fake_api(vec![]).await;
+
+            let err = enrolled(&api.url, Some(device("http://elsewhere")), None, None)
+                .await
+                .unwrap_err();
+
+            assert_eq!(code_of(&err), Code::Precondition);
+            assert_eq!(
+                err.to_string(),
+                "This machine is enrolled with another control plane (http://elsewhere). Run `knaix device leave` first."
+            );
+            assert_eq!(state::load().unwrap(), None);
+            assert!(api.calls().is_empty());
+        }
+
+        fn key(key_id: &str, pem: &str) -> Value {
+            json!({"keyId": key_id, "publicKeyPem": pem})
+        }
+
+        #[tokio::test]
+        async fn a_new_device_is_enrolled_with_what_it_offers_and_saved() {
+            let _home = ScratchHome::new();
+            let reply = json!({
+                "device": {"id": "dev-new"},
+                "token": "kvd_new",
+                "ticketKey": key(KEY_ID, KEY_PEM),
+                "warnings": ["llama_build_unknown", "no_gateway_endpoint"],
+            });
+            let api = fake_api(vec![(ENROLL, 201, reply)]).await;
+            let note = removed_note();
+            let before = state::now_unix();
+
+            let d = enrolled(&api.url, None, Some("garage"), Some(4 * GIB))
+                .await
+                .unwrap();
+
+            let calls = api.calls();
+            assert_eq!(routes(&calls), [ENROLL]);
+            assert_eq!(calls[0].auth.as_deref(), Some("Bearer sess"));
+            assert_eq!(
+                calls[0].body,
+                json!({
+                    "name": "garage",
+                    "platform": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "backend": "cpu",
+                    "totalMemoryBytes": 32 * GIB,
+                    "usableMemoryBytes": 24 * GIB,
+                    "llamaBuild": llama::BUILD,
+                    "rpcEndpoint": "100.64.0.1:47201",
+                })
+            );
+            let want = state::DeviceState {
+                device_id: "dev-new".into(),
+                token: "kvd_new".into(),
+                name: "garage".into(),
+                api_url: api.url.clone(),
+                ticket_key_id: KEY_ID.into(),
+                ticket_key_pem: KEY_PEM.into(),
+                gateway_port: 47200,
+                backend: "cpu".into(),
+                variant: "ubuntu-x64".into(),
+                max_memory_bytes: Some(4 * GIB),
+                compute_tag: Some("tag:c-acme".into()),
+                joined_tailnet_by_knaix: true,
+                enrolled_at: d.enrolled_at,
+            };
+            assert_eq!(d, want);
+            assert!(d.enrolled_at >= before);
+            assert_eq!(state::load().unwrap(), Some(want));
+            assert!(!note.exists());
+        }
+
+        #[tokio::test]
+        async fn a_new_device_without_a_usable_ticket_key_is_taken_back_out() {
+            let _home = ScratchHome::new();
+            let unusable = [
+                Value::Null,
+                key("0ld0ld0ld0ld0ld0", KEY_PEM),
+                key(KEY_ID, "not a key"),
+            ];
+            for ticket_key in unusable {
+                let reply = json!({"device": {"id": "dev-new"}, "token": "kvd_new", "ticketKey": ticket_key});
+                let api = fake_api(vec![
+                    (ENROLL, 201, reply),
+                    ("DELETE /api/compute/devices/dev-new", 204, Value::Null),
+                ])
+                .await;
+
+                let err = enrolled(&api.url, None, Some("garage"), None)
+                    .await
+                    .unwrap_err();
+
+                assert_eq!(code_of(&err), Code::Unavailable, "{ticket_key}");
+                assert!(
+                    err.to_string()
+                        .starts_with("The control plane is not issuing tunnel tickets"),
+                    "{err}"
+                );
+                assert_eq!(
+                    routes(&api.calls()),
+                    [ENROLL, "DELETE /api/compute/devices/dev-new"],
+                    "{ticket_key}"
+                );
+                assert_eq!(api.calls()[1].auth.as_deref(), Some("Bearer sess"));
+                assert_eq!(state::load().unwrap(), None);
+            }
+
+            // Nothing to take back out when the control plane named no device.
+            let reply =
+                json!({"device": {}, "token": "kvd_new", "ticketKey": key(KEY_ID, KEY_PEM)});
+            let api = fake_api(vec![(ENROLL, 201, reply)]).await;
+            let err = enrolled(&api.url, None, Some("garage"), None)
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::Unavailable);
+            assert_eq!(routes(&api.calls()), [ENROLL]);
+            assert_eq!(state::load().unwrap(), None);
+        }
+
+        #[test]
+        fn the_background_service_is_installed_through_the_systems_manager() {
+            let home = ScratchHome::new();
+            let ctx = ctx("http://127.0.0.1:9");
+            for (os, program, file) in [
+                (
+                    "macos",
+                    "launchctl",
+                    "Library/LaunchAgents/com.kovalent.knaix-device.plist",
+                ),
+                (
+                    "linux",
+                    "systemctl",
+                    ".config/systemd/user/knaix-device.service",
+                ),
+            ] {
+                let manager = fake_tool(&home.0, program, "exit 0");
+                background(
+                    &ctx,
+                    "studio",
+                    &service::Manager {
+                        os,
+                        program: &manager,
+                    },
+                )
+                .unwrap();
+                assert!(home.0.join(file).exists(), "{os}");
+                assert!(!args_of(&manager).is_empty(), "{os}");
+            }
+
+            let refusing = fake_tool(&home.0, "launchctl", "exit 1");
+            let err = background(
+                &ctx,
+                "studio",
+                &service::Manager {
+                    os: "macos",
+                    program: &refusing,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(code_of(&err), Code::Precondition);
+        }
     }
 }
