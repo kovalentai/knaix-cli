@@ -23,6 +23,7 @@ Order: authentication and release verification first (`login.rs`, `config.rs`, `
 
 - The test step runs under `cargo llvm-cov` instead of `cargo test`, so the suite still runs once.
 - Floors start at today's numbers, rounded down, and rise with each PR.
+- **The README badge.** On each push to `main`, a separate job commits the line coverage, rounded down, as a shields.io endpoint file to the orphan `badges` branch, only when it changed. Only that job can write. It may fail without marking `main` red. Red below 60%, yellow below 80%, green from 80%.
 
 ## PR 2: Signing in
 

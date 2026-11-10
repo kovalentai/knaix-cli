@@ -11,7 +11,7 @@ own machine with no account, or on a hosted node over a zero-trust mesh.
 
 [**CLI Docs**](https://knaix.com) &nbsp;·&nbsp; [Website](https://kovalentai.com) &nbsp;·&nbsp; [Platform Docs](https://docs.kovalentai.com) &nbsp;·&nbsp; [Dashboard](https://app.kovalentai.com) &nbsp;·&nbsp; [Changelog](https://knaix.com/docs/changelog)
 
-[![Release](https://img.shields.io/github/v/release/kovalentai/knaix-cli?label=release&color=7C5CFF)](https://github.com/kovalentai/knaix-cli/releases) [![CI](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-64748B)](LICENSE) [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B)](#install)
+[![Release](https://img.shields.io/github/v/release/kovalentai/knaix-cli?label=release&color=7C5CFF)](https://github.com/kovalentai/knaix-cli/releases) [![CI](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kovalentai/knaix-cli/badges/coverage.json)](https://github.com/kovalentai/knaix-cli/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-64748B)](LICENSE) [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B)](#install)
 
 </div>
 

@@ -40,11 +40,74 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Test, measuring coverage
+        run: cargo llvm-cov --locked --no-report
+
       # Floors only rise: raise them to the measured numbers, rounded down.
-      - name: Test, with coverage floors
+      - name: Coverage floors
         run: |
-          cargo llvm-cov --locked --summary-only \
+          cargo llvm-cov report --summary-only \
             --fail-under-lines 57 --fail-under-regions 57 --fail-under-functions 65
+
+      # Rounded down, so the badge never claims more than was measured.
+      - name: Coverage badge
+        run: |
+          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
+          jq '.data[0].totals.lines.percent as $p | {schemaVersion: 1, label: "coverage",
+              message: "\($p | floor)%",
+              color: (if $p < 60 then "red" elif $p < 80 then "yellow" else "brightgreen" end)}' \
+            coverage-summary.json > coverage.json
+          cat coverage.json
+
+      - name: Keep the badge for publishing
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: coverage.json
+
+  # Publishes the badge the README shows, from main only. Its own job, so the
+  # test job's token stays read-only, and allowed to fail, since a badge that
+  # did not update is no reason to mark main red.
+  coverage-badge:
+    name: Publish the coverage badge
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-badge
+          path: new
+
+      # An orphan branch that holds only the badge, committed to only when the
+      # number changed.
+      - name: Commit it to the badges branch
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q badges && cd badges
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          if git fetch -q --depth 1 origin badges; then
+            git checkout -q -B badges FETCH_HEAD
+          else
+            git checkout -q --orphan badges
+          fi
+          cp ../new/coverage.json coverage.json
+          git add coverage.json
+          if git diff --cached --quiet; then
+            echo "Coverage unchanged: $(jq -r .message coverage.json)"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "coverage: $(jq -r .message coverage.json)"
+          git push -q origin HEAD:badges
 
   # A release publishes a Windows binary, but nothing compiled for Windows until
   # the tag was already cut. Code that only fails there -- a Unix-only helper, a
