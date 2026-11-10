@@ -486,6 +486,23 @@ pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
         .interact()
         .context("Could not read the password")?;
 
+    let ask_code = || {
+        Input::<String>::with_theme(&theme)
+            .with_prompt("Authenticator code")
+            .interact_text()
+            .context("Could not read the code")
+    };
+    sign_in(&api_url, &username, password, ask_code).await
+}
+
+/// Both steps of the terminal sign-in, once the username and password are in
+/// hand. `ask_code` is called only when the account has MFA on.
+async fn sign_in(
+    api_url: &str,
+    username: &str,
+    password: String,
+    ask_code: impl FnOnce() -> Result<String>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -493,7 +510,7 @@ pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
 
     let mut reply = post_login(
         &client,
-        &api_url,
+        api_url,
         serde_json::json!({ "username": username, "password": password }),
     )
     .await?;
@@ -503,14 +520,10 @@ pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
         let temp = reply.temp_token.take().ok_or_else(|| {
             anyhow!("The API asked for an MFA code but sent no session to send it with")
         })?;
-        let code: String = Input::with_theme(&theme)
-            .with_prompt("Authenticator code")
-            .interact_text()
-            .context("Could not read the code")?;
-        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let code: String = ask_code()?.chars().filter(|c| !c.is_whitespace()).collect();
         reply = post_login(
             &client,
-            &api_url,
+            api_url,
             serde_json::json!({ "mfaToken": temp, "mfaCode": code }),
         )
         .await?;
@@ -519,7 +532,9 @@ pub async fn login_in_terminal(username: Option<String>) -> Result<()> {
     let token = reply
         .token
         .ok_or_else(|| anyhow!("The API accepted the sign-in but returned no session"))?;
-    let username = reply.user.map(|u| u.username).unwrap_or(username);
+    let username = reply
+        .user
+        .map_or_else(|| username.to_string(), |u| u.username);
     store_session(&token, &username)
 }
 
@@ -550,7 +565,18 @@ async fn control_plane_answers(api_url: &str) -> bool {
 
 pub async fn login() -> Result<()> {
     let api_url = load_config().api_url;
-    if !control_plane_answers(&api_url).await {
+    let wait = std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS);
+    browser_login(&api_url, open::that, wait).await
+}
+
+/// The browser sign-in, with the browser and the wait passed in so a test can
+/// stand in for both.
+async fn browser_login(
+    api_url: &str,
+    open_browser: impl FnOnce(String) -> std::io::Result<()>,
+    wait: std::time::Duration,
+) -> Result<()> {
+    if !control_plane_answers(api_url).await {
         return Err(anyhow!("Could not reach the Kovalent API at {api_url}"))
             .context("Signing in needs the control plane, and it did not answer")
             .coded(Code::Unavailable);
@@ -587,7 +613,7 @@ pub async fn login() -> Result<()> {
 
     // Build the auth URL with the callback properly percent-encoded, so the
     // callback's own query string survives being nested as a parameter.
-    let auth_url = url::Url::parse(&auth_base(&load_config().api_url))
+    let auth_url = url::Url::parse(&auth_base(api_url))
         .map(|mut u| {
             u.query_pairs_mut().append_pair("callback", &callback_url);
             u.to_string()
@@ -601,7 +627,7 @@ pub async fn login() -> Result<()> {
         crate::brand::cmd("login --no-browser")
     );
 
-    if let Err(e) = open::that(&auth_url) {
+    if let Err(e) = open_browser(auth_url) {
         println!(
             "{} Could not open the browser ({}). Visit the URL above to continue.",
             "Warning:".yellow(),
@@ -628,10 +654,10 @@ pub async fn login() -> Result<()> {
             // before the server goes away with the process.
             tokio::time::sleep(std::time::Duration::from_millis(750)).await;
         }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS)) => {
+        _ = tokio::time::sleep(wait) => {
             return Err(anyhow!(
                 "No sign-in completed within {} minutes. Run 'knaix login' to try again.",
-                LOGIN_TIMEOUT_SECS / 60
+                wait.as_secs() / 60
             ));
         }
     }
@@ -673,6 +699,10 @@ mod tests {
         assert_eq!(
             reply("{}").refusal(status),
             "The API answered 403 Forbidden"
+        );
+        assert_eq!(
+            reply(r#"{"message":"Awaiting approval"}"#).refusal(status),
+            "Awaiting approval"
         );
     }
 
@@ -759,10 +789,6 @@ mod tests {
         }
     }
 
-    // The success branch of handle_callback writes to the real ~/.knaix
-    // config, so these tests only exercise the rejection branch, which
-    // returns before touching any state or the filesystem.
-
     #[tokio::test]
     async fn callback_with_missing_state_is_rejected() {
         let state = state_with("expected-nonce");
@@ -793,5 +819,225 @@ mod tests {
             !*state.completed.lock().unwrap(),
             "a callback with the wrong state nonce must not complete login"
         );
+    }
+
+    use crate::config::{load_stored_config, ScratchHome};
+    use axum::{http::StatusCode, routing::post, Json};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+
+    /// Serve `app` on a loopback port and return its origin.
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        origin
+    }
+
+    /// A control plane whose `/api/auth/login` gives `answers` in order and
+    /// records every body it was sent.
+    async fn login_api(answers: Vec<(u16, Value)>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
+        let log = sent.clone();
+        let app = Router::new().route(
+            "/api/auth/login",
+            post(move |Json(body): Json<Value>| async move {
+                log.lock().unwrap().push(body);
+                let (status, reply) = answers
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an unexpected call");
+                (StatusCode::from_u16(status).unwrap(), Json(reply))
+            }),
+        );
+        (serve(app).await, sent)
+    }
+
+    /// An authenticator prompt that answers `typed`. Where a test has no MFA
+    /// step, the bodies the API received show it was never asked.
+    fn code(typed: &'static str) -> impl FnOnce() -> Result<String> {
+        move || Ok(typed.to_string())
+    }
+
+    fn saved() -> (Option<String>, Option<String>) {
+        let c = load_stored_config();
+        (c.token, c.username)
+    }
+
+    #[tokio::test]
+    async fn a_password_sign_in_saves_the_session_under_the_apis_username() {
+        let _home = ScratchHome::new();
+        let (api, sent) = login_api(vec![(
+            200,
+            json!({"token": "jwt", "user": {"username": "Diego"}}),
+        )])
+        .await;
+
+        sign_in(&api, "diego", "hunter2".into(), code("unused"))
+            .await
+            .unwrap();
+
+        assert_eq!(saved(), (Some("jwt".into()), Some("Diego".into())));
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![json!({"username": "diego", "password": "hunter2"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mfa_account_sends_the_code_without_its_spaces_on_the_temp_session() {
+        let _home = ScratchHome::new();
+        let (api, sent) = login_api(vec![
+            (200, json!({"mfaRequired": true, "tempToken": "temp"})),
+            (200, json!({"token": "jwt"})),
+        ])
+        .await;
+
+        sign_in(&api, "diego", "pw".into(), code(" 123 456 "))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent.lock().unwrap()[1],
+            json!({"mfaToken": "temp", "mfaCode": "123456"})
+        );
+        // No user in the reply: the typed name is kept.
+        assert_eq!(saved(), (Some("jwt".into()), Some("diego".into())));
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_is_an_auth_error_in_the_apis_words_and_saves_nothing() {
+        let _home = ScratchHome::new();
+        let (api, _) = login_api(vec![(401, json!({"error": "Invalid credentials"}))]).await;
+
+        let err = sign_in(&api, "diego", "wrong".into(), code("unused"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(crate::exit::code_of(&err), Code::Auth);
+        assert_eq!(err.to_string(), "Sign-in refused");
+        assert_eq!(err.root_cause().to_string(), "Invalid credentials");
+        assert_eq!(saved(), (None, None));
+    }
+
+    #[tokio::test]
+    async fn a_failed_code_prompt_stops_before_the_second_step() {
+        let _home = ScratchHome::new();
+        let (api, sent) = login_api(vec![(
+            200,
+            json!({"mfaRequired": true, "tempToken": "temp"}),
+        )])
+        .await;
+
+        let err = sign_in(&api, "diego", "pw".into(), || Err(anyhow!("no tty")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "no tty");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(saved(), (None, None));
+    }
+
+    #[tokio::test]
+    async fn replies_missing_the_session_are_errors_not_a_silent_sign_in() {
+        let _home = ScratchHome::new();
+        let (api, _) = login_api(vec![
+            (200, json!({"mfaRequired": true})),
+            (200, json!({"user": {"username": "diego"}})),
+        ])
+        .await;
+
+        let mfa = sign_in(&api, "diego", "pw".into(), code("unused"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            mfa.to_string(),
+            "The API asked for an MFA code but sent no session to send it with"
+        );
+        let none = sign_in(&api, "diego", "pw".into(), code("unused"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            none.to_string(),
+            "The API accepted the sign-in but returned no session"
+        );
+        assert_eq!(saved(), (None, None));
+    }
+
+    #[tokio::test]
+    async fn an_api_that_is_not_listening_is_unavailable() {
+        let _home = ScratchHome::new();
+        // Port 9 is discard: the connection is refused.
+        let err = sign_in("http://127.0.0.1:9", "diego", "pw".into(), code("unused"))
+            .await
+            .unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), Code::Unavailable);
+        assert_eq!(
+            err.to_string(),
+            "Could not reach the Kovalent API at http://127.0.0.1:9"
+        );
+    }
+
+    /// A control plane that only answers the preflight.
+    async fn health_api() -> String {
+        serve(Router::new().route("/health", get(|| async { "ok" }))).await
+    }
+
+    #[tokio::test]
+    async fn the_browser_callback_saves_the_session_and_shows_the_success_page() {
+        let _home = ScratchHome::new();
+        let api = health_api().await;
+        let page = Arc::new(Mutex::new(String::new()));
+        let shown = page.clone();
+
+        // Stand in for the browser: follow the callback the sign-in page would.
+        let browser = move |auth_url: String| {
+            let auth = url::Url::parse(&auth_url).unwrap();
+            assert_eq!(auth.path(), "/cli-auth", "the API's own sign-in page");
+            let (_, callback) = auth.query_pairs().find(|(k, _)| k == "callback").unwrap();
+            let callback = format!("{callback}&token=jwt&username=diego");
+            tokio::spawn(async move {
+                *shown.lock().unwrap() =
+                    reqwest::get(callback).await.unwrap().text().await.unwrap();
+            });
+            Ok(())
+        };
+        browser_login(&api, browser, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        assert_eq!(saved(), (Some("jwt".into()), Some("diego".into())));
+        assert!(page.lock().unwrap().contains("<span>Authenticated</span>"));
+    }
+
+    /// A machine with no browser to open.
+    fn no_browser(_: String) -> std::io::Result<()> {
+        Err(std::io::Error::other("no browser"))
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_that_never_comes_back_times_out() {
+        let _home = ScratchHome::new();
+        let api = health_api().await;
+        let err = browser_login(&api, no_browser, std::time::Duration::from_millis(50))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().starts_with("No sign-in completed within"));
+        assert_eq!(saved(), (None, None));
+    }
+
+    #[tokio::test]
+    async fn the_browser_sign_in_refuses_when_the_control_plane_does_not_answer() {
+        let err = browser_login(
+            "http://127.0.0.1:9",
+            no_browser,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), Code::Unavailable);
     }
 }
