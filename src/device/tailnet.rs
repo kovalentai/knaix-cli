@@ -182,9 +182,8 @@ pub fn up_with_key(
     Ok(())
 }
 
-/// On Linux, `tailscale up` needs root unless the user is Tailscale's operator.
-/// What `tailscale up` needs to run through on this machine, if anything.
-/// Only Linux needs root for it, and then only when knaix runs as a user.
+/// What `tailscale up` needs to run through on this machine, if anything. On
+/// Linux, `tailscale up` needs root unless the user is Tailscale's operator.
 pub fn elevate() -> Option<&'static str> {
     #[cfg(target_os = "linux")]
     {
