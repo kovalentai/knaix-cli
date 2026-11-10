@@ -143,11 +143,18 @@ fn record(home: &Path) -> Option<Value> {
 
 /// A process standing in for `knaix device run`, recorded as the running
 /// device, with `runtime` laid over what it reports. Reaped when it exits, so a
-/// stopped one stops counting as alive.
-fn running_device(home: &Path, runtime: Value) -> u32 {
-    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+/// stopped one stops counting as alive, and killed when the test ends, so it
+/// cannot hold a pipe another test is reading.
+fn running_device(home: &Path, runtime: Value) -> Running {
+    let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
     let pid = child.id();
-    std::thread::spawn(move || child.wait());
+    let child = Arc::new(Mutex::new(child));
+    let reaper = child.clone();
+    std::thread::spawn(move || {
+        while matches!(reaper.lock().unwrap().try_wait(), Ok(None)) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
     let mut rt = json!({
         "pid": pid,
         "started_at": now() - 60,
@@ -166,7 +173,17 @@ fn running_device(home: &Path, runtime: Value) -> u32 {
         .unwrap()
         .extend(runtime.as_object().unwrap().clone());
     fs::write(home.join(".knaix/device/runtime.json"), rt.to_string()).unwrap();
-    pid
+    Running(pid, child)
+}
+
+struct Running(u32, Arc<Mutex<std::process::Child>>);
+
+impl Drop for Running {
+    // Through the handle, not the pid: once reaped, the pid may be another
+    // process's, and the handle knows not to signal it.
+    fn drop(&mut self) {
+        let _ = self.1.lock().unwrap().kill();
+    }
 }
 
 fn alive(pid: u32) -> bool {
@@ -209,7 +226,7 @@ fn status_reports_the_running_device_and_the_accounts_view_of_it() {
         ]}),
     )]);
     enrol(&home, &url, json!({}));
-    running_device(&home, json!({"server_ticket_key_id": KEY_ID}));
+    let _device = running_device(&home, json!({"server_ticket_key_id": KEY_ID}));
 
     let (code, out, err) = run(knaix(&home)
         .env("KNAIX_TOKEN", "sess")
@@ -258,7 +275,7 @@ fn status_reports_the_running_device_and_the_accounts_view_of_it() {
 fn status_of_a_device_whose_heartbeat_fails_says_what_went_wrong() {
     let home = scratch_home("status-failing");
     enrol(&home, "http://127.0.0.1:9", json!({"compute_tag": null}));
-    running_device(
+    let _device = running_device(
         &home,
         json!({
             "gateway": null,
@@ -387,7 +404,7 @@ fn leave_stops_the_device_removes_it_and_forgets_its_token() {
         Box::leak(format!("DELETE /api/compute/devices/{DEV}").into_boxed_str());
     let (url, calls) = api(vec![(route, 204, json!({}))]);
     enrol(&home, &url, json!({}));
-    let pid = running_device(&home, json!({}));
+    let device = running_device(&home, json!({}));
 
     let (code, out, err) = run(knaix(&home)
         .env("KNAIX_TOKEN", "sess")
@@ -400,7 +417,7 @@ fn leave_stops_the_device_removes_it_and_forgets_its_token() {
     );
     assert!(out.contains("Removed from your account."), "{out}");
     assert!(out.contains("tailscale logout"), "{out}");
-    assert!(wait_dead(pid), "the running device was not stopped");
+    assert!(wait_dead(device.0), "the running device was not stopped");
     assert_eq!(record(&home), None);
     assert!(!home.join(".knaix/device/runtime.json").exists());
     assert_eq!(*calls.lock().unwrap(), [format!("{route} Bearer sess")]);
@@ -481,7 +498,7 @@ fn rekey_pins_the_served_key_and_stops_the_device_holding_the_old_one() {
         json!({"keyId": KEY_ID, "publicKeyPem": KEY_PEM}),
     )]);
     enrol(&home, &url, json!({}));
-    let pid = running_device(&home, json!({}));
+    let device = running_device(&home, json!({}));
 
     let (code, out, err) = run(knaix(&home).args(["device", "rekey", "--yes"]));
 
@@ -492,7 +509,7 @@ fn rekey_pins_the_served_key_and_stops_the_device_holding_the_old_one() {
         out.contains("Stopped the running device so it does not keep the old key."),
         "{out}"
     );
-    assert!(wait_dead(pid));
+    assert!(wait_dead(device.0));
     let saved = record(&home).unwrap();
     assert_eq!(
         (
