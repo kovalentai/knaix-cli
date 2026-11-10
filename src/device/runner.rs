@@ -542,15 +542,19 @@ async fn heartbeat_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ScratchHome;
-    use crate::exit::code_of;
-    use std::cell::RefCell;
 
+    #[cfg(unix)]
+    use crate::config::ScratchHome;
+    #[cfg(unix)]
+    use crate::exit::code_of;
     #[cfg(unix)]
     use crate::testing::{args_of, fake_api, fake_tool};
     #[cfg(unix)]
     use serde_json::json;
+    #[cfg(unix)]
+    use std::cell::RefCell;
 
+    #[cfg(unix)]
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
             runtime: Mutex::new(Runtime {
@@ -564,6 +568,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn saved() -> Runtime {
         state::load_runtime().expect("runtime.json was saved")
     }
@@ -742,7 +747,9 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     const HEARTBEAT: &str = "POST /api/compute/devices/heartbeat";
+    #[cfg(unix)]
     const ENDPOINT: &str = "100.64.0.1:47100";
 
     /// Run the heartbeat loop with every beat woken at once, as rpc-server's

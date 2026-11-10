@@ -402,6 +402,7 @@ fn stop_unit_on(os: &str, systemctl: &str, unit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::config::ScratchHome;
     use crate::exit::{code_of, Code};
     #[cfg(unix)]
