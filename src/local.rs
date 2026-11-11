@@ -906,8 +906,6 @@ pub async fn up(
 /// that answered a request seconds ago, so the failure mode of a typed URL
 /// and model name -- a 404 at the first question -- is off the table.
 pub async fn setup() -> Result<()> {
-    use crossterm::{cursor, execute};
-    use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input, Select};
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
@@ -923,7 +921,71 @@ pub async fn setup() -> Result<()> {
     );
     let found =
         crate::model_server::discover(saved.as_ref().and_then(|n| n.model_url.clone())).await;
+    choose(&Terminal, saved, found).await
+}
 
+/// How setup asks the owner: the terminal in use, scripted answers in tests.
+trait Ask {
+    /// One of `items`, or None when the owner backs out. `fuzzy` lets them
+    /// type to narrow a long list.
+    fn pick(&self, prompt: &str, items: &[String], default: usize, fuzzy: bool) -> Option<usize>;
+    /// A line of text, which may be empty only when `allow_empty`.
+    fn text(&self, prompt: &str, allow_empty: bool) -> Result<String>;
+    /// Yes or no: `default` on a bare Enter, and no when the prompt fails.
+    fn confirm(&self, prompt: &str, default: bool) -> bool;
+}
+
+/// The terminal, through dialoguer.
+struct Terminal;
+
+impl Ask for Terminal {
+    fn pick(&self, prompt: &str, items: &[String], default: usize, fuzzy: bool) -> Option<usize> {
+        use crossterm::{cursor, execute};
+        use dialoguer::{theme::ColorfulTheme, FuzzySelect, Select};
+        let theme = ColorfulTheme::default();
+        let _ = execute!(std::io::stderr(), cursor::Hide);
+        let pick = if fuzzy {
+            FuzzySelect::with_theme(&theme)
+                .with_prompt(prompt)
+                .items(items)
+                .default(default)
+                .interact_opt()
+        } else {
+            Select::with_theme(&theme)
+                .with_prompt(prompt)
+                .items(items)
+                .default(default)
+                .interact_opt()
+        };
+        let _ = execute!(std::io::stderr(), cursor::Show);
+        pick.unwrap_or(None)
+    }
+
+    fn text(&self, prompt: &str, allow_empty: bool) -> Result<String> {
+        use dialoguer::{theme::ColorfulTheme, Input};
+        Ok(Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .allow_empty(allow_empty)
+            .interact_text()?)
+    }
+
+    fn confirm(&self, prompt: &str, default: bool) -> bool {
+        use dialoguer::{theme::ColorfulTheme, Confirm};
+        Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .default(default)
+            .interact()
+            .unwrap_or(false)
+    }
+}
+
+/// The rest of `setup`: offer what `found` holds and what else can answer,
+/// remember the choice, and get the node running it.
+async fn choose(
+    ask: &dyn Ask,
+    saved: Option<LocalNode>,
+    found: Vec<crate::model_server::FoundServer>,
+) -> Result<()> {
     if found.is_empty() {
         println!(
             "  None answering on the usual ports: Ollama (11434), LM Studio (1234), vLLM (8000), llama-server (8081)."
@@ -953,16 +1015,7 @@ pub async fn setup() -> Result<()> {
         .and_then(|u| found.iter().position(|s| s.url == u))
         .unwrap_or(0);
 
-    let _ = execute!(std::io::stderr(), cursor::Hide);
-    let pick = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("What should answer?")
-        .items(&items)
-        .default(default)
-        .interact_opt()
-        .unwrap_or(None);
-    let _ = execute!(std::io::stderr(), cursor::Show);
-
-    let Some(pick) = pick else {
+    let Some(pick) = ask.pick("What should answer?", &items, default, false) else {
         println!("{} Nothing changed.", "Info:".blue());
         return Ok(());
     };
@@ -973,7 +1026,7 @@ pub async fn setup() -> Result<()> {
             "\n{} The deterministic mock answers. Retrieval and citations stay real.",
             "✓".green()
         );
-        return offer_start_or_restart(&node).await;
+        return offer_start_or_restart(ask, &node).await;
     }
 
     // Set where the server is known not to be running: the choice was already
@@ -981,9 +1034,10 @@ pub async fn setup() -> Result<()> {
     // fail for the reason already accepted.
     let mut server_absent = false;
     let (url, models) = if pick == manual_idx {
-        let raw: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Server URL (the base, e.g. http://192.168.1.50:11434)")
-            .interact_text()?;
+        let raw = ask.text(
+            "Server URL (the base, e.g. http://192.168.1.50:11434)",
+            false,
+        )?;
         let url = raw.trim().trim_end_matches('/').to_string();
         let label = crate::model_server::label_for(&url);
         match crate::model_server::probe(&url, label, std::time::Duration::from_secs(2)).await {
@@ -991,11 +1045,7 @@ pub async fn setup() -> Result<()> {
             None => {
                 // Maybe it is not running yet; refusing to save would make
                 // setup unusable for a server someone is about to start.
-                let keep = Confirm::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Nothing answered there. Remember it anyway?")
-                    .default(false)
-                    .interact()
-                    .unwrap_or(false);
+                let keep = ask.confirm("Nothing answered there. Remember it anyway?", false);
                 if !keep {
                     println!("{} Nothing changed.", "Info:".blue());
                     return Ok(());
@@ -1030,10 +1080,10 @@ pub async fn setup() -> Result<()> {
 
     let model = match models.len() {
         0 => {
-            let name: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Model to request (Enter for none; llama-server ignores the name)")
-                .allow_empty(true)
-                .interact_text()?;
+            let name = ask.text(
+                "Model to request (Enter for none; llama-server ignores the name)",
+                true,
+            )?;
             let name = name.trim().to_string();
             if name.is_empty() {
                 None
@@ -1059,15 +1109,7 @@ pub async fn setup() -> Result<()> {
                 .iter()
                 .map(|m| describe_model(m, total_memory))
                 .collect();
-            let _ = execute!(std::io::stderr(), cursor::Hide);
-            let choice = FuzzySelect::with_theme(&ColorfulTheme::default())
-                .with_prompt("Which model?")
-                .items(&items)
-                .default(current)
-                .interact_opt()
-                .unwrap_or(None);
-            let _ = execute!(std::io::stderr(), cursor::Show);
-            let Some(i) = choice else {
+            let Some(i) = ask.pick("Which model?", &items, current, true) else {
                 println!("{} Nothing changed.", "Info:".blue());
                 return Ok(());
             };
@@ -1110,12 +1152,7 @@ pub async fn setup() -> Result<()> {
     };
     if let crate::model_server::GenerationCheck::Failed(why) = verdict {
         println!("\n{} That model did not answer: {}", "✗".red(), why);
-        let keep = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Remember it anyway?")
-            .default(false)
-            .interact()
-            .unwrap_or(false);
-        if !keep {
+        if !ask.confirm("Remember it anyway?", false) {
             println!(
                 "{} Nothing changed. Run setup again to pick another.",
                 "Info:".blue()
@@ -1134,7 +1171,7 @@ pub async fn setup() -> Result<()> {
         ),
         None => println!("\n{} The model at {} will answer.", "✓".green(), url.cyan()),
     }
-    offer_start_or_restart(&node).await
+    offer_start_or_restart(ask, &node).await
 }
 
 /// How long the node may spend on one answer, in milliseconds, or None to let
@@ -1217,21 +1254,14 @@ fn remember_choice(
 /// choice only takes effect at startup, and a node still answering with the old
 /// one looks broken); a stopped or never-started node is offered a start, so
 /// `knaix local setup` can stand the whole thing up in one command.
-async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
-    use dialoguer::{theme::ColorfulTheme, Confirm};
-
+async fn offer_start_or_restart(ask: &dyn Ask, node: &LocalNode) -> Result<()> {
     let running = container_state().as_deref() == Some("running");
     let prompt = if running {
         "The node is running with the previous choice. Restart it now?"
     } else {
         "Start the local node now?"
     };
-    let go = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .default(true)
-        .interact()
-        .unwrap_or(false);
-    if !go {
+    if !ask.confirm(prompt, true) {
         if running {
             println!(
                 "  It keeps answering with the previous choice until {}.",
@@ -1261,7 +1291,7 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
     )
     .await?;
 
-    offer_local_as_default();
+    offer_local_as_default(ask);
     Ok(())
 }
 
@@ -1287,22 +1317,16 @@ fn should_offer_default(current: Option<&str>) -> Option<String> {
 /// ending that with "pass -n local to everything from now on" is the wrong
 /// answer to what they came to do. So it asks, once, rather than either
 /// stealing the default or leaving them with a flag they have to remember.
-fn offer_local_as_default() {
-    use dialoguer::{theme::ColorfulTheme, Confirm};
-
+fn offer_local_as_default(ask: &dyn Ask) {
     let cfg = crate::config::load_stored_config();
     let Some(current) = should_offer_default(cfg.default_node_id.as_deref()) else {
         return;
     };
 
-    let yes = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "Make local your default node instead of {current}?"
-        ))
-        .default(false)
-        .interact()
-        .unwrap_or(false);
-    if !yes {
+    if !ask.confirm(
+        &format!("Make local your default node instead of {current}?"),
+        false,
+    ) {
         return;
     }
 
@@ -2742,6 +2766,417 @@ esac"#;
             save(&node_at(&refusing)).unwrap();
             connect_snapshot_inner(&ctx(&refusing.url, Some("sess"))).await;
             assert_eq!(load().unwrap().remote_id, None);
+        }
+    }
+
+    /// `local setup` past its terminal check, answered from a script.
+    #[cfg(unix)]
+    mod choosing {
+        use super::*;
+        use crate::config::ScratchHome;
+        use crate::model_server::{FoundServer, ModelInfo};
+        use crate::testing::{args_of, fake_api, fake_tool, FakeApi};
+        use serde_json::json;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        #[derive(Debug)]
+        enum Answer {
+            Pick(Option<usize>),
+            Text(String),
+            Confirm(bool),
+        }
+        use Answer::{Confirm, Pick, Text};
+
+        /// What was asked: the prompt, and for a pick its items, the one the
+        /// cursor started on and whether it filters.
+        #[derive(Debug, Default)]
+        struct Asked {
+            prompt: String,
+            items: Vec<String>,
+            default: usize,
+            fuzzy: bool,
+        }
+
+        /// Answers in order, each checked against the kind of question.
+        struct Scripted {
+            answers: RefCell<VecDeque<Answer>>,
+            asked: RefCell<Vec<Asked>>,
+        }
+
+        fn script(answers: Vec<Answer>) -> Scripted {
+            Scripted {
+                answers: RefCell::new(answers.into()),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        impl Scripted {
+            fn next(&self, asked: Asked) -> Answer {
+                let answer = self.answers.borrow_mut().pop_front();
+                let answer = answer.unwrap_or_else(|| panic!("unscripted: {asked:?}"));
+                self.asked.borrow_mut().push(asked);
+                answer
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.asked
+                    .borrow()
+                    .iter()
+                    .map(|a| a.prompt.clone())
+                    .collect()
+            }
+        }
+
+        impl Ask for Scripted {
+            fn pick(
+                &self,
+                prompt: &str,
+                items: &[String],
+                default: usize,
+                fuzzy: bool,
+            ) -> Option<usize> {
+                let asked = Asked {
+                    prompt: prompt.into(),
+                    items: items.to_vec(),
+                    default,
+                    fuzzy,
+                };
+                match self.next(asked) {
+                    Pick(p) => p,
+                    other => panic!("{prompt:?} answered with {other:?}"),
+                }
+            }
+
+            fn text(&self, prompt: &str, _allow_empty: bool) -> Result<String> {
+                match self.next(Asked {
+                    prompt: prompt.into(),
+                    ..Asked::default()
+                }) {
+                    Text(t) => Ok(t),
+                    other => panic!("{prompt:?} answered with {other:?}"),
+                }
+            }
+
+            fn confirm(&self, prompt: &str, _default: bool) -> bool {
+                match self.next(Asked {
+                    prompt: prompt.into(),
+                    ..Asked::default()
+                }) {
+                    Confirm(c) => c,
+                    other => panic!("{prompt:?} answered with {other:?}"),
+                }
+            }
+        }
+
+        const START: &str = "Start the local node now?";
+        const RESTART: &str = "The node is running with the previous choice. Restart it now?";
+        const CHAT: &str = "POST /v1/chat/completions";
+
+        /// One server playing both the model server and the node.
+        async fn server(chat: u16, reply: serde_json::Value) -> FakeApi {
+            fake_api(vec![
+                ("GET /v1/models", 200, json!({"data": [{"id": "qwen"}]})),
+                (CHAT, chat, reply),
+                ("GET /health", 200, json!({})),
+                ("POST /api/query/answer", 200, json!({})),
+            ])
+            .await
+        }
+
+        fn port_of(api: &FakeApi) -> u16 {
+            api.url.rsplit(':').next().unwrap().parse().unwrap()
+        }
+
+        fn found(url: &str, models: Vec<ModelInfo>) -> FoundServer {
+            FoundServer {
+                url: url.into(),
+                label: "Ollama".into(),
+                models,
+            }
+        }
+
+        fn sized(id: &str, bytes: u64) -> ModelInfo {
+            ModelInfo {
+                id: id.into(),
+                size_bytes: Some(bytes),
+                local: true,
+            }
+        }
+
+        /// A docker with a node by our name, `running` or not, that `run`
+        /// starts and `rm` removes.
+        fn docker(home: &ScratchHome, running: bool) -> String {
+            let docker = fake_tool(
+                &home.0,
+                "docker",
+                r#"case "$1" in
+  info) echo 27.0.0 ;;
+  inspect) [ -e "$0.state" ] || exit 1; cat "$0.state" ;;
+  image) exit 0 ;;
+  rm) rm -f "$0.state" ;;
+  run) echo running > "$0.state" ;;
+esac"#,
+            );
+            if running {
+                std::fs::write(format!("{docker}.state"), "running").unwrap();
+            }
+            docker
+        }
+
+        fn default_node() -> Option<String> {
+            crate::config::load_stored_config().default_node_id
+        }
+
+        fn set_default_node(id: &str) {
+            let mut cfg = crate::config::load_stored_config();
+            cfg.default_node_id = Some(id.into());
+            crate::config::save_config(&cfg).unwrap();
+        }
+
+        #[tokio::test]
+        async fn backing_out_of_the_first_choice_changes_nothing() {
+            let _home = ScratchHome::new();
+            let ask = script(vec![Pick(None)]);
+
+            choose(&ask, None, Vec::new()).await.unwrap();
+
+            let asked = &ask.asked.borrow()[0];
+            assert_eq!(asked.prompt, "What should answer?");
+            assert_eq!(
+                asked.items,
+                [
+                    "A server somewhere else...",
+                    "No model: the deterministic mock (retrieval and citations stay real)"
+                ]
+            );
+            assert_eq!((asked.default, asked.fuzzy), (0, false));
+            assert!(load().is_none());
+        }
+
+        #[tokio::test]
+        async fn choosing_the_mock_forgets_the_model_and_can_leave_the_node_as_it_is() {
+            let home = ScratchHome::new();
+            let docker = docker(&home, true);
+            let _docker = UseDocker::new(&docker);
+            let before = saved(8080, Some("http://localhost:11434"), Some("llama3"));
+            save(&before).unwrap();
+            let servers = vec![
+                found("http://localhost:1234", Vec::new()),
+                found("http://localhost:11434", vec![sized("llama3", 1 << 30)]),
+                found("http://localhost:8000", vec![sized("a", 1), sized("b", 1)]),
+            ];
+            let ask = script(vec![Pick(Some(4)), Confirm(false)]);
+
+            choose(&ask, Some(before), servers).await.unwrap();
+
+            let first = &ask.asked.borrow()[0];
+            assert_eq!(first.default, 1, "the cursor starts on what is chosen");
+            assert_eq!(
+                first.items[0],
+                "Ollama at http://localhost:1234 (no models pulled)"
+            );
+            assert_eq!(first.items[1], "Ollama at http://localhost:11434 (1 model)");
+            assert_eq!(first.items[2], "Ollama at http://localhost:8000 (2 models)");
+            assert_eq!(ask.prompts()[1], RESTART);
+            let node = load().unwrap();
+            assert_eq!((node.model_url, node.model), (None, None));
+            assert_eq!(node.instance_id, "x", "the store is the same one");
+            assert!(
+                !args_of(&docker).iter().any(|a| a.starts_with("rm ")),
+                "left running"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_found_servers_models_are_offered_by_fit_and_the_one_chosen_is_checked_then_run()
+        {
+            let home = ScratchHome::new();
+            let docker = docker(&home, true);
+            let _docker = UseDocker::new(&docker);
+            let api = server(200, json!({"choices": []})).await;
+            let before = saved(port_of(&api), Some(&api.url), Some("unsized"));
+            save(&before).unwrap();
+            set_default_node("hosted-1");
+            let models = vec![
+                sized("huge", u64::MAX / 2),
+                ModelInfo {
+                    id: "cloud".into(),
+                    size_bytes: Some(300),
+                    local: false,
+                },
+                sized("small", 1 << 20),
+                ModelInfo::unmeasured("unsized".into()),
+            ];
+            let ask = script(vec![
+                Pick(Some(0)),
+                Pick(Some(2)),
+                Confirm(true),
+                Confirm(true),
+            ]);
+
+            choose(&ask, Some(before), vec![found(&api.url, models)])
+                .await
+                .unwrap();
+
+            let asked = ask.asked.borrow();
+            let models = &asked[1];
+            assert_eq!(models.prompt, "Which model?");
+            assert!(models.fuzzy);
+            let ids: Vec<&str> = models
+                .items
+                .iter()
+                .map(|i| i.split_whitespace().next().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                ["small", "unsized", "huge"],
+                "the best fits first; nothing hosted elsewhere"
+            );
+            assert_eq!(models.default, 1, "the cursor starts on the model in use");
+            assert!(
+                models.items[2].contains("larger than this machine can hold"),
+                "{}",
+                models.items[2]
+            );
+            assert_eq!(asked[2].prompt, RESTART);
+            assert_eq!(
+                asked[3].prompt,
+                "Make local your default node instead of hosted-1?"
+            );
+            let check = api.calls().into_iter().find(|c| c.route == CHAT).unwrap();
+            assert_eq!(check.body["model"], "huge");
+            assert_eq!(check.body["max_tokens"], 1);
+            let node = load().unwrap();
+            assert_eq!(
+                (node.model_url.as_deref(), node.model.as_deref()),
+                (Some(api.url.as_str()), Some("huge"))
+            );
+            let calls = args_of(&docker);
+            assert!(
+                calls.contains(&"rm -f knaix-local".to_string()),
+                "{calls:#?}"
+            );
+            let run = calls.iter().find(|c| c.starts_with("run ")).unwrap();
+            assert!(run.contains("-e LLAMA_MODEL_ID=huge "), "{run}");
+            assert_eq!(default_node().as_deref(), Some("local"));
+        }
+
+        #[tokio::test]
+        async fn a_server_typed_in_is_asked_and_a_model_that_will_not_answer_can_be_dropped_or_kept(
+        ) {
+            let home = ScratchHome::new();
+            let api = server(500, json!({"error": {"message": "model not loaded"}})).await;
+            let typed = format!("  {}/ ", api.url);
+
+            let ask = script(vec![Pick(Some(0)), Text(typed.clone()), Confirm(false)]);
+            choose(&ask, None, Vec::new()).await.unwrap();
+            assert_eq!(ask.prompts()[2], "Remember it anyway?");
+            assert!(load().is_none(), "dropped");
+            let check = api.calls().into_iter().find(|c| c.route == CHAT).unwrap();
+            assert_eq!(
+                check.body["model"], "qwen",
+                "the one model is chosen for them"
+            );
+
+            let _docker = UseDocker::new(docker(&home, false));
+            let ask = script(vec![
+                Pick(Some(0)),
+                Text(typed),
+                Confirm(true),
+                Confirm(false),
+            ]);
+            choose(&ask, None, Vec::new()).await.unwrap();
+            assert_eq!(ask.prompts()[3], START);
+            let node = load().unwrap();
+            assert_eq!(node.model_url.as_deref(), Some(api.url.as_str()), "trimmed");
+            assert_eq!(node.model.as_deref(), Some("qwen"));
+            assert_eq!(node.port, DEFAULT_PORT, "never started, so the defaults");
+        }
+
+        #[tokio::test]
+        async fn a_server_typed_in_that_does_not_answer_can_still_be_remembered() {
+            let _home = ScratchHome::new();
+            let closed = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port())
+            };
+
+            let ask = script(vec![Pick(Some(0)), Text(closed.clone()), Confirm(false)]);
+            choose(&ask, None, Vec::new()).await.unwrap();
+            assert_eq!(
+                ask.prompts()[2],
+                "Nothing answered there. Remember it anyway?"
+            );
+            assert!(load().is_none());
+
+            for (name, model) in [("", None), ("  qwen ", Some("qwen"))] {
+                let ask = script(vec![
+                    Pick(Some(0)),
+                    Text(closed.clone()),
+                    Confirm(true),
+                    Text(name.into()),
+                    Confirm(false),
+                ]);
+                choose(&ask, None, Vec::new()).await.unwrap();
+                assert!(
+                    ask.prompts()[3].starts_with("Model to request"),
+                    "{:?}",
+                    ask.prompts()
+                );
+                assert_eq!(
+                    ask.prompts()[4],
+                    START,
+                    "no generation check against a server that is not there"
+                );
+                let node = load().unwrap();
+                assert_eq!(node.model_url.as_deref(), Some(closed.as_str()));
+                assert_eq!(node.model.as_deref(), model);
+            }
+        }
+
+        #[tokio::test]
+        async fn backing_out_of_the_model_list_changes_nothing() {
+            let _home = ScratchHome::new();
+            let models = vec![sized("a", 1 << 20), sized("b", 1 << 20)];
+            let ask = script(vec![Pick(Some(0)), Pick(None)]);
+
+            choose(&ask, None, vec![found("http://localhost:11434", models)])
+                .await
+                .unwrap();
+
+            assert!(load().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_node_started_from_setup_can_leave_another_node_the_default() {
+            let home = ScratchHome::new();
+            let docker = docker(&home, false);
+            let _docker = UseDocker::new(&docker);
+            let api = server(200, json!({})).await;
+            save(&saved(port_of(&api), None, None)).unwrap();
+            set_default_node("hosted-1");
+            let ask = script(vec![Pick(Some(1)), Confirm(true), Confirm(false)]);
+
+            choose(&ask, load(), Vec::new()).await.unwrap();
+
+            assert_eq!(
+                ask.prompts()[1..],
+                [
+                    START.to_string(),
+                    "Make local your default node instead of hosted-1?".into()
+                ]
+            );
+            let run = args_of(&docker)
+                .into_iter()
+                .find(|c| c.starts_with("run "))
+                .unwrap();
+            assert!(run.contains("GENERATION_PROVIDER=mock"), "{run}");
+            assert!(
+                !args_of(&docker).iter().any(|c| c.starts_with("rm ")),
+                "nothing to stop"
+            );
+            assert_eq!(default_node().as_deref(), Some("hosted-1"));
         }
     }
 }
