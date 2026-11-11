@@ -62,7 +62,9 @@ impl Ask for Terminal {
 }
 
 /// Scripted answers, for tests.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+// Text and yes-or-no answers are asked for by Unix-only tests.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod scripted {
     use super::Ask;
     use anyhow::{anyhow, Result};

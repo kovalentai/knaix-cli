@@ -1644,7 +1644,7 @@ async fn select_node(
             "Info:".blue(),
             nodes[0].name.cyan()
         );
-        return Ok(node_uuid(&nodes[0]).ok());
+        return node_uuid(&nodes[0]).map(Some);
     }
 
     // Several, and nobody to ask: a picker here would wait for keys that never
@@ -1672,7 +1672,7 @@ async fn select_node(
         .collect();
 
     if let Some(index) = ask.pick("Select a node", &items, 0, true) {
-        return Ok(node_uuid(&nodes[index]).ok());
+        return node_uuid(&nodes[index]).map(Some);
     }
 
     Ok(None)
@@ -3757,6 +3757,155 @@ pub async fn view_memory(ctx: &KnaixContext, node_id: &str, file: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Choosing the node to ask, against a fake control plane.
+    mod choosing {
+        use super::*;
+        use crate::ask::scripted::{script, Answer::*};
+        use crate::config::Config;
+        use crate::testing::fake_api;
+        use serde_json::json;
+
+        const INSTANCES: &str = "GET /api/instances";
+
+        pub(super) fn ctx(api: &str, token: Option<&str>, default: Option<&str>) -> KnaixContext {
+            KnaixContext {
+                config: Config {
+                    token: token.map(String::from),
+                    api_url: api.into(),
+                    default_node_id: default.map(String::from),
+                    ..Config::default()
+                },
+                client: reqwest::Client::new(),
+                output_format: "text".into(),
+                quiet: true,
+            }
+        }
+
+        fn two() -> serde_json::Value {
+            json!({"data": [
+                {"id": "u-1", "name": "alpha", "state": "running"},
+                {"id": "u-2", "name": "beta", "state": "stopped"},
+            ]})
+        }
+
+        #[tokio::test]
+        async fn one_node_is_chosen_for_you_and_none_is_nothing_to_choose() {
+            let one = fake_api(vec![(
+                INSTANCES,
+                200,
+                json!({"data": [{"id": "u-1", "name": "alpha", "state": "running"}]}),
+            )])
+            .await;
+            let picked =
+                select_node(&ctx(&one.url, Some("sess"), None), &script(vec![]), true).await;
+            assert_eq!(picked.unwrap().as_deref(), Some("u-1"));
+            assert_eq!(one.calls()[0].auth.as_deref(), Some("Bearer sess"));
+
+            let none = fake_api(vec![(INSTANCES, 200, json!({"data": []}))]).await;
+            let picked =
+                select_node(&ctx(&none.url, Some("sess"), None), &script(vec![]), true).await;
+            assert_eq!(picked.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn of_several_the_one_picked_is_asked_and_backing_out_asks_nothing() {
+            let api = fake_api(vec![(INSTANCES, 200, two())]).await;
+            let signed_in = ctx(&api.url, Some("sess"), None);
+
+            let ask = script(vec![Pick(Some(1))]);
+            assert_eq!(
+                select_node(&signed_in, &ask, true)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("u-2")
+            );
+            {
+                let asked = &ask.asked.borrow()[0];
+                assert_eq!(asked.prompt, "Select a node");
+                assert!(asked.fuzzy);
+                assert_eq!(asked.default, 0);
+                assert!(
+                    asked.items[0].starts_with("alpha (") && asked.items[0].contains("running"),
+                    "{:?}",
+                    asked.items
+                );
+                assert!(
+                    asked.items[1].starts_with("beta (") && asked.items[1].contains("stopped"),
+                    "{:?}",
+                    asked.items
+                );
+            }
+
+            let ask = script(vec![Pick(None)]);
+            assert_eq!(select_node(&signed_in, &ask, true).await.unwrap(), None);
+
+            let err = select_node(&signed_in, &script(vec![]), false)
+                .await
+                .unwrap_err();
+            assert_eq!(crate::exit::code_of(&err), Code::Usage);
+            assert!(
+                err.to_string().contains("you have 2 (alpha, beta)"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_node_without_a_uuid_is_an_error_not_a_silent_nothing() {
+            let one = fake_api(vec![(
+                INSTANCES,
+                200,
+                json!({"data": [{"name": "old", "state": "running"}]}),
+            )])
+            .await;
+            let err = select_node(&ctx(&one.url, Some("sess"), None), &script(vec![]), true)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Node old has no instance UUID"),
+                "{err}"
+            );
+
+            let api = fake_api(vec![(INSTANCES, 200, json!({"data": [{"name": "old", "state": "running"}, {"id": "u-2", "name": "beta", "state": "running"}]}))]).await;
+            let err = select_node(
+                &ctx(&api.url, Some("sess"), None),
+                &script(vec![Pick(Some(0))]),
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("Node old has no instance UUID"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_list_failing_or_unreadable_or_no_session_is_an_error() {
+            let down = fake_api(vec![(INSTANCES, 503, json!({}))]).await;
+            let err = select_node(&ctx(&down.url, Some("sess"), None), &script(vec![]), true)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("Failed to fetch node list (HTTP 503"),
+                "{err}"
+            );
+
+            let odd = fake_api(vec![(INSTANCES, 200, json!({"data": "nodes"}))]).await;
+            let err = select_node(&ctx(&odd.url, Some("sess"), None), &script(vec![]), true)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "Failed to parse node list from API");
+
+            let err = select_node(&ctx(&odd.url, None, None), &script(vec![]), true)
+                .await
+                .unwrap_err();
+            assert_eq!(crate::exit::code_of(&err), Code::Auth);
+            assert_eq!(odd.calls().len(), 1, "no session, nothing asked");
+        }
+    }
 
     /// Four or five digits of milliseconds is a number the reader has to divide
     /// before they can react to it, which is the opposite of what a timing
