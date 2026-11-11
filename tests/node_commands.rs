@@ -371,6 +371,10 @@ fn metrics_of_a_hosted_node_as_a_table_or_as_it_came() {
         metrics.out
     );
 
+    let forbidden = server(vec![two_nodes(), (HEALTH, 403, String::new())]);
+    let metrics = knaix(&home, &forbidden.url, &["metrics", "alpha"]);
+    assert_eq!(metrics.code, 3, "{}", metrics.err);
+
     let refusing = server(vec![two_nodes(), (HEALTH, 503, String::new())]);
     let metrics = knaix(&home, &refusing.url, &["metrics", "alpha"]);
     assert_eq!(metrics.code, 1, "{}", metrics.err);
@@ -391,19 +395,16 @@ fn metrics_of_the_local_node_are_measured_from_this_machine() {
 
     let metrics = knaix(&home, "http://127.0.0.1:9", &["metrics", "local"]);
     assert_eq!(metrics.code, 0, "{}", metrics.err);
-    for expected in [
-        "Local node health:",
-        "HEALTHY",
-        "127.0.0.1",
-        "community",
-        "2",
-    ] {
+    for expected in ["Local node health:", "HEALTHY", "127.0.0.1", "community"] {
         assert!(
             metrics.out.contains(expected),
             "missing {expected:?} in:\n{}",
             metrics.out
         );
     }
+
+    let peers = metrics.out.lines().find(|l| l.contains("Peers")).unwrap();
+    assert!(peers.contains(" 2 "), "two peers: {peers}");
 
     let json_out = knaix(
         &home,
@@ -416,6 +417,16 @@ fn metrics_of_the_local_node_are_measured_from_this_machine() {
     assert_eq!(measured["healthy"], true);
     assert_eq!(measured["tier"], "community");
     assert!(measured["latencyMs"].is_u64());
+
+    // Answering, but not ready: the store is still opening.
+    let opening = server(vec![(
+        "GET /health",
+        200,
+        json!({"ready": false}).to_string(),
+    )]);
+    record_local_node(&home, &opening.url);
+    let metrics = knaix(&home, "http://127.0.0.1:9", &["metrics", "local"]);
+    assert!(metrics.out.contains("NOT READY"), "{}", metrics.out);
 
     let waking = server(vec![(
         "GET /health",
@@ -431,6 +442,13 @@ fn metrics_of_the_local_node_are_measured_from_this_machine() {
             metrics.out
         );
     }
+    let json_out = knaix(
+        &home,
+        "http://127.0.0.1:9",
+        &["-o", "json", "metrics", "local"],
+    );
+    let measured: Value = serde_json::from_str(&json_out.out).unwrap();
+    assert_eq!(measured["healthy"], false);
 
     record_local_node(&home, "http://127.0.0.1:9");
     let metrics = knaix(&home, "http://127.0.0.1:9", &["metrics", "local"]);
