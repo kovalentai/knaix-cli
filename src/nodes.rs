@@ -1576,6 +1576,8 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// Ask which node to act on: one is chosen for you, several are offered in a
+/// picker, and with no terminal to show it on, the caller is told how to name one.
 pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<String>> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
