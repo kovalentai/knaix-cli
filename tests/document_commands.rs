@@ -851,7 +851,8 @@ fn an_upload_goes_ahead_when_what_is_already_filed_cannot_be_listed() {
 fn a_long_dry_run_lists_fifty_and_counts_the_rest() {
     let home = scratch_home("docs-dry-long");
     let dir = home.join("many");
-    for i in 0..52 {
+    // One past the fifty shown, so the count is exercised at its edge.
+    for i in 0..51 {
         write(&dir, &format!("note-{i:02}.md"), "x");
     }
 
@@ -862,7 +863,33 @@ fn a_long_dry_run_lists_fifty_and_counts_the_rest() {
     );
 
     assert_eq!(dry.code, 0, "{}", dry.err);
-    assert!(dry.out.contains("Would ingest 52 file(s):"), "{}", dry.out);
+    assert!(dry.out.contains("Would ingest 51 file(s):"), "{}", dry.out);
     assert_eq!(dry.out.matches("+ note-").count(), 50, "{}", dry.out);
-    assert!(dry.out.contains("+ and 2 more"), "{}", dry.out);
+    assert!(dry.out.contains("+ and 1 more"), "{}", dry.out);
+}
+
+#[test]
+fn an_upload_the_control_plane_did_not_take_is_an_error_whatever_the_status() {
+    let home = scratch_home("docs-upload-unaccepted");
+    write(&home, "travel.md", "Economy.");
+    let api = server(vec![
+        alpha(),
+        (LIST, 200, json!({"data": []}).to_string()),
+        (
+            UPLOAD,
+            200,
+            json!({"success": false, "error": "quota exceeded"}).to_string(),
+        ),
+    ]);
+
+    let upload = knaix(&home, &api.url, &["upload", "-n", "alpha", "travel.md"]);
+
+    assert_eq!(upload.code, 1, "{}", upload.out);
+    assert!(
+        upload
+            .err
+            .contains("Upload failed: HTTP 200 OK - quota exceeded"),
+        "{}",
+        upload.err
+    );
 }
