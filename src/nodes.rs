@@ -1686,12 +1686,22 @@ async fn select_node(
 
 /// The UUID a node's data routes are keyed by, or an error naming the node.
 pub(crate) fn node_uuid(node: &Node) -> Result<String> {
-    node.id.clone().ok_or_else(|| {
+    let id = node.id.clone().ok_or_else(|| {
         anyhow!(
             "Node {} has no instance UUID; the control plane is too old for this CLI.",
             node.name
         )
-    })
+    })?;
+    // The id names the node's notes directory and goes into request paths, so
+    // one the server sent as `../..` would file a note outside ~/.knaix/memory.
+    if crate::stdin_arg::checked_name("id", &id).is_err() {
+        return Err(anyhow!(
+            "Node {} has an id that is not a plain name: {:?}",
+            node.name,
+            id
+        ));
+    }
+    Ok(id)
 }
 
 /// Turn anything the user can read off `knaix list` -- UUID, instance id, or
