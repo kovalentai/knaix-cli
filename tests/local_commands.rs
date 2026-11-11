@@ -700,6 +700,26 @@ fn a_node_published_on_every_interface_is_recreated_on_loopback_keeping_its_stor
         "{launched}"
     );
     assert_eq!(recorded(&home).unwrap()["instance_id"], INSTANCE);
+
+    // Taken down even when it cannot be started again: left up, it would stay
+    // open to the network.
+    docker
+        .running_ours(node.port)
+        .set("port", &format!("0.0.0.0:{}\n", node.port))
+        .set("pull-fails", "")
+        .unset("present");
+    let up = local(&home, &["up"]);
+    assert_eq!(up.code, 1, "{}", up.out);
+    assert!(up.err.contains("Could not pull"), "{}", up.err);
+    assert_eq!(
+        docker
+            .calls()
+            .iter()
+            .filter(|c| *c == "rm -f knaix-local")
+            .count(),
+        1,
+        "removed once, before the pull"
+    );
 }
 
 #[test]
@@ -892,6 +912,11 @@ fn status_says_whether_the_node_runs_answers_and_with_what() {
     );
     let text = status("text");
     assert!(text.out.contains("running (not ready)"), "{}", text.out);
+    let waking: Value = serde_json::from_str(&status("json").out).unwrap();
+    assert_eq!(
+        (&waking["running"], &waking["healthy"]),
+        (&json!(true), &json!(false))
+    );
     assert!(
         text.out.contains("model at http://localhost:11434"),
         "{}",
