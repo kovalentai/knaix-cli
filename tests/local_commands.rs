@@ -1168,3 +1168,41 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
     );
     assert_eq!(node.calls().len(), calls);
 }
+
+#[test]
+fn connect_in_the_foreground_records_the_connection_before_it_relays() {
+    let home = scratch_home("connect-foreground");
+    let docker = docker(&home);
+    let node = node();
+    docker.running_ours(node.port);
+    record(&home, node.port, json!({}));
+    node.answer(CONNECT, 200, r#"{"data":{"clientId":"c-1"}}"#);
+    node.answer(TELEMETRY, 200, "{}");
+
+    let mut relay = knaix(&home)
+        .env("PATH", format!("{}:/bin", home.join("bin").display()))
+        .env("KNAIX_TOKEN", "sess")
+        .env("KNAIX_API_URL", format!("http://127.0.0.1:{}", node.port))
+        .args(["local", "connect"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("the first sample", || {
+        node.calls().iter().any(|(r, _)| r == TELEMETRY)
+    });
+    // Relaying until stopped, so it is stopped here.
+    relay.kill().unwrap();
+    let out = relay.wait_with_output().unwrap();
+
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.contains("Relaying metrics and logs. Press Ctrl-C to stop"),
+        "{out}"
+    );
+    let saved = recorded(&home).unwrap();
+    assert_eq!(
+        saved["remote_id"], "c-1",
+        "a dashboard can find it while it relays"
+    );
+    assert_eq!(saved["relay_pid"], Value::Null, "nothing in the background");
+}
