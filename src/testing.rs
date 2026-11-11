@@ -30,7 +30,8 @@ impl FakeApi {
 }
 
 /// Answer each `"METHOD /path"` in `routes` with its status and JSON body.
-/// A `Null` body sends nothing at all. Any other route answers 404 with no
+/// A `Null` body sends nothing at all, and a string is sent as it is, which is
+/// how a test serves an event stream. Any other route answers 404 with no
 /// body, as a missing one would.
 pub async fn fake_api(routes: Vec<(&str, u16, Value)>) -> FakeApi {
     let routes: HashMap<String, (u16, Value)> = routes
@@ -51,10 +52,10 @@ pub async fn fake_api(routes: Vec<(&str, u16, Value)>) -> FakeApi {
             });
             match routes.get(&route) {
                 Some((status, reply)) => {
-                    let body = if reply.is_null() {
-                        String::new()
-                    } else {
-                        reply.to_string()
+                    let body = match reply {
+                        Value::Null => String::new(),
+                        Value::String(raw) => raw.clone(),
+                        json => json.to_string(),
                     };
                     (StatusCode::from_u16(*status).unwrap(), body)
                 }
