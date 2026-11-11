@@ -4319,6 +4319,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_sizes_read_in_the_largest_unit_they_fill() {
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1_572_864), "1.5 MB");
+        assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
+    }
+
     /// Four or five digits of milliseconds is a number the reader has to divide
     /// before they can react to it, which is the opposite of what a timing
     /// readout is for.
