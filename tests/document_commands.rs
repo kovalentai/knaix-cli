@@ -765,3 +765,104 @@ fn memory_lists_a_nodes_notes_and_reads_one() {
     let emptied = knaix(&home, &api.url, &["memory", "-n", "alpha"]);
     assert!(emptied.out.contains("No files found."), "{}", emptied.out);
 }
+
+#[test]
+fn a_document_that_cannot_be_listed_or_read_is_an_error_naming_the_status() {
+    let home = scratch_home("docs-unreadable");
+    let api = server(vec![
+        alpha(),
+        hosted_documents(),
+        (
+            "GET /api/knowledge/u-1/documents/d-3/content",
+            500,
+            String::new(),
+        ),
+    ]);
+    let cat = knaix(&home, &api.url, &["cat", "-n", "alpha", "travel.md"]);
+    assert_eq!(cat.code, 1, "{}", cat.out);
+    assert!(
+        cat.err
+            .contains("Could not read the document: HTTP 500 Internal Server Error"),
+        "{}",
+        cat.err
+    );
+
+    let unlisted = server(vec![alpha(), (LIST, 503, String::new())]);
+    let cat = knaix(&home, &unlisted.url, &["cat", "-n", "alpha", "travel.md"]);
+    assert_eq!(cat.code, 1, "{}", cat.out);
+    assert!(
+        cat.err
+            .contains("Could not list documents: HTTP 503 Service Unavailable"),
+        "{}",
+        cat.err
+    );
+
+    let node = local_node(vec![("POST /api/kb/document", 500, String::new())]);
+    record_local_node(&home, &node.url);
+    let cat = knaix(
+        &home,
+        "http://127.0.0.1:9",
+        &["cat", "-n", "local", "house.md"],
+    );
+    assert_eq!(cat.code, 1, "{}", cat.out);
+    assert!(
+        cat.err.contains("Could not read the document: HTTP 500"),
+        "{}",
+        cat.err
+    );
+}
+
+#[test]
+fn an_upload_goes_ahead_when_what_is_already_filed_cannot_be_listed() {
+    let home = scratch_home("docs-upload-unlisted");
+    write(&home, "travel.md", "Economy.");
+    let api = server(vec![
+        alpha(),
+        (LIST, 503, String::new()),
+        (
+            UPLOAD,
+            200,
+            json!({"success": true, "data": {"chunkCount": 1}}).to_string(),
+        ),
+    ]);
+
+    for args in [
+        &["upload", "-n", "alpha", "travel.md"][..],
+        &["upload", "-n", "alpha", "travel.md", "--replace"],
+    ] {
+        let upload = knaix(&home, &api.url, args);
+        assert_eq!(upload.code, 0, "{args:?}: {}", upload.err);
+        assert!(
+            upload.out.contains("travel.md ingested (1 chunk)."),
+            "{}",
+            upload.out
+        );
+        assert!(
+            !upload.out.contains("already"),
+            "nothing known to warn about: {}",
+            upload.out
+        );
+    }
+    assert_eq!(api.calls().iter().filter(|c| c.route == UPLOAD).count(), 2);
+    assert!(!api.calls().iter().any(|c| c.route.starts_with("DELETE")));
+}
+
+#[test]
+fn a_long_dry_run_lists_fifty_and_counts_the_rest() {
+    let home = scratch_home("docs-dry-long");
+    let dir = home.join("many");
+    for i in 0..52 {
+        write(&dir, &format!("note-{i:02}.md"), "x");
+    }
+
+    let dry = knaix(
+        &home,
+        "http://127.0.0.1:9",
+        &["upload", &dir.display().to_string(), "--dry-run"],
+    );
+
+    assert_eq!(dry.code, 0, "{}", dry.err);
+    assert!(dry.out.contains("Would ingest 52 file(s):"), "{}", dry.out);
+    assert_eq!(dry.out.matches("+ note-").count(), 50, "{}", dry.out);
+    assert!(dry.out.contains("+ and 2 more"), "{}", dry.out);
+}
