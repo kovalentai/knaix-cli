@@ -127,19 +127,34 @@ pub fn knaix_reading(home: &Path, api: &str, args: &[&str], stdin: Stdio) -> Run
         .args(args)
         .spawn()
         .expect("failed to run knaix");
+    // Drained while it runs: a pipe nobody reads fills, and a command that
+    // prints more than it holds would stop and read as one that never finished.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             panic!("knaix {args:?} did not finish");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let out = child.wait_with_output().unwrap();
+    };
     Run {
-        code: out.status.code().expect("killed by a signal"),
-        out: String::from_utf8_lossy(&out.stdout).into_owned(),
-        err: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: status.code().expect("killed by a signal"),
+        out: out.join().unwrap(),
+        err: err.join().unwrap(),
     }
 }
 
