@@ -2512,16 +2512,20 @@ const TIMING_SHOWN_AFTER: Duration = WAITED_AFTER;
 
 /// The two halves of a wait worth explaining, or `None` when it is not.
 ///
-/// Separated from the printing so the thresholds and the subtraction can be
-/// tested without capturing stdout.
-fn timing_split(answer: &ChatAnswer) -> Option<(u128, u128)> {
+/// Separated from the printing so the thresholds, the subtraction and the
+/// wording can be tested without capturing stdout.
+fn timing_line(answer: &ChatAnswer) -> Option<String> {
     let (first, total) = (answer.first_token_ms?, answer.total_ms?);
     if total < TIMING_SHOWN_AFTER.as_millis() {
         return None;
     }
     // Saturating because the two are sampled separately; a total below the
     // first token would otherwise wrap into an enormous generation time.
-    Some((first, total.saturating_sub(first)))
+    Some(format!(
+        "{} to the first word, {} writing.",
+        format_duration_ms(first),
+        format_duration_ms(total.saturating_sub(first))
+    ))
 }
 
 /// The passage carrying a given `[n]` marker, if the last answer had one.
@@ -2540,18 +2544,9 @@ fn find_source(citations: &[Citation], index: u32) -> Option<&Citation> {
 /// Silent on a quick answer, and silent when nothing streamed, since there is
 /// then no first token to have timed.
 pub fn print_answer_timing(answer: &ChatAnswer) {
-    let Some((first, generating)) = timing_split(answer) else {
-        return;
-    };
-    println!(
-        "{}",
-        format!(
-            "{} to the first word, {} writing.",
-            format_duration_ms(first),
-            format_duration_ms(generating)
-        )
-        .dimmed()
-    );
+    if let Some(line) = timing_line(answer) {
+        println!("{}", line.dimmed());
+    }
 }
 
 /// The answer as one JSON object, for scripting. Citations carry their
@@ -4631,26 +4626,24 @@ mod tests {
     /// explaining, and only when there was a first token to have timed.
     #[test]
     fn timing_is_shown_for_a_slow_answer_and_not_a_quick_one() {
-        assert!(timing_split(&timed(Some(100), Some(900))).is_none());
-        assert!(timing_split(&timed(Some(2_000), Some(9_000))).is_some());
+        assert_eq!(timing_line(&timed(Some(100), Some(4_999))), None);
+        assert_eq!(
+            timing_line(&timed(Some(800), Some(5_000))).as_deref(),
+            Some("800 ms to the first word, 4.2 s writing.")
+        );
         // Nothing streamed: no first token, so no split to report.
-        assert!(timing_split(&timed(None, Some(9_000))).is_none());
-        assert!(timing_split(&timed(Some(2_000), None)).is_none());
+        assert_eq!(timing_line(&timed(None, Some(9_000))), None);
+        assert_eq!(timing_line(&timed(Some(2_000), None)), None);
     }
 
     /// The two are sampled separately, so a total under the first token is
     /// possible; subtracting must not wrap into an enormous generation time.
     #[test]
     fn a_total_below_the_first_token_does_not_wrap() {
-        let (_, generating) = timing_split(&timed(Some(9_000), Some(8_000))).unwrap();
-        assert_eq!(generating, 0);
-    }
-
-    #[test]
-    fn the_split_is_the_wait_before_and_after_the_first_word() {
-        let (first, generating) = timing_split(&timed(Some(2_000), Some(9_000))).unwrap();
-        assert_eq!(first, 2_000);
-        assert_eq!(generating, 7_000);
+        assert_eq!(
+            timing_line(&timed(Some(9_000), Some(8_000))).as_deref(),
+            Some("9.0 s to the first word, 0 ms writing.")
+        );
     }
 
     fn citation_at(index: u32, name: &str, cited: bool) -> Citation {
