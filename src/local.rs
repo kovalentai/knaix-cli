@@ -1268,13 +1268,10 @@ async fn offer_start_or_restart(node: &LocalNode) -> Result<()> {
 /// Whether setup should offer the default, and the node it would replace.
 ///
 /// `None` when there is nothing to ask: no default at all, because `up` has
-/// already granted it; `local` already, because there is nothing to change; or
-/// no terminal, because a piped setup must keep what it had rather than block
-/// on a prompt nobody can answer.
-fn should_offer_default(current: Option<&str>, interactive: bool) -> Option<String> {
-    if !interactive {
-        return None;
-    }
+/// already granted it; or `local` already, because there is nothing to change.
+/// Setup has already refused to run without a terminal, so there is always
+/// someone to ask.
+fn should_offer_default(current: Option<&str>) -> Option<String> {
     match current {
         None => None,
         Some(id) if id == LOCAL_NODE_ID => None,
@@ -1294,8 +1291,7 @@ fn offer_local_as_default() {
     use dialoguer::{theme::ColorfulTheme, Confirm};
 
     let cfg = crate::config::load_stored_config();
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let Some(current) = should_offer_default(cfg.default_node_id.as_deref(), interactive) else {
+    let Some(current) = should_offer_default(cfg.default_node_id.as_deref()) else {
         return;
     };
 
@@ -2092,7 +2088,7 @@ mod tests {
     #[test]
     fn a_different_default_is_worth_asking_about() {
         assert_eq!(
-            should_offer_default(Some("claude-9aeb349918"), true),
+            should_offer_default(Some("claude-9aeb349918")),
             Some("claude-9aeb349918".to_string())
         );
     }
@@ -2100,16 +2096,8 @@ mod tests {
     #[test]
     fn nothing_to_ask_when_there_is_no_default_or_it_is_already_local() {
         // up() grants the default when the slot is empty, so setup finds it set.
-        assert_eq!(should_offer_default(None, true), None);
-        assert_eq!(should_offer_default(Some("local"), true), None);
-    }
-
-    /// A piped or scripted setup must not stop on a question nobody can answer,
-    /// and must not silently take a default either.
-    #[test]
-    fn without_a_terminal_it_asks_nothing_and_changes_nothing() {
-        assert_eq!(should_offer_default(Some("claude-9aeb349918"), false), None);
-        assert_eq!(should_offer_default(None, false), None);
+        assert_eq!(should_offer_default(None), None);
+        assert_eq!(should_offer_default(Some("local")), None);
     }
 
     use super::*;
