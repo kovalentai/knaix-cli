@@ -661,6 +661,12 @@ impl Target {
 
 /// Resolve the local node, failing with the command that would start it.
 fn local_target() -> Result<Target> {
+    let (base, instance_id) = local_address()?;
+    Ok(Target::Local { base, instance_id })
+}
+
+/// Where the local node answers and the instance its store is keyed by.
+fn local_address() -> Result<(String, String)> {
     let node = crate::local::load()
         .ok_or_else(|| {
             anyhow!(
@@ -669,10 +675,7 @@ fn local_target() -> Result<Target> {
             )
         })
         .coded(Code::Precondition)?;
-    Ok(Target::Local {
-        base: node.base_url(),
-        instance_id: node.instance_id,
-    })
+    Ok((node.base_url(), node.instance_id))
 }
 
 /// Resolve what a command should act on, local or hosted.
@@ -1218,9 +1221,7 @@ pub fn format_file_size(bytes: u64) -> String {
 /// records a document's source name, not a type, and inferring one from the
 /// extension would put a guess in a column the hosted listing fills with fact.
 async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
-    let Target::Local { base, instance_id } = local_target()? else {
-        unreachable!("local_target only builds a local target");
-    };
+    let (base, instance_id) = local_address()?;
 
     let documents = local_documents(ctx, &base, &instance_id).await?;
 
