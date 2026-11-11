@@ -390,11 +390,11 @@ pub async fn run(
                     // rather than returning a bare prompt. Spaced like an answer
                     // would have been, so the prompt does not jump up the screen
                     // on the one turn that failed.
-                    Ok(Some(answer)) if answer.text.trim().is_empty() => {
+                    Ok(answer) if answer.text.trim().is_empty() => {
                         println!("{}", "Warning: Node returned an empty response.".yellow());
                         println!();
                     }
-                    Ok(Some(answer)) => {
+                    Ok(answer) => {
                         crate::nodes::print_scope_note(&answer);
                         crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
@@ -431,9 +431,6 @@ pub async fn run(
                             &answer.text,
                             crate::nodes::HISTORY_CHAR_BUDGET,
                         );
-                    }
-                    Ok(None) => {
-                        println!("{}", "Warning: Node returned an empty response.".yellow());
                     }
                     Err(e) => {
                         println!("{} {}", "Error:".red(), e);

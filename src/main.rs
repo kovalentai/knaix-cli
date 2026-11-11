@@ -991,7 +991,7 @@ async fn run() -> Result<()> {
                     );
                 }
                 if ctx.output_format == "json" {
-                    if let Some(answer) = nodes::chat(
+                    let answer = nodes::chat(
                         &ctx,
                         &target,
                         &message,
@@ -1000,23 +1000,21 @@ async fn run() -> Result<()> {
                         &options,
                         None,
                     )
-                    .await?
-                    {
-                        nodes::print_answer_json(&answer)?;
-                    }
-                // Raw rather than markdown: this is the output people pipe, and
-                // it must stay the text the node sent.
-                } else if let Some(answer) = nodes::chat(
-                    &ctx,
-                    &target,
-                    &message,
-                    nodes::Echo::Raw,
-                    &[],
-                    &options,
-                    None,
-                )
-                .await?
-                {
+                    .await?;
+                    nodes::print_answer_json(&answer)?;
+                } else {
+                    // Raw rather than markdown: this is the output people pipe,
+                    // and it must stay the text the node sent.
+                    let answer = nodes::chat(
+                        &ctx,
+                        &target,
+                        &message,
+                        nodes::Echo::Raw,
+                        &[],
+                        &options,
+                        None,
+                    )
+                    .await?;
                     nodes::print_scope_note(&answer);
                     nodes::print_answer_timing(&answer);
                     nodes::print_answer_footer(&target, &answer);

@@ -432,8 +432,7 @@ async fn measure_answers(
             } else {
                 e
             }
-        })?
-        .ok_or_else(|| anyhow!("The node returned no answer on run {}", i + 1))?;
+        })?;
 
         total_ms.push(started.elapsed().as_millis());
         if let Some(ms) = answer.first_token_ms {

@@ -1826,7 +1826,7 @@ pub async fn chat(
     history: &[ChatTurn],
     options: &AnswerOptions,
     conversation: Option<&str>,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     if let Target::Local { base, instance_id } = target {
         // A local node has no control plane to hold a thread, so its context is
         // the history the caller replays.
@@ -1907,7 +1907,7 @@ pub async fn chat(
         print_citations(&citations);
     }
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text,
         citations,
         model,
@@ -1915,7 +1915,7 @@ pub async fn chat(
         total_ms,
         conversation_id,
         scope,
-    }))
+    })
 }
 
 /// Ask the local node directly.
@@ -1932,7 +1932,7 @@ async fn chat_local(
     echo: Echo,
     history: &[ChatTurn],
     options: &AnswerOptions,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     let pb = chat_spinner(ctx);
 
     let body = build_local_answer_body(instance_id, message, history, options);
@@ -1978,7 +1978,7 @@ async fn chat_local(
 
     let outcome = read_local_answer_stream(resp, &pb, echo, asked_at).await?;
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text: outcome.text,
         citations: outcome.citations,
         model: outcome.model,
@@ -1986,7 +1986,7 @@ async fn chat_local(
         total_ms: outcome.total_ms,
         conversation_id: None,
         scope: outcome.scope,
-    }))
+    })
 }
 
 /// The pre-streaming path: one blocking request that returns the whole answer.
@@ -2000,7 +2000,7 @@ async fn chat_local_blocking(
     body: &serde_json::Value,
     pb: &ProgressBar,
     echo: Echo,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     let resp = ctx
         .client
         .post(format!("{}/api/query/answer", base))
@@ -2049,7 +2049,7 @@ async fn chat_local_blocking(
         print_citations(&citations);
     }
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text,
         citations,
         model,
@@ -2060,7 +2060,7 @@ async fn chat_local_blocking(
         total_ms: None,
         conversation_id: None,
         scope,
-    }))
+    })
 }
 
 /// Consume the local node's SSE answer stream.
@@ -3907,7 +3907,6 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Within 30 days [1].", "{echo:?}");
                 let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
@@ -4060,7 +4059,6 @@ mod tests {
                     Some("ignored"),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Checkout is at 11 [2].");
                 let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
@@ -4101,7 +4099,6 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Pets are welcome [1].");
                 assert_eq!(answer.citations[0].cited, Some(true));
