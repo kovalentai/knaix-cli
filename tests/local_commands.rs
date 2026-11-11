@@ -958,3 +958,202 @@ fn logs_show_the_nodes_last_lines_as_text_or_json() {
     let v: Value = serde_json::from_str(&json_out.out).unwrap();
     assert_eq!(v, json!({"lines": ["node booting", "store open"]}));
 }
+
+#[test]
+fn setup_without_a_terminal_says_how_to_choose_a_model_in_a_script() {
+    let home = scratch_home("setup");
+    docker(&home);
+
+    let setup = local(&home, &["setup"]);
+
+    assert_eq!(setup.code, 1, "{}", setup.out);
+    assert!(
+        setup
+            .err
+            .contains("Setup is interactive. In a script, pass --model-url and --model"),
+        "{}",
+        setup.err
+    );
+}
+
+const CONNECT: &str = "POST /api/instances/local/connect";
+const TELEMETRY: &str = "POST /api/instances/c-1/telemetry";
+const DISCONNECT: &str = "POST /api/instances/c-1/disconnect";
+
+/// `knaix local <args>` signed in to the control plane `node` also plays,
+/// with `kill` and `hostname` on the PATH behind the stand-in docker.
+fn connected(home: &Path, node: &Node, args: &[&str]) -> Run {
+    run(knaix(home)
+        .env("PATH", format!("{}:/bin", home.join("bin").display()))
+        .env("KNAIX_TOKEN", "sess")
+        .env("KNAIX_API_URL", format!("http://127.0.0.1:{}", node.port))
+        .arg("local")
+        .args(args))
+}
+
+fn alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Kills a relay worker the test started, should the test fail first.
+struct Worker(u32);
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if alive(self.0) {
+            unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+#[test]
+fn connect_is_refused_until_there_is_a_running_node_and_a_session() {
+    let home = scratch_home("connect-refused");
+    let node = node();
+    let refused = |r: Run, code: i32, want: &str| {
+        assert_eq!(r.code, code, "{}{}", r.out, r.err);
+        assert!(r.err.contains(want), "wanted {want:?}: {}", r.err);
+    };
+
+    // Without the /bin `connected` adds: on Linux that is /usr/bin, where a
+    // real docker lives.
+    refused(local(&home, &["connect"]), 7, "Docker is not installed");
+    let docker = docker(&home);
+    refused(
+        connected(&home, &node, &["connect"]),
+        1,
+        "No local node. Start one with 'knaix local up'.",
+    );
+    record(&home, node.port, json!({}));
+    refused(
+        connected(&home, &node, &["connect"]),
+        1,
+        "The local node is not running. Start it with 'knaix local up'.",
+    );
+    docker.running_ours(node.port);
+    refused(
+        local(&home, &["connect"]),
+        3,
+        "Connecting a local node needs an account. Run 'knaix login' first.",
+    );
+    node.answer(CONNECT, 500, r#"{"error":"down"}"#);
+    refused(
+        connected(&home, &node, &["connect"]),
+        1,
+        "Register failed (500",
+    );
+    node.answer(CONNECT, 200, r#"{"data":{}}"#);
+    refused(
+        connected(&home, &node, &["connect"]),
+        1,
+        "The control plane did not return a node id.",
+    );
+    assert_eq!(recorded(&home).unwrap()["remote_id"], Value::Null);
+
+    // The background worker relays a node already connected, and nothing else.
+    refused(
+        connected(&home, &node, &["connect", "--worker"]),
+        1,
+        "Local node is not connected.",
+    );
+    fs::remove_file(home.join(".knaix/local.json")).unwrap();
+    refused(
+        connected(&home, &node, &["connect", "--worker"]),
+        1,
+        "No local node to relay.",
+    );
+}
+
+#[test]
+fn connect_in_the_background_relays_until_disconnect_stops_it() {
+    let home = scratch_home("connect");
+    let docker = docker(&home);
+    let node = node();
+    docker.running_ours(node.port);
+    record(&home, node.port, json!({"model": "llama3"}));
+    node.answer(CONNECT, 200, r#"{"data":{"clientId":"c-1"}}"#);
+    node.answer(TELEMETRY, 200, "{}");
+    node.answer(DISCONNECT, 200, "{}");
+    let pushes = || node.calls().iter().filter(|(r, _)| r == TELEMETRY).count();
+    let relay_pid = || recorded(&home).unwrap()["relay_pid"].as_u64().unwrap() as u32;
+
+    let up = connected(&home, &node, &["connect", "--daemon"]);
+
+    assert_eq!(up.code, 0, "{}{}", up.out, up.err);
+    assert!(
+        up.out
+            .contains("Connected local to your account; it will appear in your dashboard."),
+        "{}",
+        up.out
+    );
+    let first = Worker(relay_pid());
+    assert!(
+        up.out.contains(&format!(
+            "Relaying metrics and logs in the background (pid {}).",
+            first.0
+        )),
+        "{}",
+        up.out
+    );
+    let (route, register) = &node.calls()[0];
+    assert_eq!(route, CONNECT);
+    assert_eq!(register["localInstanceId"], INSTANCE);
+    assert_eq!(register["model"], "llama3");
+    assert_eq!(recorded(&home).unwrap()["remote_id"], "c-1");
+    wait_for("the worker's first sample", || pushes() > 0);
+    let (_, sample) = node
+        .calls()
+        .into_iter()
+        .find(|(r, _)| r == TELEMETRY)
+        .unwrap();
+    assert_eq!(sample["metrics"]["healthy"], true);
+    assert_eq!(sample["logs"], json!(["node booting", "store open"]));
+
+    // Again: one relay replaces the other, never two at once.
+    let again = connected(&home, &node, &["connect", "--daemon"]);
+    assert_eq!(again.code, 0, "{}", again.err);
+    let second = Worker(relay_pid());
+    assert_ne!(second.0, first.0);
+    wait_for("the first worker to stop", || !alive(first.0));
+
+    let down = connected(&home, &node, &["disconnect"]);
+    assert_eq!(down.code, 0, "{}", down.err);
+    assert!(
+        down.out
+            .contains("Local node disconnected from your account."),
+        "{}",
+        down.out
+    );
+    wait_for("the second worker to stop", || !alive(second.0));
+    assert!(node.calls().iter().any(|(r, _)| r == DISCONNECT));
+    let saved = recorded(&home).unwrap();
+    assert_eq!(
+        (&saved["remote_id"], &saved["relay_pid"]),
+        (&Value::Null, &Value::Null)
+    );
+    assert_eq!(saved["instance_id"], INSTANCE, "the node itself is kept");
+
+    // Already disconnected, and then no node at all: nothing to tell the account.
+    let calls = node.calls().len();
+    let down = connected(&home, &node, &["disconnect"]);
+    assert!(down.out.contains("Local node disconnected"), "{}", down.out);
+    fs::remove_file(home.join(".knaix/local.json")).unwrap();
+    let down = connected(&home, &node, &["disconnect"]);
+    assert!(
+        down.out.contains("No local node on this machine."),
+        "{}",
+        down.out
+    );
+    assert_eq!(node.calls().len(), calls);
+}
