@@ -125,7 +125,7 @@ fn print_help() {
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
     for (cmd, what) in rows {
-        println!("  {:<18} {}", cmd.cyan(), what);
+        println!("  {:<26} {}", cmd.cyan(), what);
     }
     println!();
 }
