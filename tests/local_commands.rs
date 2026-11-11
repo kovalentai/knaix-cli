@@ -139,11 +139,14 @@ fn the_run(calls: &[String]) -> &str {
         .unwrap_or_else(|| panic!("no docker run in {calls:#?}"))
 }
 
+/// Each route's status, body and how many milliseconds to wait before it.
+type Answers = Arc<Mutex<HashMap<String, (u16, String, u64)>>>;
+
 /// The node on loopback: `GET /health` and `POST /api/query/answer`, each
 /// answering as `answer` last set. Records each request with its JSON body.
 struct Node {
     port: u16,
-    answers: Arc<Mutex<HashMap<String, (u16, String)>>>,
+    answers: Answers,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
@@ -151,10 +154,10 @@ fn node() -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let answers = Arc::new(Mutex::new(HashMap::from([
-        ("GET /health".to_string(), (200, "{}".to_string())),
+        ("GET /health".to_string(), (200, "{}".to_string(), 0)),
         (
             "POST /api/query/answer".to_string(),
-            (200, r#"{"answer":"ok"}"#.to_string()),
+            (200, r#"{"answer":"ok"}"#.to_string(), 0),
         ),
     ])));
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -184,16 +187,20 @@ fn node() -> Node {
             }
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).unwrap();
+            // Chosen before the request is recorded, so a test waiting on the
+            // record changes only the answers after it.
+            let (status, reply, delay) =
+                table
+                    .lock()
+                    .unwrap()
+                    .get(&route)
+                    .cloned()
+                    .unwrap_or((404, "{}".into(), 0));
             log.lock().unwrap().push((
                 route.clone(),
                 serde_json::from_slice(&body).unwrap_or(Value::Null),
             ));
-            let (status, reply) = table
-                .lock()
-                .unwrap()
-                .get(&route)
-                .cloned()
-                .unwrap_or((404, "{}".into()));
+            std::thread::sleep(std::time::Duration::from_millis(delay));
             let _ = write!(
                 stream,
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -210,10 +217,15 @@ fn node() -> Node {
 
 impl Node {
     fn answer(&self, route: &str, status: u16, body: &str) {
+        self.answer_after(route, status, body, 0);
+    }
+
+    /// Answer `route` only after `ms` milliseconds.
+    fn answer_after(&self, route: &str, status: u16, body: &str, ms: u64) {
         self.answers
             .lock()
             .unwrap()
-            .insert(route.to_string(), (status, body.to_string()));
+            .insert(route.to_string(), (status, body.to_string(), ms));
     }
 
     fn calls(&self) -> Vec<(String, Value)> {
@@ -437,6 +449,23 @@ fn up_with_a_model_on_this_machine_reaches_it_from_the_container_and_remembers_i
         launched.contains("-e GENERATION_TIMEOUT_MS=600000 "),
         "{launched}"
     );
+
+    // A server remembered without a model name: llama-server needs none.
+    docker.unset("state");
+    record(
+        &home,
+        node.port,
+        json!({"model_url": "http://localhost:8081"}),
+    );
+    let again = local(&home, &["up"]);
+    assert!(
+        again
+            .out
+            .contains("Using the model server from last time: http://localhost:8081."),
+        "{}",
+        again.out
+    );
+    assert!(!the_run(&docker.calls()).contains("LLAMA_MODEL_ID"));
 }
 
 #[test]
@@ -521,6 +550,54 @@ fn a_failed_pull_falls_back_to_the_image_here_or_stops() {
     );
     assert!(the_run(&docker.calls()).ends_with(" knaix-node:dev"));
     assert_eq!(recorded(&home).unwrap()["image"], "knaix-node:dev");
+}
+
+#[test]
+fn a_slow_node_is_waited_for_and_warmed_with_a_dot_a_second() {
+    let home = scratch_home("slow");
+    let docker = docker(&home);
+    docker.set("present", "");
+    let node = node();
+    node.answer("GET /health", 503, "{}");
+    node.answer_after("POST /api/query/answer", 200, "{}", 1_500);
+    let (answers, calls) = (node.answers.clone(), node.calls.clone());
+    // Ready once it has turned one poll away, so the next one finds it ready.
+    std::thread::spawn(move || {
+        while !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, _)| r == "GET /health")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ready = (200, "{}".to_string(), 0);
+        answers.lock().unwrap().insert("GET /health".into(), ready);
+    });
+
+    let up = local(&home, &["up", "--port", &node.port.to_string(), "--mock"]);
+
+    assert_eq!(up.code, 0, "{}{}", up.out, up.err);
+    assert!(
+        up.out.contains("Waiting for the node to open its store."),
+        "{}",
+        up.out
+    );
+    assert!(
+        up.out.contains("Warming the store and model."),
+        "{}",
+        up.out
+    );
+    let polls = node
+        .calls()
+        .iter()
+        .filter(|(r, _)| r == "GET /health")
+        .count();
+    assert!(polls >= 2, "{polls} polls");
+    assert!(docker
+        .calls()
+        .iter()
+        .any(|c| c == "inspect --format {{.State.Status}} knaix-local"));
 }
 
 #[test]
@@ -646,6 +723,12 @@ fn a_running_container_this_cli_did_not_start_is_not_touched() {
         .calls()
         .iter()
         .any(|c| c.starts_with("rm ") || c.starts_with("run ")));
+
+    // Nor is one docker cannot say the image of.
+    docker.unset("image");
+    let up = local(&home, &["up"]);
+    assert_eq!(up.code, 1, "{}", up.out);
+    assert!(up.err.contains("was not started by this CLI"), "{}", up.err);
 }
 
 #[test]

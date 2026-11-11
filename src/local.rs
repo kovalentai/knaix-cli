@@ -2156,6 +2156,8 @@ mod tests {
             // One good line does not redeem the other: the container is still
             // reachable from the segment.
             "127.0.0.1:8080\n0.0.0.0:8080",
+            // A line docker never prints proves nothing.
+            "127.0.0.1",
         ] {
             assert!(
                 !published_on_loopback_only(out),
