@@ -55,6 +55,7 @@ pub struct Document {
 
 /// An answer and the passages it was grounded in. The two travel together so
 /// every surface can show its sources, not just the one-shot command.
+#[derive(Debug)]
 pub struct ChatAnswer {
     pub text: String,
     pub citations: Vec<Citation>,
@@ -3757,6 +3758,415 @@ pub async fn view_memory(ctx: &KnaixContext, node_id: &str, file: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolving the node to ask, and asking it, against a fake control plane
+    /// or a fake local node. Every fallback to the picker here has one node, so
+    /// nothing prompts even when the tests run in a terminal.
+    mod answering {
+        use super::choosing::ctx;
+        use super::*;
+        use crate::exit::code_of;
+        use crate::testing::fake_api;
+        use serde_json::{json, Value};
+
+        const INSTANCES: &str = "GET /api/instances";
+        const CHAT: &str = "POST /api/nodes/u-1/native-chat";
+        const STREAM: &str = "POST /api/query/answer/stream";
+        const BLOCKING: &str = "POST /api/query/answer";
+
+        fn list(nodes: Value) -> (&'static str, u16, Value) {
+            (INSTANCES, 200, json!({ "data": nodes }))
+        }
+
+        #[tokio::test]
+        async fn a_named_node_is_found_by_name_instance_id_or_uuid() {
+            let api = fake_api(vec![list(json!([
+                {"id": "u-1", "name": "alpha", "state": "running", "instanceId": "i-1"},
+                {"id": "u-2", "name": "beta", "state": "stopped"},
+            ]))])
+            .await;
+            let signed_in = ctx(&api.url, Some("sess"), None);
+            for (wanted, uuid) in [("beta", "u-2"), ("u-2", "u-2"), ("i-1", "u-1")] {
+                let id = resolve_node_id(&signed_in, Some(wanted.into()))
+                    .await
+                    .unwrap();
+                assert_eq!(id.as_deref(), Some(uuid), "{wanted}");
+            }
+            let err = resolve_node_id(&signed_in, Some("zeta".into()))
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::NotFound);
+            assert_eq!(
+                err.to_string(),
+                "No node matches 'zeta'. Run 'knaix list' to see your nodes."
+            );
+
+            let err = resolve_node_id(&ctx(&api.url, None, Some("alpha")), None)
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&err), Code::Auth, "no session to resolve against");
+        }
+
+        #[tokio::test]
+        async fn the_default_is_asked_while_it_runs_and_otherwise_a_node_is_chosen() {
+            let both = fake_api(vec![list(json!([
+                {"id": "u-1", "name": "alpha", "state": "running"},
+                {"id": "u-2", "name": "beta", "state": "stopped"},
+            ]))])
+            .await;
+            let running = resolve_node_id(&ctx(&both.url, Some("sess"), Some("alpha")), None).await;
+            assert_eq!(running.unwrap().as_deref(), Some("u-1"));
+
+            let one = fake_api(vec![list(
+                json!([{"id": "u-2", "name": "beta", "state": "stopped"}]),
+            )])
+            .await;
+            for default in ["beta", "gone"] {
+                let id = resolve_node_id(&ctx(&one.url, Some("sess"), Some(default)), None).await;
+                assert_eq!(
+                    id.unwrap().as_deref(),
+                    Some("u-2"),
+                    "{default}: the one there is"
+                );
+            }
+            assert_eq!(
+                one.calls().len(),
+                4,
+                "the default checked, then the choice listed"
+            );
+
+            let down = fake_api(vec![(INSTANCES, 503, json!({}))]).await;
+            let err = resolve_node_id(&ctx(&down.url, Some("sess"), Some("alpha")), None)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("Failed to fetch node list (HTTP 503"),
+                "{err}"
+            );
+        }
+
+        /// An event stream: each frame on its own lines, ended by a blank one.
+        fn sse(frames: &[(&str, Value)]) -> Value {
+            let mut body = String::new();
+            for (event, data) in frames {
+                if !event.is_empty() {
+                    body.push_str(&format!("event: {event}\n"));
+                }
+                body.push_str(&format!("data: {data}\n\n"));
+            }
+            Value::String(body)
+        }
+
+        fn brief() -> AnswerOptions {
+            AnswerOptions {
+                verbosity: Verbosity::Brief,
+                ..AnswerOptions::default()
+            }
+        }
+
+        fn hosted_answer() -> Value {
+            let mut body = sse(&[
+                ("meta", json!({
+                    "citations": [
+                        {"index": 1, "content": "Receipts are due within 30 days.", "source": {"name": "policy.md"}},
+                        {"index": 2, "content": "Cabin class is economy.", "source": {"name": "travel.md"}},
+                    ],
+                    "model": "gpt-x",
+                    "conversationId": "c-9",
+                    "scope": {"chunksUsed": 3, "chunksTotal": 10},
+                })),
+                ("", json!({"token": "Within "})),
+            ])
+            .as_str()
+            .unwrap()
+            .to_string();
+            // Lines a stream may carry that are not frames: a comment and junk.
+            body.push_str(": keep-alive\ndata: not json\n\n");
+            body.push_str("data: {\"token\":\"30 days [1].\"}\r\n\r\n");
+            body.push_str("event: done\ndata: {\"citedIndexes\":[1]}\n\n");
+            Value::String(body)
+        }
+
+        #[tokio::test]
+        async fn a_hosted_answer_streams_with_the_passages_it_cited_marked() {
+            let api = fake_api(vec![(CHAT, 200, hosted_answer())]).await;
+            let signed_in = ctx(&api.url, Some("sess"), None);
+            let node = Target::Remote { uuid: "u-1".into() };
+
+            for echo in [Echo::Silent, Echo::Raw, Echo::Markdown] {
+                let answer = chat(
+                    &signed_in,
+                    &node,
+                    "when are receipts due?",
+                    echo,
+                    &[],
+                    &brief(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(answer.text, "Within 30 days [1].", "{echo:?}");
+                let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
+                assert_eq!(cited, [Some(true), Some(false)]);
+                assert_eq!(answer.model.as_deref(), Some("gpt-x"));
+                assert_eq!(answer.conversation_id.as_deref(), Some("c-9"));
+                assert_eq!(answer.scope, Some((3, 10)));
+                assert!(answer.first_token_ms.is_some() && answer.total_ms.is_some());
+            }
+            let asked = &api.calls()[0];
+            assert_eq!(asked.auth.as_deref(), Some("Bearer sess"));
+            assert_eq!(
+                asked.body,
+                json!({"message": "when are receipts due?", "stream": true, "verbosity": "brief"})
+            );
+        }
+
+        #[tokio::test]
+        async fn a_follow_up_whose_thread_is_gone_is_asked_again_without_it() {
+            let gone = json!({"error": "Conversation not found"});
+            let api = fake_api(vec![(CHAT, 404, gone)]).await;
+            let signed_in = ctx(&api.url, Some("sess"), None);
+            let node = Target::Remote { uuid: "u-1".into() };
+
+            let err = chat(
+                &signed_in,
+                &node,
+                "and then?",
+                Echo::Silent,
+                &[],
+                &brief(),
+                Some("c-1"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(code_of(&err), Code::NotFound);
+            assert_eq!(
+                err.to_string(),
+                "Chat failed on node: HTTP 404 Not Found - Conversation not found"
+            );
+            let calls = api.calls();
+            assert_eq!(calls.len(), 2, "asked once more, without the thread");
+            assert_eq!(calls[0].body["conversationId"], "c-1");
+            assert_eq!(calls[1].body.get("conversationId"), None);
+
+            // A 404 about the node, not the thread, is not asked again.
+            let missing = fake_api(vec![(CHAT, 404, json!({"error": "Node not found"}))]).await;
+            let err = chat(
+                &ctx(&missing.url, Some("sess"), None),
+                &node,
+                "q",
+                Echo::Silent,
+                &[],
+                &brief(),
+                Some("c-1"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().ends_with("Node not found"), "{err}");
+            assert_eq!(missing.calls().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_hosted_refusal_error_frame_or_lost_connection_is_an_error() {
+            let ask = |api: String| async move {
+                let node = Target::Remote { uuid: "u-1".into() };
+                let options = brief();
+                let signed_in = ctx(&api, Some("sess"), None);
+                chat(&signed_in, &node, "q", Echo::Raw, &[], &options, None).await
+            };
+
+            let refused = fake_api(vec![(CHAT, 403, json!({"error": "no access"}))]).await;
+            let err = ask(refused.url.clone()).await.unwrap_err();
+            assert_eq!(code_of(&err), Code::Auth);
+            assert_eq!(
+                err.to_string(),
+                "Chat failed on node: HTTP 403 Forbidden - no access"
+            );
+
+            let unsaid = fake_api(vec![(CHAT, 500, Value::Null)]).await;
+            let err = ask(unsaid.url.clone()).await.unwrap_err();
+            assert!(err.to_string().ends_with("- no detail"), "{err}");
+
+            let failed = sse(&[
+                ("", json!({"token": "Par"})),
+                ("error", json!({"error": "model overloaded"})),
+            ]);
+            let broken = fake_api(vec![(CHAT, 200, failed)]).await;
+            let err = ask(broken.url.clone()).await.unwrap_err();
+            assert_eq!(err.to_string(), "Chat failed on node: model overloaded");
+
+            let err = ask("http://127.0.0.1:9".into()).await.unwrap_err();
+            assert_eq!(err.to_string(), "Networking error during chat request");
+            let err = chat(
+                &ctx("http://127.0.0.1:9", None, None),
+                &Target::Remote { uuid: "u-1".into() },
+                "q",
+                Echo::Raw,
+                &[],
+                &brief(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code_of(&err), Code::Auth);
+        }
+
+        fn local(base: &str) -> Target {
+            Target::Local {
+                base: base.into(),
+                instance_id: "inst-1".into(),
+            }
+        }
+
+        fn local_answer() -> Value {
+            sse(&[
+                (
+                    "meta",
+                    json!({
+                        "citations": [
+                            {"index": 1, "content": "Pets are welcome.", "metadata": {"source": {"name": "house.md"}}},
+                            {"index": 2, "content": "Checkout is at 11.", "metadata": {"source": {"name": "house.md"}}},
+                        ],
+                        "model": "mock",
+                    }),
+                ),
+                ("", json!({"token": "Checkout is at 11 "})),
+                ("", json!({"token": "[2]."})),
+                ("done", json!({})),
+            ])
+        }
+
+        #[tokio::test]
+        async fn a_local_answer_is_cited_by_the_markers_in_it() {
+            let node = fake_api(vec![(STREAM, 200, local_answer())]).await;
+            let history = [ChatTurn {
+                role: "user".into(),
+                content: "hi".into(),
+            }];
+
+            for echo in [Echo::Silent, Echo::Raw, Echo::Markdown] {
+                let answer = chat(
+                    &ctx("http://unused", None, None),
+                    &local(&node.url),
+                    "when is checkout?",
+                    echo,
+                    &history,
+                    &brief(),
+                    Some("ignored"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(answer.text, "Checkout is at 11 [2].");
+                let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
+                assert_eq!(
+                    cited,
+                    [Some(false), Some(true)],
+                    "only [2] is in the answer"
+                );
+                assert_eq!(answer.model.as_deref(), Some("mock"));
+                assert_eq!(answer.conversation_id, None, "a local node keeps no thread");
+                assert!(answer.first_token_ms.is_some());
+            }
+            let asked = &node.calls()[0];
+            assert_eq!(asked.auth, None, "nobody to authorize against");
+            assert_eq!(asked.body["instance_id"], "inst-1");
+            assert_eq!(asked.body["query"], "when is checkout?");
+            assert_eq!(asked.body["history"][0]["content"], "hi");
+        }
+
+        #[tokio::test]
+        async fn an_older_local_node_answers_in_one_piece() {
+            let whole = json!({
+                "answer": "Pets are welcome [1].",
+                "citations": [{"index": 1, "content": "Pets are welcome.", "metadata": {"source": {"name": "house.md"}}}],
+                "model": "llama3",
+                "scope": {"chunksUsed": 2, "chunksTotal": 2},
+            });
+            let node = fake_api(vec![(STREAM, 404, Value::Null), (BLOCKING, 200, whole)]).await;
+
+            for echo in [Echo::Silent, Echo::Raw, Echo::Markdown] {
+                let answer = chat(
+                    &ctx("http://unused", None, None),
+                    &local(&node.url),
+                    "pets?",
+                    echo,
+                    &[],
+                    &brief(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(answer.text, "Pets are welcome [1].");
+                assert_eq!(answer.citations[0].cited, Some(true));
+                assert_eq!(
+                    (answer.first_token_ms, answer.total_ms),
+                    (None, None),
+                    "nothing streamed to time"
+                );
+                assert_eq!(answer.scope, Some((2, 2)));
+            }
+            let calls = node.calls();
+            assert_eq!(calls[1].route, BLOCKING);
+            assert_eq!(
+                calls[1].body, calls[0].body,
+                "the same question, by the older route"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_local_node_that_refuses_fails_mid_answer_or_is_down_says_so() {
+            let ask = |base: String| async move {
+                chat(
+                    &ctx("http://unused", None, None),
+                    &local(&base),
+                    "q",
+                    Echo::Raw,
+                    &[],
+                    &brief(),
+                    None,
+                )
+                .await
+            };
+
+            let busy = fake_api(vec![(STREAM, 503, json!({"message": "store is opening"}))]).await;
+            let err = ask(busy.url.clone()).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Local node could not answer: HTTP 503 Service Unavailable - store is opening"
+            );
+
+            let old_and_busy = fake_api(vec![
+                (STREAM, 405, Value::Null),
+                (BLOCKING, 500, json!({"error": "no model"})),
+            ])
+            .await;
+            let err = ask(old_and_busy.url.clone()).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Local node could not answer: HTTP 500 Internal Server Error - no model"
+            );
+
+            let failed = sse(&[("error", json!({"message": "generation failed"}))]);
+            let broken = fake_api(vec![(STREAM, 200, failed)]).await;
+            let err = ask(broken.url.clone()).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Local node could not answer: generation failed"
+            );
+
+            let err = ask("http://127.0.0.1:9".into()).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("Could not reach the local node."),
+                "{err}"
+            );
+        }
+    }
 
     /// Choosing the node to ask, against a fake control plane.
     mod choosing {
