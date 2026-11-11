@@ -128,8 +128,9 @@ pub fn knaix_reading(home: &Path, api: &str, args: &[&str], stdin: Stdio) -> Run
 }
 
 /// `knaix <args>`, with `token` as its session, if any. PATH is a directory
-/// with nothing in it, so no command reaches the docker or anything else on
-/// the machine running the test.
+/// with nothing in it, so on Unix no command reaches the docker or anything
+/// else on the machine running the test. Windows also searches its system
+/// directories, so there a docker installed in them can still answer.
 fn run(home: &Path, api: &str, token: Option<&str>, args: &[&str], stdin: Stdio) -> Run {
     let empty = home.join("empty-path");
     fs::create_dir_all(&empty).unwrap();

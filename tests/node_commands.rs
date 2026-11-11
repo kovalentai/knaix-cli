@@ -557,9 +557,16 @@ fn the_local_nodes_logs_are_dockers_and_its_listing_says_what_answers() {
     use_local(&home);
     record_local_node(&home, "http://127.0.0.1:9");
 
+    // Asked of docker, not a control plane. Only Unix can promise an empty
+    // PATH hides it: Windows also looks in its system directories, where a
+    // runner may have one.
     let logs = knaix(&home, "http://127.0.0.1:9", &["logs", "local"]);
-    assert_eq!(logs.code, 7, "no docker on this PATH: {}", logs.err);
-    assert!(logs.err.contains("Docker is not installed"), "{}", logs.err);
+    if cfg!(unix) {
+        assert_eq!(logs.code, 7, "no docker on this PATH: {}", logs.err);
+        assert!(logs.err.contains("Docker is not installed"), "{}", logs.err);
+    } else {
+        assert_ne!(logs.code, 0, "no local container to read: {}", logs.err);
+    }
 
     for (model, answered_by) in [
         (
