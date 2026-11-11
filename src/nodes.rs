@@ -1715,12 +1715,8 @@ pub async fn resolve_node_id(
         return resolve_node_uuid(ctx, &id).await.map(Some);
     }
 
-    // No token means nothing to resolve against; go straight to selection,
-    // which reports the auth failure in one place.
-    if ctx.config.token.is_none() {
-        return select_node_interactively(ctx).await;
-    }
-
+    // Signed out, the default cannot be checked and the selection below
+    // reports the missing session.
     if let Some(ref def_id) = ctx.config.default_node_id {
         // Validate the default before committing to it, so a stopped or
         // deleted node prompts instead of failing mid-command.
