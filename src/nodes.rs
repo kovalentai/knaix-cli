@@ -661,6 +661,12 @@ impl Target {
 
 /// Resolve the local node, failing with the command that would start it.
 fn local_target() -> Result<Target> {
+    let (base, instance_id) = local_address()?;
+    Ok(Target::Local { base, instance_id })
+}
+
+/// Where the local node answers and the instance its store is keyed by.
+fn local_address() -> Result<(String, String)> {
     let node = crate::local::load()
         .ok_or_else(|| {
             anyhow!(
@@ -669,10 +675,7 @@ fn local_target() -> Result<Target> {
             )
         })
         .coded(Code::Precondition)?;
-    Ok(Target::Local {
-        base: node.base_url(),
-        instance_id: node.instance_id,
-    })
+    Ok((node.base_url(), node.instance_id))
 }
 
 /// Resolve what a command should act on, local or hosted.
@@ -1218,9 +1221,7 @@ pub fn format_file_size(bytes: u64) -> String {
 /// records a document's source name, not a type, and inferring one from the
 /// extension would put a guess in a column the hosted listing fills with fact.
 async fn list_local_documents(ctx: &KnaixContext) -> Result<()> {
-    let Target::Local { base, instance_id } = local_target()? else {
-        unreachable!("local_target only builds a local target");
-    };
+    let (base, instance_id) = local_address()?;
 
     let documents = local_documents(ctx, &base, &instance_id).await?;
 
@@ -1337,9 +1338,11 @@ fn local_node_row() -> Option<Vec<String>> {
         state.to_string(),
         node.base_url().blue().to_string(),
         "LOCAL".green().to_string(),
-        match &node.model {
-            Some(m) => m.clone().magenta().to_string(),
-            None => "mock".magenta().to_string(),
+        // What answers: a server named without a model is still a model.
+        match (&node.model, &node.model_url) {
+            (Some(m), _) => m.clone().magenta().to_string(),
+            (None, Some(url)) => format!("model at {url}").magenta().to_string(),
+            (None, None) => "mock".magenta().to_string(),
         },
     ])
 }
@@ -3466,7 +3469,8 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
                     "Failed to provision node: HTTP {} - {}",
                     status,
                     err_str
-                ));
+                ))
+                .coded(Code::for_status(status.as_u16()));
             }
         }
         Err(e) => {
@@ -4313,6 +4317,14 @@ mod tests {
             assert_eq!(crate::exit::code_of(&err), Code::Auth);
             assert_eq!(odd.calls().len(), 1, "no session, nothing asked");
         }
+    }
+
+    #[test]
+    fn file_sizes_read_in_the_largest_unit_they_fill() {
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1_572_864), "1.5 MB");
+        assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
     }
 
     /// Four or five digits of milliseconds is a number the reader has to divide

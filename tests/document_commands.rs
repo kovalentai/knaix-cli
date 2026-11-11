@@ -893,3 +893,22 @@ fn an_upload_the_control_plane_did_not_take_is_an_error_whatever_the_status() {
         upload.err
     );
 }
+
+/// A link in the notes directory is not a note: listing it would offer
+/// whatever it points at, anywhere on the machine, as though it were one.
+#[cfg(unix)]
+#[test]
+fn memory_does_not_list_a_link_out_of_the_notes_directory() {
+    let home = scratch_home("docs-memory-link");
+    let api = server(vec![alpha()]);
+    let notes = home.join(".knaix/memory/u-1");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("travel.md"), "Aisle seat.").unwrap();
+    fs::write(home.join("secret.txt"), "not a note").unwrap();
+    std::os::unix::fs::symlink(home.join("secret.txt"), notes.join("secret.md")).unwrap();
+
+    let listed = knaix(&home, &api.url, &["-o", "json", "memory", "-n", "alpha"]);
+
+    let files: serde_json::Value = serde_json::from_str(&listed.out).unwrap();
+    assert_eq!(files["files"], json!(["travel.md"]), "{}", listed.out);
+}
