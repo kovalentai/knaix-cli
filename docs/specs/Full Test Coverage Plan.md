@@ -115,3 +115,10 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 
 - **Through the binary,** against the fake control plane or a fake local node from `tests/common`, which now also keeps a request's raw body so a multipart upload can be read back.
 - **Cases:** each command against a hosted node and a local one; a name that matches nothing, one document or several copies; `export` that will not overwrite a file; `rm` refused without a terminal, partly failing, and naming what it removed; an upload ingested, refused, or unreachable; a second copy warned about, or replaced only after the new one lands; a directory where one file fails and the rest still go; a dry run that sends nothing; piped input filed under `--name`.
+
+## PR 12: Listing nodes, their health and logs, and starting one
+
+**Goal:** the rest of `nodes.rs` outside the REPL: `knaix list` (nodes, or a node's documents, local or hosted), `metrics`, `logs` and `up`. What is left after this is the REPL's: saving a note, printing a source, and the timing line.
+
+- **Through the binary,** with `tests/common`'s runner now giving `knaix` an empty PATH, so no binary test can reach the docker on the machine running it, and able to run signed out.
+- **Cases:** the node table and its JSON with the local node last; signed out with and without a local node; no nodes; a node's documents, hosted or local, as a table, JSON or none; `--docs` with no default; metrics and logs from a hosted node and the local one, healthy or not, as text and JSON, and refused; `up` that names the node it requested, or does not, and a refusal that exits with the code its status means.
