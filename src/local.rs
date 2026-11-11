@@ -1877,9 +1877,7 @@ async fn connect_snapshot_inner(ctx: &crate::nodes::KnaixContext) {
     if docker_available().is_err() || container_state().as_deref() != Some("running") {
         return;
     }
-    if ctx.get_token().is_err() {
-        return;
-    }
+    // Signed out, `register` refuses before it sends anything.
     let client_id = match register(ctx, &node).await {
         Ok(c) => c,
         Err(_) => return,
