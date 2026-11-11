@@ -272,6 +272,16 @@ pub async fn run(
                                 );
                                 continue;
                             }
+                            // As /k: the shared check names the --doc flag,
+                            // which is not what was typed here.
+                            if !target.is_local() {
+                                println!(
+                                    "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                                    "Note:".blue(),
+                                    "/doc".cyan()
+                                );
+                                continue;
+                            }
                             match crate::nodes::scope_to_documents(
                                 ctx,
                                 target,
