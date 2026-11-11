@@ -108,3 +108,10 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 - **Streams from the fake control plane.** `testing::fake_api` sends a string body as it is, so a test serves a real server-sent event stream: `meta`, token frames, `done` or `error`, split and malformed lines included.
 - **Through the binary,** `knaix chat` as a script runs it: text and JSON, `--brief`, `--k` and `--doc` with the notes they print, a hosted error and a local node that is down or predates streaming.
 - **Cases:** a hosted answer with the passages it cited marked, a follow-up whose thread is gone sent again without it, a local answer whose `[n]` markers decide what it cited, error frames, refusals with their exit codes, the default node running, stopped or gone, one node chosen for you, several to choose from, and none.
+
+## PR 11: A node's documents
+
+**Goal:** the document half of `nodes.rs`: `ls` of a node's documents, `cat`, `export`, `rm`, `upload` of a file, a directory or standard input, `--replace`, and `knaix memory`. The node list, metrics, logs and `up` follow in PR 12; saving a note is the REPL's, with it.
+
+- **Through the binary,** against the fake control plane or a fake local node from `tests/common`, which now also keeps a request's raw body so a multipart upload can be read back.
+- **Cases:** each command against a hosted node and a local one; a name that matches nothing, one document or several copies; `export` that will not overwrite a file; `rm` refused without a terminal, partly failing, and naming what it removed; an upload ingested, refused, or unreachable; a second copy warned about, or replaced only after the new one lands; a directory where one file fails and the rest still go; a dry run that sends nothing; piped input filed under `--name`.
