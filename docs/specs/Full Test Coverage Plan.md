@@ -99,3 +99,12 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 - **The relay takes its pause and when to stop.** `connect` passes 15 seconds and never; tests pass milliseconds and a future that ends after two pushes. The login snapshot takes the context, so a test gives it the fake control plane.
 - **Through the binary:** `connect` refused without docker, a node, a running container or a session; `connect --daemon` registers and starts a worker that relays until `disconnect` stops it and marks the node offline.
 - **Cases:** each picker choice (the mock, a found server, a server typed in that answers or does not), models hosted elsewhere set aside, models ordered by fit with a warning for one too large, a model that will not answer kept or dropped, backing out at each prompt, and the node restarted, started or left as it is, with the default offered when another node holds it.
+
+## PR 10: Asking a node
+
+**Goal:** the question half of `nodes.rs`: `knaix chat` against a hosted node and a local one, both answer streams, the printed answer (citations, sources, scope, timing, the mock footer, JSON), and how the node to ask is resolved or chosen. Documents, uploads, notes, metrics and `up` follow in PR 11.
+
+- **One prompt interface.** `Ask` moves out of `local.rs` to its own module so the node picker uses it too: the terminal in use, scripted answers in tests.
+- **Streams from the fake control plane.** `testing::fake_api` sends a string body as it is, so a test serves a real server-sent event stream: `meta`, token frames, `done` or `error`, split and malformed lines included.
+- **Through the binary,** `knaix chat` as a script runs it: text and JSON, `--brief`, `--k` and `--doc` with the notes they print, a hosted error and a local node that is down or predates streaming.
+- **Cases:** a hosted answer with the passages it cited marked, a follow-up whose thread is gone sent again without it, a local answer whose `[n]` markers decide what it cited, error frames, refusals with their exit codes, the default node running, stopped or gone, one node chosen for you, several to choose from, and none.
