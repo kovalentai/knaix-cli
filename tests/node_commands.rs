@@ -532,3 +532,63 @@ fn metrics_and_logs_from_a_control_plane_that_goes_away_are_unavailable() {
         logs.err
     );
 }
+
+#[test]
+fn the_local_nodes_logs_are_dockers_and_its_listing_says_what_answers() {
+    let home = scratch_home("nodes-local-answers");
+    use_local(&home);
+    record_local_node(&home, "http://127.0.0.1:9");
+
+    let logs = knaix(&home, "http://127.0.0.1:9", &["logs", "local"]);
+    assert_eq!(logs.code, 7, "no docker on this PATH: {}", logs.err);
+    assert!(logs.err.contains("Docker is not installed"), "{}", logs.err);
+
+    for (model, answered_by) in [
+        (
+            json!({"model_url": "http://localhost:11434", "model": "llama3"}),
+            "llama3 at http://localhost:11434",
+        ),
+        (
+            json!({"model_url": "http://localhost:8081"}),
+            "the model at http://localhost:8081",
+        ),
+    ] {
+        let node = server(vec![(
+            "POST /api/kb/documents",
+            200,
+            json!({"documents": [{"document_id": "h-1", "source": "house.md", "chunks": 1}]})
+                .to_string(),
+        )]);
+        let port: u16 = node.url.rsplit(':').next().unwrap().parse().unwrap();
+        let mut record = json!({"port": port, "instance_id": "inst-1", "image": "img"});
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(model.as_object().unwrap().clone());
+        fs::write(home.join(".knaix/local.json"), record.to_string()).unwrap();
+
+        let list = knaix(&home, "http://127.0.0.1:9", &["list"]);
+        assert!(
+            list.out.contains(&format!("answered by {answered_by}")),
+            "{}",
+            list.out
+        );
+
+        let hosted = server(vec![nodes(json!([]))]);
+        let rows = knaix(&home, &hosted.url, &["list", "--nodes"]);
+        let named = match record["model"].as_str() {
+            Some(model) => model.to_string(),
+            None => format!("model at {}", record["model_url"].as_str().unwrap()),
+        };
+        assert!(
+            rows.out.contains(&named),
+            "the local row names what answers: {}",
+            rows.out
+        );
+        assert!(
+            !rows.out.contains("mock"),
+            "a model answers, not the mock: {}",
+            rows.out
+        );
+    }
+}

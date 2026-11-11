@@ -1338,9 +1338,11 @@ fn local_node_row() -> Option<Vec<String>> {
         state.to_string(),
         node.base_url().blue().to_string(),
         "LOCAL".green().to_string(),
-        match &node.model {
-            Some(m) => m.clone().magenta().to_string(),
-            None => "mock".magenta().to_string(),
+        // What answers: a server named without a model is still a model.
+        match (&node.model, &node.model_url) {
+            (Some(m), _) => m.clone().magenta().to_string(),
+            (None, Some(url)) => format!("model at {url}").magenta().to_string(),
+            (None, None) => "mock".magenta().to_string(),
         },
     ])
 }
