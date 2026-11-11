@@ -1144,6 +1144,17 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
     );
     assert_eq!(saved["instance_id"], INSTANCE, "the node itself is kept");
 
+    // Signed out: the relay still stops, but the account is not told.
+    record(&home, node.port, json!({"remote_id": "c-1"}));
+    let calls = node.calls().len();
+    let down = run(knaix(&home)
+        .env("PATH", format!("{}:/bin", home.join("bin").display()))
+        .env("KNAIX_API_URL", format!("http://127.0.0.1:{}", node.port))
+        .args(["local", "disconnect"]));
+    assert!(down.out.contains("Local node disconnected"), "{}", down.out);
+    assert_eq!(node.calls().len(), calls);
+    assert_eq!(recorded(&home).unwrap()["remote_id"], Value::Null);
+
     // Already disconnected, and then no node at all: nothing to tell the account.
     let calls = node.calls().len();
     let down = connected(&home, &node, &["disconnect"]);

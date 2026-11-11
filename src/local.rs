@@ -2137,6 +2137,7 @@ mod tests {
         // A stopped container reports dashes; do not invent a number.
         assert_eq!(parse_size("--"), None);
         assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("3PiB"), None, "a unit docker does not print");
     }
 
     #[test]
@@ -2558,12 +2559,16 @@ mod tests {
         const CONNECT: &str = "POST /api/instances/local/connect";
         const TELEMETRY: &str = "POST /api/instances/c-1/telemetry";
 
-        /// A docker whose node is running, logging two lines, and measured.
+        /// A docker whose node is running, logging two lines, and measured in
+        /// whichever format it is asked for.
         const RUNNING: &str = r#"case "$1" in
   info) echo 27.0.0 ;;
   inspect) echo running ;;
   logs) echo "store open"; echo "query answered" ;;
-  stats) printf '12.5%%\t3.0%%\t104.9MiB / 7.6GiB\n' ;;
+  stats) case "$4" in
+      *MemUsage*) printf '12.5%%\t3.0%%\t104.9MiB / 7.6GiB\n' ;;
+      *) echo "12.5% 3.0%" ;;
+    esac ;;
 esac"#;
 
         fn ctx(api: &str, token: Option<&str>) -> KnaixContext {
@@ -2724,6 +2729,61 @@ esac"#;
             assert_eq!(load().unwrap().remote_id.as_deref(), Some("c-1"));
         }
 
+        #[test]
+        fn the_readers_for_top_and_reports_ask_docker_and_survive_its_silence() {
+            let home = ScratchHome::new();
+            assert_eq!(container_usage(), None, "no docker");
+            assert!(recent_container_logs(5).is_empty());
+            assert!(log_lines(5).is_err());
+
+            let running = fake_tool(&home.0, "docker", RUNNING);
+            let docker = UseDocker::new(&running);
+            assert_eq!(container_usage(), Some((12.5, 3.0)));
+            assert_eq!(log_lines(5).unwrap(), ["store open", "query answered"]);
+            assert_eq!(recent_container_logs(5), ["store open", "query answered"]);
+            assert!(args_of(&running).contains(&"logs --tail 5 knaix-local".to_string()));
+            drop(docker);
+
+            // Running, but measured as dashes and saying nothing when asked.
+            let quiet = fake_tool(
+                &home.0,
+                "docker2",
+                r#"case "$1" in info) echo 27 ;; inspect) echo running ;; stats) echo "-- --" ;; esac"#,
+            );
+            let docker = UseDocker::new(&quiet);
+            assert_eq!(container_usage(), None);
+            assert_eq!(
+                docker_version(Duration::from_secs(5)),
+                Probe::Answered("27".into())
+            );
+            assert_eq!(
+                docker_probe(&["logs", "knaix-local"], Duration::from_secs(5)),
+                Probe::Absent,
+                "an empty answer is no answer"
+            );
+            drop(docker);
+
+            let stopped = fake_tool(
+                &home.0,
+                "docker3",
+                r#"case "$1" in info) echo 27 ;; *) exit 1 ;; esac"#,
+            );
+            let _docker = UseDocker::new(&stopped);
+            let err = log_lines(5).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "No local node exists. Start one with 'knaix local up'."
+            );
+        }
+
+        #[tokio::test]
+        async fn the_login_snapshot_returns_at_once_with_no_node() {
+            let _home = ScratchHome::new();
+            tokio::time::timeout(Duration::from_secs(5), connect_snapshot())
+                .await
+                .unwrap();
+        }
+
         #[tokio::test]
         async fn after_login_nothing_is_registered_without_a_running_node_a_session_or_an_id() {
             let home = ScratchHome::new();
@@ -2784,9 +2844,11 @@ esac"#;
         enum Answer {
             Pick(Option<usize>),
             Text(String),
+            /// The text prompt fails, as it does when the terminal goes away.
+            Broken,
             Confirm(bool),
         }
-        use Answer::{Confirm, Pick, Text};
+        use Answer::{Broken, Confirm, Pick, Text};
 
         /// What was asked: the prompt, and for a pick its items, the one the
         /// cursor started on and whether it filters.
@@ -2854,6 +2916,7 @@ esac"#;
                     ..Asked::default()
                 }) {
                     Text(t) => Ok(t),
+                    Broken => Err(anyhow!("the terminal went away")),
                     other => panic!("{prompt:?} answered with {other:?}"),
                 }
             }
@@ -3136,6 +3199,23 @@ esac"#,
         }
 
         #[tokio::test]
+        async fn a_prompt_that_fails_is_an_error_and_saves_nothing() {
+            let _home = ScratchHome::new();
+            let closed = "http://127.0.0.1:9";
+
+            let typed = choose(&script(vec![Pick(Some(0)), Broken]), None, Vec::new()).await;
+            assert_eq!(typed.unwrap_err().to_string(), "the terminal went away");
+            let named = script(vec![
+                Pick(Some(0)),
+                Text(closed.into()),
+                Confirm(true),
+                Broken,
+            ]);
+            assert!(choose(&named, None, Vec::new()).await.is_err());
+            assert!(load().is_none());
+        }
+
+        #[tokio::test]
         async fn backing_out_of_the_model_list_changes_nothing() {
             let _home = ScratchHome::new();
             let models = vec![sized("a", 1 << 20), sized("b", 1 << 20)];
@@ -3177,6 +3257,13 @@ esac"#,
                 "nothing to stop"
             );
             assert_eq!(default_node().as_deref(), Some("hosted-1"));
+
+            // Already the default: nothing to offer.
+            set_default_node("local");
+            std::fs::remove_file(format!("{docker}.state")).unwrap();
+            let ask = script(vec![Pick(Some(1)), Confirm(true)]);
+            choose(&ask, load(), Vec::new()).await.unwrap();
+            assert_eq!(ask.prompts().len(), 2, "{:?}", ask.prompts());
         }
     }
 }
