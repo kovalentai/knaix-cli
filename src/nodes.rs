@@ -1686,12 +1686,22 @@ async fn select_node(
 
 /// The UUID a node's data routes are keyed by, or an error naming the node.
 pub(crate) fn node_uuid(node: &Node) -> Result<String> {
-    node.id.clone().ok_or_else(|| {
+    let id = node.id.clone().ok_or_else(|| {
         anyhow!(
             "Node {} has no instance UUID; the control plane is too old for this CLI.",
             node.name
         )
-    })
+    })?;
+    // The id names the node's notes directory and goes into request paths, so
+    // one the server sent as `../..` would file a note outside ~/.knaix/memory.
+    if crate::stdin_arg::checked_name("id", &id).is_err() {
+        return Err(anyhow!(
+            "Node {} has an id that is not a plain name: {:?}",
+            node.name,
+            id
+        ));
+    }
+    Ok(id)
 }
 
 /// Turn anything the user can read off `knaix list` -- UUID, instance id, or
@@ -1826,7 +1836,7 @@ pub async fn chat(
     history: &[ChatTurn],
     options: &AnswerOptions,
     conversation: Option<&str>,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     if let Target::Local { base, instance_id } = target {
         // A local node has no control plane to hold a thread, so its context is
         // the history the caller replays.
@@ -1907,7 +1917,7 @@ pub async fn chat(
         print_citations(&citations);
     }
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text,
         citations,
         model,
@@ -1915,7 +1925,7 @@ pub async fn chat(
         total_ms,
         conversation_id,
         scope,
-    }))
+    })
 }
 
 /// Ask the local node directly.
@@ -1932,7 +1942,7 @@ async fn chat_local(
     echo: Echo,
     history: &[ChatTurn],
     options: &AnswerOptions,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     let pb = chat_spinner(ctx);
 
     let body = build_local_answer_body(instance_id, message, history, options);
@@ -1978,7 +1988,7 @@ async fn chat_local(
 
     let outcome = read_local_answer_stream(resp, &pb, echo, asked_at).await?;
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text: outcome.text,
         citations: outcome.citations,
         model: outcome.model,
@@ -1986,7 +1996,7 @@ async fn chat_local(
         total_ms: outcome.total_ms,
         conversation_id: None,
         scope: outcome.scope,
-    }))
+    })
 }
 
 /// The pre-streaming path: one blocking request that returns the whole answer.
@@ -2000,7 +2010,7 @@ async fn chat_local_blocking(
     body: &serde_json::Value,
     pb: &ProgressBar,
     echo: Echo,
-) -> Result<Option<ChatAnswer>> {
+) -> Result<ChatAnswer> {
     let resp = ctx
         .client
         .post(format!("{}/api/query/answer", base))
@@ -2049,7 +2059,7 @@ async fn chat_local_blocking(
         print_citations(&citations);
     }
 
-    Ok(Some(ChatAnswer {
+    Ok(ChatAnswer {
         text,
         citations,
         model,
@@ -2060,7 +2070,7 @@ async fn chat_local_blocking(
         total_ms: None,
         conversation_id: None,
         scope,
-    }))
+    })
 }
 
 /// Consume the local node's SSE answer stream.
@@ -2502,16 +2512,20 @@ const TIMING_SHOWN_AFTER: Duration = WAITED_AFTER;
 
 /// The two halves of a wait worth explaining, or `None` when it is not.
 ///
-/// Separated from the printing so the thresholds and the subtraction can be
-/// tested without capturing stdout.
-fn timing_split(answer: &ChatAnswer) -> Option<(u128, u128)> {
+/// Separated from the printing so the thresholds, the subtraction and the
+/// wording can be tested without capturing stdout.
+fn timing_line(answer: &ChatAnswer) -> Option<String> {
     let (first, total) = (answer.first_token_ms?, answer.total_ms?);
     if total < TIMING_SHOWN_AFTER.as_millis() {
         return None;
     }
     // Saturating because the two are sampled separately; a total below the
     // first token would otherwise wrap into an enormous generation time.
-    Some((first, total.saturating_sub(first)))
+    Some(format!(
+        "{} to the first word, {} writing.",
+        format_duration_ms(first),
+        format_duration_ms(total.saturating_sub(first))
+    ))
 }
 
 /// The passage carrying a given `[n]` marker, if the last answer had one.
@@ -2530,18 +2544,9 @@ fn find_source(citations: &[Citation], index: u32) -> Option<&Citation> {
 /// Silent on a quick answer, and silent when nothing streamed, since there is
 /// then no first token to have timed.
 pub fn print_answer_timing(answer: &ChatAnswer) {
-    let Some((first, generating)) = timing_split(answer) else {
-        return;
-    };
-    println!(
-        "{}",
-        format!(
-            "{} to the first word, {} writing.",
-            format_duration_ms(first),
-            format_duration_ms(generating)
-        )
-        .dimmed()
-    );
+    if let Some(line) = timing_line(answer) {
+        println!("{}", line.dimmed());
+    }
 }
 
 /// The answer as one JSON object, for scripting. Citations carry their
@@ -3907,7 +3912,6 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Within 30 days [1].", "{echo:?}");
                 let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
@@ -4060,7 +4064,6 @@ mod tests {
                     Some("ignored"),
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Checkout is at 11 [2].");
                 let cited: Vec<_> = answer.citations.iter().map(|c| c.cited).collect();
@@ -4101,7 +4104,6 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap()
                 .unwrap();
                 assert_eq!(answer.text, "Pets are welcome [1].");
                 assert_eq!(answer.citations[0].cited, Some(true));
@@ -4624,26 +4626,24 @@ mod tests {
     /// explaining, and only when there was a first token to have timed.
     #[test]
     fn timing_is_shown_for_a_slow_answer_and_not_a_quick_one() {
-        assert!(timing_split(&timed(Some(100), Some(900))).is_none());
-        assert!(timing_split(&timed(Some(2_000), Some(9_000))).is_some());
+        assert_eq!(timing_line(&timed(Some(100), Some(4_999))), None);
+        assert_eq!(
+            timing_line(&timed(Some(800), Some(5_000))).as_deref(),
+            Some("800 ms to the first word, 4.2 s writing.")
+        );
         // Nothing streamed: no first token, so no split to report.
-        assert!(timing_split(&timed(None, Some(9_000))).is_none());
-        assert!(timing_split(&timed(Some(2_000), None)).is_none());
+        assert_eq!(timing_line(&timed(None, Some(9_000))), None);
+        assert_eq!(timing_line(&timed(Some(2_000), None)), None);
     }
 
     /// The two are sampled separately, so a total under the first token is
     /// possible; subtracting must not wrap into an enormous generation time.
     #[test]
     fn a_total_below_the_first_token_does_not_wrap() {
-        let (_, generating) = timing_split(&timed(Some(9_000), Some(8_000))).unwrap();
-        assert_eq!(generating, 0);
-    }
-
-    #[test]
-    fn the_split_is_the_wait_before_and_after_the_first_word() {
-        let (first, generating) = timing_split(&timed(Some(2_000), Some(9_000))).unwrap();
-        assert_eq!(first, 2_000);
-        assert_eq!(generating, 7_000);
+        assert_eq!(
+            timing_line(&timed(Some(9_000), Some(8_000))).as_deref(),
+            Some("9.0 s to the first word, 0 ms writing.")
+        );
     }
 
     fn citation_at(index: u32, name: &str, cited: bool) -> Citation {

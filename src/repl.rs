@@ -125,7 +125,7 @@ fn print_help() {
         ("/exit, /quit", "End the session (Ctrl-D works too)"),
     ];
     for (cmd, what) in rows {
-        println!("  {:<18} {}", cmd.cyan(), what);
+        println!("  {:<26} {}", cmd.cyan(), what);
     }
     println!();
 }
@@ -272,6 +272,16 @@ pub async fn run(
                                 );
                                 continue;
                             }
+                            // As /k: the shared check names the --doc flag,
+                            // which is not what was typed here.
+                            if !target.is_local() {
+                                println!(
+                                    "{} {} applies to a local node; a hosted node's retrieval is set by the control plane.",
+                                    "Note:".blue(),
+                                    "/doc".cyan()
+                                );
+                                continue;
+                            }
                             match crate::nodes::scope_to_documents(
                                 ctx,
                                 target,
@@ -390,11 +400,11 @@ pub async fn run(
                     // rather than returning a bare prompt. Spaced like an answer
                     // would have been, so the prompt does not jump up the screen
                     // on the one turn that failed.
-                    Ok(Some(answer)) if answer.text.trim().is_empty() => {
+                    Ok(answer) if answer.text.trim().is_empty() => {
                         println!("{}", "Warning: Node returned an empty response.".yellow());
                         println!();
                     }
-                    Ok(Some(answer)) => {
+                    Ok(answer) => {
                         crate::nodes::print_scope_note(&answer);
                         crate::nodes::print_answer_timing(&answer);
                         crate::nodes::print_answer_footer(target, &answer);
@@ -432,9 +442,6 @@ pub async fn run(
                             crate::nodes::HISTORY_CHAR_BUDGET,
                         );
                     }
-                    Ok(None) => {
-                        println!("{}", "Warning: Node returned an empty response.".yellow());
-                    }
                     Err(e) => {
                         println!("{} {}", "Error:".red(), e);
                     }
@@ -448,10 +455,8 @@ pub async fn run(
                 println!("\nSession ended.");
                 break;
             }
-            Err(err) => {
-                println!("Readline error: {:?}", err);
-                break;
-            }
+            // Not an ending: a script whose input broke must not exit 0.
+            Err(err) => return Err(anyhow::anyhow!("Could not read the next line: {err}")),
         }
     }
 

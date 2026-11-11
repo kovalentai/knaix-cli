@@ -122,3 +122,12 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 
 - **Through the binary,** with `tests/common`'s runner now giving `knaix` an empty PATH, so no binary test can reach the docker on the machine running it, and able to run signed out.
 - **Cases:** the node table and its JSON with the local node last; signed out with and without a local node; no nodes; a node's documents, hosted or local, as a table, JSON or none; `--docs` with no default; metrics and logs from a hosted node and the local one, healthy or not, as text and JSON, and refused; `up` that names the node it requested, or does not, and a refusal that exits with the code its status means.
+
+## PR 13: The REPL
+
+**Goal:** `knaix repl` and what only it uses: saving and ingesting a note, printing a source in full, and the timing line.
+
+- **Through the binary,** with the session's input piped from a file. Without a terminal the line editor reads one line at a time until the input ends, so a test types a whole session as a script.
+- **The timing line is built apart from its printing,** so its wording can be checked without capturing stdout.
+- **Cases:** a hosted thread followed and then reset; a local session's history, `/k` and `/doc`; `/source` for a cited passage, an uncited one, a missing one and junk; `/remember` ingested, refused and unsaved, on either kind of node; `/memory`; each setting command and an unknown one; a failed or threadless turn; input that is not text; a node id from the control plane that is a path.
+- **Not covered:** Ctrl-C, which needs a real terminal to send it.

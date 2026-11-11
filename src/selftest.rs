@@ -628,8 +628,7 @@ async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::
     )
     .await
     {
-        Ok(Some(answer)) => Ok(answer),
-        Ok(None) => Err(anyhow!("Node returned no answer")),
+        Ok(answer) => Ok(answer),
         Err(e) if e.to_string().contains("429") => Err(anyhow!(
             "Rate limited part-way through the run. A self-test spends one request per question; \
              wait for the window to reset, or use --quick for a shorter run."
