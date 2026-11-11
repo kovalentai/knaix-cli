@@ -5,7 +5,6 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use colored::*;
-use crossterm::{cursor, execute};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::header::AUTHORIZATION;
@@ -1577,6 +1576,17 @@ pub async fn list_nodes(ctx: &KnaixContext, node_id: Option<&str>) -> Result<()>
 }
 
 pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<String>> {
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    select_node(ctx, &crate::ask::Terminal, interactive).await
+}
+
+/// `select_node_interactively`, given how to ask and whether anyone can answer.
+async fn select_node(
+    ctx: &KnaixContext,
+    ask: &dyn crate::ask::Ask,
+    interactive: bool,
+) -> Result<Option<String>> {
     let token = ctx.get_token()?;
 
     // Show spinner while fetching nodes
@@ -1637,8 +1647,17 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         return Ok(node_uuid(&nodes[0]).ok());
     }
 
-    // Multiple nodes: show fuzzy selector with cursor hidden for a clean UI
-    use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+    // Several, and nobody to ask: a picker here would wait for keys that never
+    // come, so say how to choose instead.
+    if !interactive {
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        return Err(anyhow!(
+            "Choose a node to ask: you have {} ({}). Pass -n <name>, or run 'knaix use <name>' to make one the default.",
+            nodes.len(),
+            names.join(", ")
+        ))
+        .coded(Code::Usage);
+    }
 
     let items: Vec<String> = nodes
         .iter()
@@ -1652,18 +1671,7 @@ pub async fn select_node_interactively(ctx: &KnaixContext) -> Result<Option<Stri
         })
         .collect();
 
-    let _ = execute!(std::io::stderr(), cursor::Hide);
-
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select a node")
-        .default(0)
-        .items(&items)
-        .interact_opt()
-        .unwrap_or(None);
-
-    let _ = execute!(std::io::stderr(), cursor::Show);
-
-    if let Some(index) = selection {
+    if let Some(index) = ask.pick("Select a node", &items, 0, true) {
         return Ok(node_uuid(&nodes[index]).ok());
     }
 
