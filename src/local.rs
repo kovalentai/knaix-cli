@@ -1860,8 +1860,8 @@ pub async fn disconnect() -> Result<()> {
 /// After login, register a running local node and push one snapshot so it shows
 /// up right away. Best-effort and quiet: does nothing if nothing is running.
 pub async fn connect_snapshot() {
-    // Bounded so a slow or unreachable control plane never holds up login.
     let ctx = crate::nodes::KnaixContext::new("text".to_string());
+    // Bounded so a slow or unreachable control plane never holds up login.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         connect_snapshot_inner(&ctx),

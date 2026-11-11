@@ -1006,13 +1006,20 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// Kills a relay worker the test started, should the test fail first.
-struct Worker(u32);
+/// Kills a relay the test started, should the test fail first. Cleared once
+/// the test has seen it stop, so a pid reused since is left alone.
+struct Worker(Option<u32>);
+
+impl Worker {
+    fn pid(&self) -> u32 {
+        self.0.expect("a relay worker was recorded")
+    }
+}
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        if alive(self.0) {
-            unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+        if let Some(pid) = self.0.filter(|pid| alive(*pid)) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
     }
 }
@@ -1086,9 +1093,13 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
     node.answer(TELEMETRY, 200, "{}");
     node.answer(DISCONNECT, 200, "{}");
     let pushes = || node.calls().iter().filter(|(r, _)| r == TELEMETRY).count();
-    let relay_pid = || recorded(&home).unwrap()["relay_pid"].as_u64().unwrap() as u32;
+    let worker = || {
+        let pid = recorded(&home).and_then(|r| r["relay_pid"].as_u64());
+        Worker(pid.map(|p| p as u32))
+    };
 
     let up = connected(&home, &node, &["connect", "--daemon"]);
+    let mut first = worker();
 
     assert_eq!(up.code, 0, "{}{}", up.out, up.err);
     assert!(
@@ -1097,11 +1108,10 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
         "{}",
         up.out
     );
-    let first = Worker(relay_pid());
     assert!(
         up.out.contains(&format!(
             "Relaying metrics and logs in the background (pid {}).",
-            first.0
+            first.pid()
         )),
         "{}",
         up.out
@@ -1122,10 +1132,11 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
 
     // Again: one relay replaces the other, never two at once.
     let again = connected(&home, &node, &["connect", "--daemon"]);
+    let mut second = worker();
     assert_eq!(again.code, 0, "{}", again.err);
-    let second = Worker(relay_pid());
-    assert_ne!(second.0, first.0);
-    wait_for("the first worker to stop", || !alive(first.0));
+    assert_ne!(second.pid(), first.pid());
+    wait_for("the first worker to stop", || !alive(first.pid()));
+    first.0 = None;
 
     let down = connected(&home, &node, &["disconnect"]);
     assert_eq!(down.code, 0, "{}", down.err);
@@ -1135,7 +1146,8 @@ fn connect_in_the_background_relays_until_disconnect_stops_it() {
         "{}",
         down.out
     );
-    wait_for("the second worker to stop", || !alive(second.0));
+    wait_for("the second worker to stop", || !alive(second.pid()));
+    second.0 = None;
     assert!(node.calls().iter().any(|(r, _)| r == DISCONNECT));
     let saved = recorded(&home).unwrap();
     assert_eq!(
@@ -1187,10 +1199,12 @@ fn connect_in_the_foreground_records_the_connection_before_it_relays() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut guard = Worker(Some(relay.id()));
     wait_for("the first sample", || {
         node.calls().iter().any(|(r, _)| r == TELEMETRY)
     });
-    // Relaying until stopped, so it is stopped here.
+    // Relaying until stopped, so it is stopped here, through the handle.
+    guard.0 = None;
     relay.kill().unwrap();
     let out = relay.wait_with_output().unwrap();
 
