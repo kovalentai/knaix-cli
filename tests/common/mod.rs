@@ -45,6 +45,10 @@ pub struct Server {
     calls: Arc<Mutex<Vec<Call>>>,
 }
 
+/// A status that closes the connection without answering, as a server that
+/// went away mid-request would.
+pub const DROP: u16 = 0;
+
 pub fn server(routes: Vec<(&str, u16, String)>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -87,6 +91,9 @@ pub fn server(routes: Vec<(&str, u16, String)>) -> Server {
                 raw: String::from_utf8_lossy(&body).into_owned(),
             });
             let (status, reply) = routes.get(&route).cloned().unwrap_or((404, String::new()));
+            if status == DROP {
+                continue;
+            }
             let _ = write!(
                 stream,
                 "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",

@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{knaix, knaix_signed_out, nodes, record_local_node, scratch_home, server};
+use common::{knaix, knaix_signed_out, nodes, record_local_node, scratch_home, server, DROP};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -500,6 +500,34 @@ fn logs_of_a_hosted_node_as_lines_or_json_however_they_came() {
     assert_eq!(logs.code, 3, "{}", logs.err);
     assert!(
         logs.err.contains("Failed to fetch logs: HTTP 403"),
+        "{}",
+        logs.err
+    );
+}
+
+#[test]
+fn metrics_and_logs_from_a_control_plane_that_goes_away_are_unavailable() {
+    let home = scratch_home("nodes-dropped");
+    let api = server(vec![
+        two_nodes(),
+        (HEALTH, DROP, String::new()),
+        ("GET /api/nodes/u-1/logs?limit=50", DROP, String::new()),
+    ]);
+
+    let metrics = knaix(&home, &api.url, &["metrics", "alpha"]);
+    assert_eq!(metrics.code, 4, "{}", metrics.err);
+    assert!(
+        metrics
+            .err
+            .contains("Networking error during metrics request"),
+        "{}",
+        metrics.err
+    );
+
+    let logs = knaix(&home, &api.url, &["logs", "alpha"]);
+    assert_eq!(logs.code, 4, "{}", logs.err);
+    assert!(
+        logs.err.contains("Networking error during logs request"),
         "{}",
         logs.err
     );

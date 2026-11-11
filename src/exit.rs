@@ -117,7 +117,9 @@ pub fn code_of(err: &anyhow::Error) -> Code {
     }
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
-            if e.is_connect() || e.is_timeout() {
+            // A connection the far end dropped before answering is as much
+            // a transport failure as one it refused, and as worth retrying.
+            if e.is_connect() || e.is_timeout() || e.is_request() {
                 return Code::Unavailable;
             }
         }
