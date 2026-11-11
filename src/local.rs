@@ -200,9 +200,47 @@ fn clear_state() {
     let _ = std::fs::remove_file(state_path());
 }
 
+#[cfg(test)]
+thread_local! {
+    // Set by `UseDocker`. Unset, a unit test's docker is a path that does not
+    // exist, so no test can inspect or remove a container on the machine
+    // running it.
+    static TEST_DOCKER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// For a unit test: run `docker` as this stand-in until dropped.
+#[cfg(all(test, unix))]
+pub(crate) struct UseDocker;
+
+#[cfg(all(test, unix))]
+impl UseDocker {
+    pub(crate) fn new(program: impl Into<PathBuf>) -> Self {
+        TEST_DOCKER.with(|d| *d.borrow_mut() = Some(program.into()));
+        UseDocker
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for UseDocker {
+    fn drop(&mut self) {
+        TEST_DOCKER.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+/// `docker`, or in a unit test the stand-in it chose.
+fn docker_command() -> Command {
+    #[cfg(test)]
+    let program = TEST_DOCKER
+        .with(|d| d.borrow().clone())
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/docker"));
+    #[cfg(not(test))]
+    let program = "docker";
+    Command::new(program)
+}
+
 /// Run a docker command, returning stdout on success and stderr on failure.
 fn docker(args: &[&str]) -> Result<String> {
-    let out = Command::new("docker")
+    let out = docker_command()
         .args(args)
         .output()
         .context("Could not run docker. Is Docker installed and running?")
@@ -222,7 +260,7 @@ fn docker(args: &[&str]) -> Result<String> {
 /// which is indistinguishable from a hang -- and the first run is exactly when
 /// a user has least reason to assume it is working.
 fn docker_streaming(args: &[&str]) -> Result<()> {
-    let status = Command::new("docker")
+    let status = docker_command()
         .args(args)
         .status()
         .context("Could not run docker. Is Docker installed and running?")
@@ -262,7 +300,7 @@ pub const PROBE_WAIT: Duration = Duration::from_secs(3);
 /// in when they reach for `knaix doctor`, so the command that reports it must
 /// not be the command that hangs on it.
 pub fn docker_probe(args: &[&str], wait: Duration) -> Probe {
-    let child = Command::new("docker")
+    let child = docker_command()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -342,7 +380,7 @@ pub fn summarize_within(wait: Duration) -> LocalSummary {
 /// machine where the daemon is stopped and fails only when there is nothing
 /// installed to ask.
 fn docker_installed() -> bool {
-    std::process::Command::new("docker")
+    docker_command()
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1713,7 +1751,7 @@ pub async fn connect(daemon: bool, worker: bool) -> Result<()> {
             .clone()
             .ok_or_else(|| anyhow!("Local node is not connected."))?;
         let ctx = crate::nodes::KnaixContext::new("text".to_string());
-        return relay_loop(&ctx, &node, &client_id).await;
+        return relay_loop(&ctx, &node, &client_id, RELAY_EVERY, std::future::pending()).await;
     }
 
     docker_available()?;
@@ -1756,7 +1794,14 @@ pub async fn connect(daemon: bool, worker: bool) -> Result<()> {
     }
 
     println!("  Relaying metrics and logs. Press Ctrl-C to stop; the node stays connected.");
-    relay_loop(&ctx, &saved, &client_id).await
+    relay_loop(
+        &ctx,
+        &saved,
+        &client_id,
+        RELAY_EVERY,
+        std::future::pending(),
+    )
+    .await
 }
 
 /// Stop relaying and mark the node offline in the account. The node keeps running.
@@ -1796,10 +1841,15 @@ pub async fn disconnect() -> Result<()> {
 /// up right away. Best-effort and quiet: does nothing if nothing is running.
 pub async fn connect_snapshot() {
     // Bounded so a slow or unreachable control plane never holds up login.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), connect_snapshot_inner()).await;
+    let ctx = crate::nodes::KnaixContext::new("text".to_string());
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        connect_snapshot_inner(&ctx),
+    )
+    .await;
 }
 
-async fn connect_snapshot_inner() {
+async fn connect_snapshot_inner(ctx: &crate::nodes::KnaixContext) {
     let node = match load() {
         Some(n) => n,
         None => return,
@@ -1807,20 +1857,19 @@ async fn connect_snapshot_inner() {
     if docker_available().is_err() || container_state().as_deref() != Some("running") {
         return;
     }
-    let ctx = crate::nodes::KnaixContext::new("text".to_string());
     if ctx.get_token().is_err() {
         return;
     }
-    let client_id = match register(&ctx, &node).await {
+    let client_id = match register(ctx, &node).await {
         Ok(c) => c,
         Err(_) => return,
     };
     let mut saved = node.clone();
     saved.remote_id = Some(client_id.clone());
     let _ = save(&saved);
-    let sample = gather_sample(&ctx, &node).await;
+    let sample = gather_sample(ctx, &node).await;
     let logs = recent_log_lines(30);
-    let _ = push_telemetry(&ctx, &client_id, sample, logs).await;
+    let _ = push_telemetry(ctx, &client_id, sample, logs).await;
     println!(
         "  Your local node is now connected; see it in the dashboard. {} streams live telemetry.",
         crate::brand::cmd("local connect")
@@ -1879,11 +1928,19 @@ async fn push_telemetry(
     Ok(())
 }
 
+/// How often the relay sends a sample.
+const RELAY_EVERY: Duration = Duration::from_secs(15);
+
+/// Send a sample and the new log lines every `every`, until `stop` ends. The
+/// commands pass a `stop` that never does: they relay until killed.
 async fn relay_loop(
     ctx: &crate::nodes::KnaixContext,
     node: &LocalNode,
     client_id: &str,
+    every: Duration,
+    stop: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    tokio::pin!(stop);
     let mut since: Option<u64> = None;
     loop {
         let sample = gather_sample(ctx, node).await;
@@ -1891,7 +1948,10 @@ async fn relay_loop(
         if let Err(e) = push_telemetry(ctx, client_id, sample, logs).await {
             eprintln!("{} {}", "Warning:".yellow(), e);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tokio::select! {
+            _ = &mut stop => return Ok(()),
+            _ = tokio::time::sleep(every) => {}
+        }
     }
 }
 
@@ -2471,5 +2531,229 @@ mod tests {
         // total_memory() returning 0 means the probe failed. Every model is
         // then offered plainly rather than all of them being called too large.
         assert_eq!(describe_model(&model("any", Some(30)), 0), "any  (30.0 GB)");
+    }
+
+    /// The relay and the login snapshot, against a stand-in docker and a fake
+    /// control plane that also plays the node.
+    #[cfg(unix)]
+    mod relaying {
+        use super::*;
+        use crate::config::{Config, ScratchHome};
+        use crate::nodes::KnaixContext;
+        use crate::testing::{args_of, fake_api, fake_tool, FakeApi};
+        use serde_json::{json, Value};
+
+        const CONNECT: &str = "POST /api/instances/local/connect";
+        const TELEMETRY: &str = "POST /api/instances/c-1/telemetry";
+
+        /// A docker whose node is running, logging two lines, and measured.
+        const RUNNING: &str = r#"case "$1" in
+  info) echo 27.0.0 ;;
+  inspect) echo running ;;
+  logs) echo "store open"; echo "query answered" ;;
+  stats) printf '12.5%%\t3.0%%\t104.9MiB / 7.6GiB\n' ;;
+esac"#;
+
+        fn ctx(api: &str, token: Option<&str>) -> KnaixContext {
+            KnaixContext {
+                config: Config {
+                    token: token.map(String::from),
+                    api_url: api.into(),
+                    ..Config::default()
+                },
+                client: reqwest::Client::new(),
+                output_format: "text".into(),
+                quiet: true,
+            }
+        }
+
+        /// A node served by `api`, which answers its health check.
+        fn node_at(api: &FakeApi) -> LocalNode {
+            let port = api.url.rsplit(':').next().unwrap().parse().unwrap();
+            let mut node = saved(port, None, Some("llama3"));
+            node.instance_id = "0b5e8a4c-1d2f-4e3a-9b8c-7d6e5f4a3b2c".into();
+            node
+        }
+
+        fn pushes(api: &FakeApi) -> Vec<Value> {
+            api.calls()
+                .into_iter()
+                .filter(|c| c.route == TELEMETRY)
+                .map(|c| c.body)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_relay_sends_a_sample_and_only_new_log_lines_until_told_to_stop() {
+            let home = ScratchHome::new();
+            let docker = fake_tool(&home.0, "docker", RUNNING);
+            let _docker = UseDocker::new(&docker);
+            let api = fake_api(vec![
+                ("GET /health", 200, json!({})),
+                (TELEMETRY, 500, json!({})),
+            ])
+            .await;
+            let node = node_at(&api);
+            let after_two = async {
+                while pushes(&api).len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+
+            let signed_in = ctx(&api.url, Some("sess"));
+            let relayed = relay_loop(
+                &signed_in,
+                &node,
+                "c-1",
+                Duration::from_millis(10),
+                after_two,
+            );
+            tokio::time::timeout(Duration::from_secs(10), relayed)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let pushed = pushes(&api);
+            assert_eq!(pushed.len(), 2, "a refused push does not stop the relay");
+            let metrics = &pushed[0]["metrics"];
+            assert_eq!(metrics["healthy"], true);
+            assert_eq!(metrics["cpuPct"], 12.5);
+            assert_eq!(metrics["memPct"], 3.0);
+            assert_eq!(metrics["memUsedBytes"], (104.9 * 1024.0 * 1024.0) as u64);
+            assert!(metrics["latencyMs"].is_u64());
+            assert_eq!(pushed[0]["logs"], json!(["store open", "query answered"]));
+            let telemetry = api
+                .calls()
+                .into_iter()
+                .find(|c| c.route == TELEMETRY)
+                .unwrap();
+            assert_eq!(telemetry.auth.as_deref(), Some("Bearer sess"));
+            let logs: Vec<String> = args_of(&docker)
+                .into_iter()
+                .filter(|a| a.starts_with("logs "))
+                .collect();
+            assert_eq!(logs[0], "logs --tail 30 knaix-local", "a recent tail first");
+            assert!(
+                logs[1].starts_with("logs --since "),
+                "then only what is new: {logs:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_node_that_cannot_be_measured_or_reached_is_sent_as_such() {
+            let home = ScratchHome::new();
+            let docker = fake_tool(&home.0, "docker", "exit 1");
+            let _docker = UseDocker::new(&docker);
+            let api = fake_api(vec![(TELEMETRY, 200, Value::Null)]).await;
+            let node = node_at(&api);
+            let after_one = async {
+                while pushes(&api).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+
+            let signed_in = ctx(&api.url, Some("sess"));
+            let relayed = relay_loop(
+                &signed_in,
+                &node,
+                "c-1",
+                Duration::from_millis(10),
+                after_one,
+            );
+            tokio::time::timeout(Duration::from_secs(10), relayed)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let pushed = &pushes(&api)[0];
+            assert_eq!(
+                pushed["metrics"]["healthy"], false,
+                "no health route answers"
+            );
+            for gone in ["cpuPct", "memPct", "memUsedBytes"] {
+                assert_eq!(pushed["metrics"][gone], Value::Null, "{gone}");
+            }
+            assert_eq!(pushed["logs"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn after_login_a_running_node_is_registered_and_sends_one_sample() {
+            let home = ScratchHome::new();
+            let docker = fake_tool(&home.0, "docker", RUNNING);
+            let _docker = UseDocker::new(&docker);
+            let reply = json!({"data": {"clientId": "c-1"}});
+            let api = fake_api(vec![
+                (CONNECT, 200, reply),
+                (TELEMETRY, 200, Value::Null),
+                ("GET /health", 200, json!({})),
+            ])
+            .await;
+            let node = node_at(&api);
+            save(&node).unwrap();
+
+            connect_snapshot_inner(&ctx(&api.url, Some("sess"))).await;
+
+            let calls = api.calls();
+            let register = calls.iter().find(|c| c.route == CONNECT).unwrap();
+            assert_eq!(register.auth.as_deref(), Some("Bearer sess"));
+            assert_eq!(register.body["localInstanceId"], node.instance_id);
+            assert_eq!(register.body["port"], node.port);
+            assert_eq!(register.body["model"], "llama3");
+            assert!(register.body["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("Local node"));
+            assert_eq!(pushes(&api).len(), 1);
+            assert_eq!(
+                pushes(&api)[0]["logs"],
+                json!(["store open", "query answered"])
+            );
+            assert!(args_of(&docker).contains(&"logs --tail 30 knaix-local".to_string()));
+            assert_eq!(load().unwrap().remote_id.as_deref(), Some("c-1"));
+        }
+
+        #[tokio::test]
+        async fn after_login_nothing_is_registered_without_a_running_node_a_session_or_an_id() {
+            let home = ScratchHome::new();
+            let api = fake_api(vec![
+                (CONNECT, 200, json!({"data": {}})),
+                (TELEMETRY, 200, Value::Null),
+            ])
+            .await;
+            let signed_in = ctx(&api.url, Some("sess"));
+
+            // No node at all, then one with no docker to ask.
+            connect_snapshot_inner(&signed_in).await;
+            save(&node_at(&api)).unwrap();
+            connect_snapshot_inner(&signed_in).await;
+            // Docker, but the node is stopped.
+            let stopped = fake_tool(
+                &home.0,
+                "docker",
+                r#"case "$1" in info) echo 27 ;; inspect) echo exited ;; esac"#,
+            );
+            let docker = UseDocker::new(&stopped);
+            connect_snapshot_inner(&signed_in).await;
+            assert!(api.calls().is_empty(), "{:?}", api.calls());
+            drop(docker);
+
+            let running = fake_tool(&home.0, "docker2", RUNNING);
+            let _docker = UseDocker::new(&running);
+            connect_snapshot_inner(&ctx(&api.url, None)).await;
+            assert!(
+                api.calls().is_empty(),
+                "no session, nothing to register with"
+            );
+
+            // Registered, but the control plane named no node.
+            connect_snapshot_inner(&signed_in).await;
+            assert_eq!(api.calls().len(), 1);
+            assert_eq!(load().unwrap().remote_id, None);
+
+            let refusing = fake_api(vec![(CONNECT, 403, json!({"error": "no"}))]).await;
+            save(&node_at(&refusing)).unwrap();
+            connect_snapshot_inner(&ctx(&refusing.url, Some("sess"))).await;
+            assert_eq!(load().unwrap().remote_id, None);
+        }
     }
 }
