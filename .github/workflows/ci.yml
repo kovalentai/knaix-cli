@@ -47,7 +47,7 @@ jobs:
       - name: Coverage floors
         run: |
           cargo llvm-cov report --summary-only \
-            --fail-under-lines 73 --fail-under-regions 73 --fail-under-functions 81
+            --fail-under-lines 76 --fail-under-regions 76 --fail-under-functions 83
 
       # Rounded down, so the badge never claims more than was measured.
       - name: Coverage badge
