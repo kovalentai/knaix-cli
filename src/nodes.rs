@@ -3466,7 +3466,8 @@ pub async fn up(ctx: &KnaixContext) -> Result<()> {
                     "Failed to provision node: HTTP {} - {}",
                     status,
                     err_str
-                ));
+                ))
+                .coded(Code::for_status(status.as_u16()));
             }
         }
         Err(e) => {
