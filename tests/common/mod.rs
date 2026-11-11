@@ -108,14 +108,33 @@ pub fn knaix(home: &Path, api: &str, args: &[&str]) -> Run {
     knaix_reading(home, api, args, Stdio::null())
 }
 
+/// `knaix <args>` against `api` with no session on the machine.
+pub fn knaix_signed_out(home: &Path, api: &str, args: &[&str]) -> Run {
+    run(home, api, None, args, Stdio::null())
+}
+
 /// `knaix` with `stdin` as its standard input. Killed, failing the test, if
 /// it has not finished in a minute: a command waiting for input a script
 /// cannot give is the failure some of these tests look for.
 pub fn knaix_reading(home: &Path, api: &str, args: &[&str], stdin: Stdio) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_knaix"))
+    run(home, api, Some("sess"), args, stdin)
+}
+
+/// `knaix <args>`, with `token` as its session, if any. PATH is a directory
+/// with nothing in it, so no command reaches the docker or anything else on
+/// the machine running the test.
+fn run(home: &Path, api: &str, token: Option<&str>, args: &[&str], stdin: Stdio) -> Run {
+    let empty = home.join("empty-path");
+    fs::create_dir_all(&empty).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knaix"));
+    match token {
+        Some(token) => command.env("KNAIX_TOKEN", token),
+        None => command.env_remove("KNAIX_TOKEN"),
+    };
+    let mut child = command
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("KNAIX_TOKEN", "sess")
+        .env("PATH", &empty)
         .env("KNAIX_API_URL", api)
         .env("KNAIX_NO_UPDATE_CHECK", "1")
         .env("NO_COLOR", "1")
