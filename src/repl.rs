@@ -445,10 +445,8 @@ pub async fn run(
                 println!("\nSession ended.");
                 break;
             }
-            Err(err) => {
-                println!("Readline error: {:?}", err);
-                break;
-            }
+            // Not an ending: a script whose input broke must not exit 0.
+            Err(err) => return Err(anyhow::anyhow!("Could not read the next line: {err}")),
         }
     }
 
