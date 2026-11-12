@@ -285,29 +285,18 @@ pub async fn run(
     // run would then measure against two copies of every document. Report that
     // rather than assuming ownership of documents this run did not create.
     let leftovers = list_selftest_documents(ctx, target).await?;
-    if !leftovers.is_empty() {
-        if sweep {
-            let swept = sweep_previous(ctx, target).await?;
-            if human {
-                println!(
-                    "{} Removed {} self-test document(s) left by an earlier run.",
-                    "Info:".blue(),
-                    swept
-                );
-            }
-        } else if human {
-            // Benign, and worth saying so: the control plane reuses the
-            // registry row for content-identical uploads, so this run re-ingests
-            // those same documents rather than adding a second copy, and its own
-            // cleanup removes them. --sweep exists for clearing them without
-            // running a test at all.
-            println!(
-                "{} {} self-test document(s) from an earlier run are on this node. This run\n      re-uses and then removes them; pass {} to clear them without testing.",
-                "Info:".blue(),
-                leftovers.len(),
-                "--sweep".cyan()
-            );
-        }
+    if sweep {
+        return sweep_previous(ctx, target, &leftovers, human).await;
+    }
+    // Not removed here: only this run's own uploads are, by the ids the node
+    // gave it, so an earlier run's documents stay until they are swept.
+    if !leftovers.is_empty() && human {
+        println!(
+            "{} {} self-test document(s) from an earlier run are on this node; clear them with {}.",
+            "Info:".blue(),
+            leftovers.len(),
+            crate::brand::cmd("selftest --sweep")
+        );
     }
 
     let run_id = short_run_id();
@@ -638,15 +627,33 @@ fn root_cause(e: &anyhow::Error) -> String {
 /// under it, and that run would then measure a node whose documents vanished
 /// mid-question -- a wrong answer reported confidently, which is worse than a
 /// stale document left lying around.
-async fn sweep_previous(ctx: &KnaixContext, target: &Target) -> Result<usize> {
-    let stale = list_selftest_documents(ctx, target).await?;
+async fn sweep_previous(
+    ctx: &KnaixContext,
+    target: &Target,
+    stale: &[String],
+    human: bool,
+) -> Result<()> {
     let mut removed = 0;
     for id in stale {
-        if delete_document(ctx, target, &id).await.is_ok() {
+        if delete_document(ctx, target, id).await.is_ok() {
             removed += 1;
         }
     }
-    Ok(removed)
+    if removed < stale.len() {
+        return Err(anyhow!(
+            "Could not remove {} of {} self-test document(s) from the node.",
+            stale.len() - removed,
+            stale.len()
+        ));
+    }
+    if human {
+        println!(
+            "{} Removed {} self-test document(s) left by an earlier run.",
+            "Info:".blue(),
+            removed
+        );
+    }
+    Ok(())
 }
 
 async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<Vec<String>> {
@@ -797,10 +804,11 @@ async fn cleanup(
 
     if !failed.is_empty() {
         eprintln!(
-            "{} Could not remove {} self-test document(s) from the node. They are named '{}*' and the next run will sweep them.",
+            "{} Could not remove {} self-test document(s) from the node. They are named '{}*'; remove them with {}.",
             "Warning:".yellow(),
             failed.len(),
-            DOC_PREFIX
+            DOC_PREFIX,
+            crate::brand::cmd("selftest --sweep")
         );
     }
 }

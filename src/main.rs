@@ -454,8 +454,9 @@ enum Commands {
         #[clap(long)]
         quick: bool,
 
-        /// Remove self-test documents left behind by an earlier interrupted run
-        #[clap(long)]
+        /// Remove self-test documents left behind by an earlier interrupted run,
+        /// without running a test
+        #[clap(long, conflicts_with_all = ["keep", "quick"])]
         sweep: bool,
     },
 
