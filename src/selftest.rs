@@ -855,19 +855,12 @@ fn summarize(
         .collect();
     answer.sort_unstable();
 
-    let hit_rate_at_k = if total == 0 {
-        0.0
-    } else {
-        hits as f64 / total as f64
-    };
+    // Never empty: the question set is bundled, and a test holds it non-empty.
+    let hit_rate_at_k = hits as f64 / total as f64;
     // `+ 0.0` is not redundant. Summing no f64 yields -0.0, because that is
     // floating-point addition's identity, and a run where nothing was retrieved
     // then reports its MRR as "-0.000".
-    let mrr = if total == 0 {
-        0.0
-    } else {
-        mrr_sum / total as f64 + 0.0
-    };
+    let mrr = mrr_sum / total as f64 + 0.0;
 
     // Two ways the number cannot be read, and they are not the same thing. The
     // mock picks the top passage every time, so its accuracy restates rank-1
