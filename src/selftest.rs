@@ -526,8 +526,30 @@ async fn run_questions(
         }
 
         let started = Instant::now();
-        let answer = match ask(ctx, target, &q.query).await {
+        // Each self-test question stands alone; no conversation history to
+        // carry, and the default verbosity keeps the graded answers comparable.
+        let answer = match crate::nodes::chat(
+            ctx,
+            target,
+            &q.query,
+            crate::nodes::Echo::Silent,
+            &[],
+            &crate::nodes::AnswerOptions::default(),
+            None,
+        )
+        .await
+        {
             Ok(a) => a,
+            // A run costs one request per question against an account-wide
+            // budget. Once it is spent every later question would fail the same
+            // way, and asking anyway spends more of it, so the run stops here.
+            Err(e) if e.to_string().contains("429") => {
+                return Err(anyhow!(
+                    "Rate limited part-way through the run. A self-test spends one request per question; \
+                     wait for the window to reset, or use --quick for a shorter run."
+                ))
+                .coded(Code::Unavailable);
+            }
             // One question the node could not answer is a result, not the end
             // of the run. Recording it keeps the other fifty-one measurements
             // and names the cause, which a bare abort threw away.
@@ -607,34 +629,6 @@ async fn run_questions(
 /// out, or refused, or was not there.
 fn root_cause(e: &anyhow::Error) -> String {
     e.chain().last().map(|c| c.to_string()).unwrap_or_default()
-}
-
-/// Ask one question, surfacing a rate limit as the thing it is.
-///
-/// A run costs one request per question plus a handful for setup, against an
-/// account-wide budget shared with everything else the user is doing. A raw
-/// "HTTP 429" mid-run reads as a broken node rather than a spent budget.
-async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::nodes::ChatAnswer> {
-    // Each self-test question stands alone; no conversation history to carry,
-    // and the default verbosity keeps the graded answers comparable.
-    match crate::nodes::chat(
-        ctx,
-        target,
-        query,
-        crate::nodes::Echo::Silent,
-        &[],
-        &crate::nodes::AnswerOptions::default(),
-        None,
-    )
-    .await
-    {
-        Ok(answer) => Ok(answer),
-        Err(e) if e.to_string().contains("429") => Err(anyhow!(
-            "Rate limited part-way through the run. A self-test spends one request per question; \
-             wait for the window to reset, or use --quick for a shorter run."
-        )),
-        Err(e) => Err(e),
-    }
 }
 
 /// Remove documents left by an earlier run, without running a test.
