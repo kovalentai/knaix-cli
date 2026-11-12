@@ -699,7 +699,8 @@ pub(crate) async fn list_documents_with_prefix(
         .context("Failed to list documents on the node")?;
 
     if !resp.status().is_success() {
-        return Err(anyhow!("Failed to list documents: HTTP {}", resp.status()));
+        return Err(anyhow!("Failed to list documents: HTTP {}", resp.status()))
+            .coded(Code::for_status(resp.status().as_u16()));
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
