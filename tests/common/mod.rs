@@ -50,12 +50,23 @@ pub struct Server {
 pub const DROP: u16 = 0;
 
 pub fn server(routes: Vec<(&str, u16, String)>) -> Server {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
     let routes: HashMap<String, (u16, String)> = routes
         .into_iter()
         .map(|(r, s, b)| (r.to_string(), (s, b)))
         .collect();
+    server_answering(move |call| {
+        routes
+            .get(&call.route)
+            .cloned()
+            .unwrap_or((404, String::new()))
+    })
+}
+
+/// A server whose reply is worked out from each request, for an exchange where
+/// the same route has to answer differently.
+pub fn server_answering(answer: impl Fn(&Call) -> (u16, String) + Send + 'static) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(Mutex::new(Vec::new()));
     let log = calls.clone();
     std::thread::spawn(move || {
@@ -84,13 +95,14 @@ pub fn server(routes: Vec<(&str, u16, String)>) -> Server {
             }
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).unwrap();
-            log.lock().unwrap().push(Call {
-                route: route.clone(),
+            let call = Call {
+                route,
                 auth,
                 body: serde_json::from_slice(&body).unwrap_or(Value::Null),
                 raw: String::from_utf8_lossy(&body).into_owned(),
-            });
-            let (status, reply) = routes.get(&route).cloned().unwrap_or((404, String::new()));
+            };
+            let (status, reply) = answer(&call);
+            log.lock().unwrap().push(call);
             if status == DROP {
                 continue;
             }
