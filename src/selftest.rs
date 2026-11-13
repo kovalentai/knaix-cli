@@ -532,7 +532,7 @@ async fn run_questions(
             // A run costs one request per question against an account-wide
             // budget. Once it is spent every later question would fail the same
             // way, and asking anyway spends more of it, so the run stops here.
-            Err(e) if e.to_string().contains("429") => {
+            Err(e) if e.to_string().contains("HTTP 429 ") => {
                 return Err(anyhow!(
                     "Rate limited part-way through the run. A self-test spends one request per question; \
                      wait for the window to reset, or use --quick for a shorter run."

@@ -499,6 +499,25 @@ fn a_hosted_refusal_exits_with_the_code_its_status_means() {
         &run,
         &["Could not remove 6 self-test document(s) from the node."],
     );
+
+    let busy = server(vec![
+        alpha(),
+        (LIST, 200, json!({"data": []}).to_string()),
+        (
+            UPLOAD,
+            200,
+            json!({"success": true, "data": {"documentId": "h-new"}}).to_string(),
+        ),
+        (
+            CHAT,
+            500,
+            json!({"error": "retry after 4290 ms"}).to_string(),
+        ),
+    ]);
+    let run = knaix(&home, &busy.url, &["selftest", "-n", "alpha", "--quick"]);
+    assert!(!run.err.contains("Rate limited"), "{}", run.err);
+    let asked = busy.calls().iter().filter(|c| c.route == CHAT).count();
+    assert!(asked > 1, "a 500 that mentions 429 is not a rate limit");
 }
 
 /// A node that answers each question from the passage that supports it, as a
