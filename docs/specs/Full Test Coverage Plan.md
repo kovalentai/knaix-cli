@@ -131,3 +131,10 @@ Left: the permission-hardening warning in `save_config` cannot fire on a filesys
 - **The timing line is built apart from its printing,** so its wording can be checked without capturing stdout.
 - **Cases:** a hosted thread followed and then reset; a local session's history, `/k` and `/doc`; `/source` for a cited passage, an uncited one, a missing one and junk; `/remember` ingested, refused and unsaved, on either kind of node; `/memory`; each setting command and an unknown one; a failed or threadless turn; input that is not text; a node id from the control plane that is a path.
 - **Not covered:** Ctrl-C, which needs a real terminal to send it.
+
+## PR 14: The self-test
+
+**Goal:** `knaix selftest` end to end: the corpus uploaded and removed, the questions asked and scored, the report as a table or JSON, `--quick`, `--keep` and `--sweep`.
+
+- **Through the binary,** against a fake local node or control plane. `tests/common` gains a server whose reply is worked out from each request, so a node can answer each bundled question from the passage that supports it and a run can pass.
+- **Cases:** a quick run that is not scored; a full run that passes, and one that falls below the bar, as text and JSON; an answer that cites nothing; a node that does not answer; a rate limit; an upload refused; documents an earlier run left, reported or swept; deletes that fail, in a sweep and in cleanup; `--keep`; and an expired session.

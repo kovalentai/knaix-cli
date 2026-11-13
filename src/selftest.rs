@@ -285,29 +285,18 @@ pub async fn run(
     // run would then measure against two copies of every document. Report that
     // rather than assuming ownership of documents this run did not create.
     let leftovers = list_selftest_documents(ctx, target).await?;
-    if !leftovers.is_empty() {
-        if sweep {
-            let swept = sweep_previous(ctx, target).await?;
-            if human {
-                println!(
-                    "{} Removed {} self-test document(s) left by an earlier run.",
-                    "Info:".blue(),
-                    swept
-                );
-            }
-        } else if human {
-            // Benign, and worth saying so: the control plane reuses the
-            // registry row for content-identical uploads, so this run re-ingests
-            // those same documents rather than adding a second copy, and its own
-            // cleanup removes them. --sweep exists for clearing them without
-            // running a test at all.
-            println!(
-                "{} {} self-test document(s) from an earlier run are on this node. This run\n      re-uses and then removes them; pass {} to clear them without testing.",
-                "Info:".blue(),
-                leftovers.len(),
-                "--sweep".cyan()
-            );
-        }
+    if sweep {
+        return sweep_previous(ctx, target, &leftovers, human).await;
+    }
+    // Not removed here: only this run's own uploads are, by the ids the node
+    // gave it, so an earlier run's documents stay until they are swept.
+    if !leftovers.is_empty() && human {
+        println!(
+            "{} {} self-test document(s) from an earlier run are on this node; clear them with {}.",
+            "Info:".blue(),
+            leftovers.len(),
+            crate::brand::cmd("selftest --sweep")
+        );
     }
 
     let run_id = short_run_id();
@@ -526,8 +515,30 @@ async fn run_questions(
         }
 
         let started = Instant::now();
-        let answer = match ask(ctx, target, &q.query).await {
+        // Each self-test question stands alone; no conversation history to
+        // carry, and the default verbosity keeps the graded answers comparable.
+        let answer = match crate::nodes::chat(
+            ctx,
+            target,
+            &q.query,
+            crate::nodes::Echo::Silent,
+            &[],
+            &crate::nodes::AnswerOptions::default(),
+            None,
+        )
+        .await
+        {
             Ok(a) => a,
+            // A run costs one request per question against an account-wide
+            // budget. Once it is spent every later question would fail the same
+            // way, and asking anyway spends more of it, so the run stops here.
+            Err(e) if e.to_string().contains("HTTP 429 ") => {
+                return Err(anyhow!(
+                    "Rate limited part-way through the run. A self-test spends one request per question; \
+                     wait for the window to reset, or use --quick for a shorter run."
+                ))
+                .coded(Code::Unavailable);
+            }
             // One question the node could not answer is a result, not the end
             // of the run. Recording it keeps the other fifty-one measurements
             // and names the cause, which a bare abort threw away.
@@ -609,34 +620,6 @@ fn root_cause(e: &anyhow::Error) -> String {
     e.chain().last().map(|c| c.to_string()).unwrap_or_default()
 }
 
-/// Ask one question, surfacing a rate limit as the thing it is.
-///
-/// A run costs one request per question plus a handful for setup, against an
-/// account-wide budget shared with everything else the user is doing. A raw
-/// "HTTP 429" mid-run reads as a broken node rather than a spent budget.
-async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::nodes::ChatAnswer> {
-    // Each self-test question stands alone; no conversation history to carry,
-    // and the default verbosity keeps the graded answers comparable.
-    match crate::nodes::chat(
-        ctx,
-        target,
-        query,
-        crate::nodes::Echo::Silent,
-        &[],
-        &crate::nodes::AnswerOptions::default(),
-        None,
-    )
-    .await
-    {
-        Ok(answer) => Ok(answer),
-        Err(e) if e.to_string().contains("429") => Err(anyhow!(
-            "Rate limited part-way through the run. A self-test spends one request per question; \
-             wait for the window to reset, or use --quick for a shorter run."
-        )),
-        Err(e) => Err(e),
-    }
-}
-
 /// Remove documents left by an earlier run, without running a test.
 ///
 /// Opt-in, because the prefix identifies a self-test document but not *whose*.
@@ -644,15 +627,35 @@ async fn ask(ctx: &KnaixContext, target: &Target, query: &str) -> Result<crate::
 /// under it, and that run would then measure a node whose documents vanished
 /// mid-question -- a wrong answer reported confidently, which is worse than a
 /// stale document left lying around.
-async fn sweep_previous(ctx: &KnaixContext, target: &Target) -> Result<usize> {
-    let stale = list_selftest_documents(ctx, target).await?;
+async fn sweep_previous(
+    ctx: &KnaixContext,
+    target: &Target,
+    stale: &[String],
+    human: bool,
+) -> Result<()> {
     let mut removed = 0;
     for id in stale {
-        if delete_document(ctx, target, &id).await.is_ok() {
+        if delete_document(ctx, target, id).await.is_ok() {
             removed += 1;
         }
     }
-    Ok(removed)
+    if removed < stale.len() {
+        return Err(anyhow!(
+            "Could not remove {} of {} self-test document(s) from the node.",
+            stale.len() - removed,
+            stale.len()
+        ));
+    }
+    if human {
+        println!(
+            "{} Removed {} self-test document(s) left by an earlier run.",
+            "Info:".blue(),
+            removed
+        );
+    } else {
+        println!("{}", serde_json::json!({ "removed": removed }));
+    }
+    Ok(())
 }
 
 async fn list_selftest_documents(ctx: &KnaixContext, target: &Target) -> Result<Vec<String>> {
@@ -705,7 +708,8 @@ pub(crate) async fn list_documents_with_prefix(
         .context("Failed to list documents on the node")?;
 
     if !resp.status().is_success() {
-        return Err(anyhow!("Failed to list documents: HTTP {}", resp.status()));
+        return Err(anyhow!("Failed to list documents: HTTP {}", resp.status()))
+            .coded(Code::for_status(resp.status().as_u16()));
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -802,10 +806,11 @@ async fn cleanup(
 
     if !failed.is_empty() {
         eprintln!(
-            "{} Could not remove {} self-test document(s) from the node. They are named '{}*' and the next run will sweep them.",
+            "{} Could not remove {} self-test document(s) from the node. They are named '{}*'; remove them with {}.",
             "Warning:".yellow(),
             failed.len(),
-            DOC_PREFIX
+            DOC_PREFIX,
+            crate::brand::cmd("selftest --sweep")
         );
     }
 }
@@ -855,19 +860,12 @@ fn summarize(
         .collect();
     answer.sort_unstable();
 
-    let hit_rate_at_k = if total == 0 {
-        0.0
-    } else {
-        hits as f64 / total as f64
-    };
+    // Never empty: the question set is bundled, and a test holds it non-empty.
+    let hit_rate_at_k = hits as f64 / total as f64;
     // `+ 0.0` is not redundant. Summing no f64 yields -0.0, because that is
     // floating-point addition's identity, and a run where nothing was retrieved
     // then reports its MRR as "-0.000".
-    let mrr = if total == 0 {
-        0.0
-    } else {
-        mrr_sum / total as f64 + 0.0
-    };
+    let mrr = mrr_sum / total as f64 + 0.0;
 
     // Two ways the number cannot be read, and they are not the same thing. The
     // mock picks the top passage every time, so its accuracy restates rank-1
