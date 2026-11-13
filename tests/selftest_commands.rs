@@ -277,6 +277,15 @@ fn sweep_removes_what_an_earlier_run_left_and_tests_nothing() {
     assert!(bodies(&node, LOCAL_INGEST).is_empty(), "nothing tested");
     assert!(bodies(&node, STREAM).is_empty(), "nothing asked");
 
+    let scripted = knaix(
+        &home,
+        "http://127.0.0.1:9",
+        &["-o", "json", "selftest", "-n", "local", "--sweep"],
+    );
+    assert_eq!(scripted.code, 0, "{}", scripted.err);
+    let report: Value = serde_json::from_str(&scripted.out).unwrap();
+    assert_eq!(report, json!({"removed": 2}));
+
     let both = selftest(&home, &["--sweep", "--quick"]);
     assert_eq!(
         both.code, 2,

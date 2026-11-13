@@ -652,6 +652,8 @@ async fn sweep_previous(
             "Info:".blue(),
             removed
         );
+    } else {
+        println!("{}", serde_json::json!({ "removed": removed }));
     }
     Ok(())
 }
